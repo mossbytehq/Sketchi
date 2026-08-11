@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Sketchi
+Comment=Collaborative Rust whiteboard
+Exec=sketchi
+Icon=sketchi
+Terminal=false
+Categories=Graphics;Office;
+StartupNotify=true
+StartupWMClass=sketchi

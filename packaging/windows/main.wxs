@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wix">
+  <Fragment>
+    <Icon Id="SketchiIcon" SourceFile="$(var.IconFile)" />
+  </Fragment>
+  <Package Name="Sketchi" Manufacturer="Sketchi contributors" Version="$(var.Version)" UpgradeCode="7A4C2B31-8D7D-4C4F-9E04-3B8E2C1B1A10">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Sketchi is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Feature Id="MainFeature" Title="Sketchi" Level="1">
+      <ComponentGroupRef Id="SketchiFiles" />
+    </Feature>
+  </Package>
+  <Fragment>
+    <StandardDirectory Id="ProgramFilesFolder">
+      <Directory Id="INSTALLFOLDER" Name="Sketchi" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Sketchi" />
+    </StandardDirectory>
+  </Fragment>
+  <Fragment>
+    <ComponentGroup Id="SketchiFiles" Directory="INSTALLFOLDER">
+      <Component>
+        <File Source="$(var.ClientBinary)" Name="Sketchi.exe" />
+        <File Source="$(var.ServerBinary)" Name="Sketchi-server.exe" />
+        <File Source="$(var.LicenseFile)" Name="LICENSE.md" />
+      </Component>
+      <Component Directory="ApplicationProgramsFolder">
+        <Shortcut
+            Id="SketchiStartMenuShortcut"
+            Name="Sketchi"
+            Target="[INSTALLFOLDER]Sketchi.exe"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="SketchiIcon" />
+        <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue
+            Root="HKCU"
+            Key="Software\Sketchi"
+            Name="installed"
+            Type="integer"
+            Value="1"
+            KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

@@ -1,0 +1,56 @@
+[package]
+name = "canvas-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Sketchi collaboration server"
+default-run = "sketchi-server"
+
+[package.metadata.deb]
+maintainer = "Sketchi contributors"
+copyright = "2026 Sketchi contributors"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/sketchi-server", "usr/bin/sketchi-server", "755"],
+    ["LICENSE.md", "usr/share/doc/sketchi-server/LICENSE.md", "644"],
+]
+
+[lib]
+name = "canvas_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sketchi-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+canvas-core = { path = "../../crates/canvas-core" }
+canvas-protocol = { path = "../../crates/canvas-protocol" }
+clap.workspace = true
+futures-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+rusqlite.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

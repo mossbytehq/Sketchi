@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - id: version
+        name: Validate release tag
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cargo xtask version-check --tag "$GITHUB_REF_NAME"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  assemble:
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sketchi-staging-*
+          path: dist/staging
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sketchi-package-*
+          path: dist/artifacts
+          merge-multiple: true
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Create portable archives from verified staging
+        shell: bash
+        run: |
+          mkdir -p dist/artifacts
+          for directory in dist/staging/*; do
+            name="$(basename "$directory")"
+            if [[ "$name" == *windows* ]]; then
+              (cd dist/staging && zip -qr "../artifacts/${name}.zip" "$name")
+            else
+              tar -czf "dist/artifacts/${name}.tar.gz" -C dist/staging "$name"
+            fi
+          done
+      - name: Generate checksums
+        run: cargo xtask checksums --input-dir dist/artifacts --output dist/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sketchi-release-${{ needs.version.outputs.version }}
+          path: dist
+          if-no-files-found: error
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            dist/artifacts/*
+            dist/SHA256SUMS

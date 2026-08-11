@@ -1,0 +1,147 @@
+name: Build artifacts
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: false
+        type: string
+        default: 0.1.0
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Workspace version encoded in staged artifact names
+        required: false
+        default: 0.1.0
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/install-linux-deps
+        if: runner.os == 'Linux'
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: sketchi-release-${{ matrix.target }}
+      - name: Build client and server
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin sketchi --bin sketchi-server
+      - name: Stage client package
+        shell: bash
+        run: cargo xtask package --target "${{ matrix.target }}" --format portable --target-dir target --out-dir dist/staging
+      - name: Stage server package
+        shell: bash
+        run: cargo xtask package-server --target "${{ matrix.target }}" --target-dir target --out-dir dist/staging
+      - name: Verify staged contents
+        shell: bash
+        run: |
+          cargo xtask artifact-check --path "dist/staging/Sketchi-${{ inputs.version }}-${{ matrix.target }}" --target "${{ matrix.target }}" --kind client
+          cargo xtask artifact-check --path "dist/staging/Sketchi-server-${{ inputs.version }}-${{ matrix.target }}" --target "${{ matrix.target }}" --kind server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sketchi-staging-${{ matrix.target }}
+          path: dist/staging
+          if-no-files-found: error
+
+  arch-package:
+    name: Arch package
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sketchi-staging-x86_64-unknown-linux-gnu
+          path: dist/staging
+      - name: Build Arch package
+        shell: bash
+        env:
+          SKETCHI_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/artifacts dist/arch-build
+          docker run --rm \
+            --volume "$PWD:/workspace" \
+            --workdir /workspace \
+            --env SKETCHI_VERSION \
+            archlinux:base \
+            bash -euxo pipefail -c '
+              pacman -Syu --noconfirm --needed base-devel
+              useradd --create-home builder
+              chown -R builder:builder /workspace/dist /workspace/packaging/arch
+              su builder -s /bin/bash -c "
+                export SKETCHI_VERSION=${SKETCHI_VERSION}
+                export SKETCHI_STAGE_DIR=/workspace/dist/staging/Sketchi-${SKETCHI_VERSION}-x86_64-unknown-linux-gnu
+                export PKGDEST=/workspace/dist/artifacts
+                export BUILDDIR=/workspace/dist/arch-build
+                makepkg --cleanbuild --force --nodeps --skipinteg \
+                  -D packaging/arch -p PKGBUILD
+                package=\$(find /workspace/dist/artifacts -maxdepth 1 -type f -name \"*.pkg.tar.*\" -print -quit)
+                test -n \"\$package\"
+                pacman -Qp \"\$package\"
+                tar --zstd -tf \"\$package\" | grep -Fx usr/bin/sketchi
+                tar --zstd -tf \"\$package\" | grep -Fx usr/bin/sketchi-server
+                tar --zstd -tf \"\$package\" | grep -Fx usr/share/applications/sketchi.desktop
+              "
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sketchi-package-arch-${{ inputs.version }}
+          path: dist/artifacts
+          if-no-files-found: error
+
+  rpm-package:
+    name: RPM package
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sketchi-staging-x86_64-unknown-linux-gnu
+          path: dist/staging
+      - name: Install RPM tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y rpm
+      - name: Build RPM package
+        shell: bash
+        env:
+          SKETCHI_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          stage="$PWD/dist/staging/Sketchi-${SKETCHI_VERSION}-x86_64-unknown-linux-gnu"
+          rpm_top="$PWD/dist/rpmbuild"
+          mkdir -p "$PWD/dist/artifacts" "$rpm_top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          rpmbuild -bb \
+            --define "_topdir $rpm_top" \
+            --define "_sketchi_version $SKETCHI_VERSION" \
+            --define "_sketchi_stage $stage" \
+            packaging/rpm/sketchi.spec
+          mapfile -t packages < <(find "$rpm_top/RPMS" -type f -name '*.rpm' -print)
+          test "${#packages[@]}" -eq 1
+          cp "${packages[0]}" dist/artifacts/
+          rpm -qpl "dist/artifacts/$(basename "${packages[0]}")" | grep -Fx /usr/bin/sketchi
+          rpm -qpl "dist/artifacts/$(basename "${packages[0]}")" | grep -Fx /usr/bin/sketchi-server
+          rpm -qpl "dist/artifacts/$(basename "${packages[0]}")" | grep -Fx /usr/share/applications/sketchi.desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sketchi-package-rpm-${{ inputs.version }}
+          path: dist/artifacts
+          if-no-files-found: error

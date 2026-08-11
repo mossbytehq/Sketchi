@@ -1,0 +1,36 @@
+# Maintainer: Sketchi contributors
+
+pkgname=sketchi
+: "${SKETCHI_VERSION:?SKETCHI_VERSION must be set when building Sketchi}"
+: "${SKETCHI_STAGE_DIR:?SKETCHI_STAGE_DIR must point to a verified Sketchi staging directory}"
+pkgver="${SKETCHI_VERSION}"
+pkgrel=1
+pkgdesc="Collaborative Rust whiteboard"
+arch=('x86_64')
+url="https://github.com/SantanuDatta/Sketchi"
+license=('MIT')
+depends=(
+  'wayland'
+  'libxkbcommon'
+  'vulkan-icd-loader'
+  'libx11'
+  'libxcb'
+  'libxrandr'
+  'libxi'
+  'libxcursor'
+  'libxinerama'
+)
+source=()
+sha256sums=()
+
+package() {
+  install -Dm755 "$SKETCHI_STAGE_DIR/Sketchi" "$pkgdir/usr/bin/sketchi"
+  install -Dm755 "$SKETCHI_STAGE_DIR/Sketchi-server" "$pkgdir/usr/bin/sketchi-server"
+  install -Dm644 "$SKETCHI_STAGE_DIR/LICENSE.md" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE.md"
+  install -Dm644 "$SKETCHI_STAGE_DIR/VERSION" "$pkgdir/usr/share/$pkgname/VERSION"
+  install -Dm644 "$SKETCHI_STAGE_DIR/share/applications/sketchi.desktop" \
+    "$pkgdir/usr/share/applications/sketchi.desktop"
+  install -Dm644 "$SKETCHI_STAGE_DIR/share/icons/hicolor/512x512/apps/sketchi.png" \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/sketchi.png"
+}

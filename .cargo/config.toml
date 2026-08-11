@@ -1,0 +1,11 @@
+[build]
+# Reduces persistent incremental artifacts; rebuilds may be slower.
+incremental = false
+
+[alias]
+xtask = "run --package xtask --"
+clean-cache = "clean"
+clean-dev = "clean --profile dev"
+clean-release = "clean --release"
+sketchi = "run --package canvas-client --bin sketchi"
+sketchi-release = "run --package canvas-client --release --bin sketchi"

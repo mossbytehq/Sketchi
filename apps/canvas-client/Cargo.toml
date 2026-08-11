@@ -1,0 +1,66 @@
+[package]
+name = "canvas-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Sketchi collaborative whiteboard desktop client"
+default-run = "sketchi"
+
+[package.metadata.deb]
+maintainer = "Sketchi contributors"
+copyright = "2026 Sketchi contributors"
+section = "graphics"
+priority = "optional"
+assets = [
+    ["target/release/sketchi", "usr/bin/sketchi", "755"],
+    ["target/release/sketchi-server", "usr/bin/sketchi-server", "755"],
+    ["LICENSE.md", "usr/share/doc/sketchi/LICENSE.md", "644"],
+    ["packaging/linux/desktop/sketchi.desktop", "usr/share/applications/sketchi.desktop", "644"],
+    ["packaging/linux/icons/hicolor/512x512/apps/sketchi.png", "usr/share/icons/hicolor/512x512/apps/sketchi.png", "644"],
+]
+
+[package.metadata.wix]
+product-name = "Sketchi"
+manufacturer = "Sketchi contributors"
+license = "../../LICENSE.md"
+path = "../../packaging/windows/main.wxs"
+
+[[bin]]
+name = "sketchi"
+path = "src/main.rs"
+
+[lib]
+name = "canvas_client"
+path = "src/lib.rs"
+
+[dependencies]
+canvas-core = { path = "../../crates/canvas-core" }
+canvas-protocol = { path = "../../crates/canvas-protocol" }
+canvas-renderer = { path = "../../crates/canvas-renderer" }
+arboard.workspace = true
+clap.workspace = true
+directories.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+futures-util.workspace = true
+glam.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+[lints]
+workspace = true

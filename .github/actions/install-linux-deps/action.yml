@@ -1,0 +1,17 @@
+name: Install Linux build dependencies
+description: Install native headers required by winit, wgpu, and the release smoke checks
+runs:
+  using: composite
+  steps:
+    - name: Install native packages
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y \
+          libasound2-dev \
+          libfontconfig1-dev \
+          libudev-dev \
+          libwayland-dev \
+          libx11-dev \
+          libxkbcommon-dev \
+          pkg-config

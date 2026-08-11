@@ -1,0 +1,17 @@
+[package]
+name = "canvas-renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "wgpu renderer for Sketchi documents"
+
+[dependencies]
+canvas-core = { path = "../canvas-core" }
+glam.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
+
+[lints]
+workspace = true

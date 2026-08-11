@@ -1,0 +1,52 @@
+# Rust build output.
+/target/
+
+# Local Rust tooling and profiling output.
+/.agents/
+/.cargo-home/
+/coverage/
+/.coverage
+*.profraw
+*.profdata
+*.pdb
+
+# Separate read-only reference repository.
+/yerd/
+
+# Local execution state and generated release staging.
+/.superpowers/
+/artifacts/
+/dist/
+/packaging/**/AppDir/usr/bin/
+packaging/arch/*.pkg.tar.*
+packaging/rpm/*.rpm
+packaging/rpm/rpmbuild/
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+*.pid
+
+# Local configuration and secrets. Keep shareable examples.
+.env
+.env.*
+!.env.example
+
+# Temporary editor and operating-system files.
+*.orig
+*.rej
+*.rs.bk
+*.swp
+*.swo
+*.code-workspace
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+._*
+/.codex/
+.idea/
+.vscode/

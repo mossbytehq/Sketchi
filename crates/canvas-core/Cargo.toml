@@ -1,0 +1,21 @@
+[package]
+name = "canvas-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Pure document model and operation-based CRDT for Sketchi"
+
+[dependencies]
+base64.workspace = true
+glam.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
