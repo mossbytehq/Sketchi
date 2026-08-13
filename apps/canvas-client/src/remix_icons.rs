@@ -2,9 +2,14 @@
 
 /// Glyphs used by Sketchi's workspace controls.
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) enum RemixIcon {
     New,
     Save,
+    Information,
+    InputMethod,
+    Keyboard,
+    ListSettings,
     Settings,
     Select,
     InputCursorMove,
@@ -58,6 +63,10 @@ impl RemixIcon {
         match self {
             Self::New => '\u{ea13}',
             Self::Save => '\u{f0b3}',
+            Self::Information => '\u{ee59}',
+            Self::InputMethod => '\u{ee60}',
+            Self::Keyboard => '\u{ee75}',
+            Self::ListSettings => '\u{eebd}',
             Self::Settings => '\u{f0ee}',
             Self::Select => '\u{ec0a}',
             Self::InputCursorMove => '\u{ee5e}',
@@ -146,5 +155,13 @@ mod tests {
         assert_eq!(RemixIcon::Brush.glyph(), '\u{eb01}');
         assert_eq!(RemixIcon::Pan.glyph(), '\u{f444}');
         assert_eq!(RemixIcon::Triangle.glyph(), '\u{f3e4}');
+    }
+
+    #[test]
+    fn settings_navigation_icons_use_the_requested_remix_glyphs() {
+        assert_eq!(RemixIcon::ListSettings.glyph(), '\u{eebd}');
+        assert_eq!(RemixIcon::Keyboard.glyph(), '\u{ee75}');
+        assert_eq!(RemixIcon::InputMethod.glyph(), '\u{ee60}');
+        assert_eq!(RemixIcon::Information.glyph(), '\u{ee59}');
     }
 }

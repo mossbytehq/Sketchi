@@ -34,6 +34,24 @@ pub(crate) struct GpuState {
 }
 
 impl GpuState {
+    pub(crate) const fn settings_clear_color(dark_mode: bool) -> wgpu::Color {
+        if dark_mode {
+            wgpu::Color {
+                r: 31.0 / 255.0,
+                g: 32.0 / 255.0,
+                b: 37.0 / 255.0,
+                a: 1.0,
+            }
+        } else {
+            wgpu::Color {
+                r: 246.0 / 255.0,
+                g: 247.0 / 255.0,
+                b: 249.0 / 255.0,
+                a: 1.0,
+            }
+        }
+    }
+
     /// Creates and configures a presentation surface for a native window.
     pub(crate) fn new(window: Arc<Window>, instance: &wgpu::Instance) -> Result<Self, GpuError> {
         let size = window.inner_size();
@@ -115,10 +133,12 @@ impl GpuState {
     }
 
     /// Renders one complete egui frame and presents it on the native surface.
+    #[allow(clippy::redundant_closure_for_method_calls)]
     pub(crate) fn render(
         &mut self,
         context: &egui::Context,
         full_output: egui::FullOutput,
+        clear_color: wgpu::Color,
     ) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output
@@ -134,6 +154,24 @@ impl GpuState {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Sketchi egui frame encoder"),
             });
+
+        // A native settings window gets a fresh egui-wgpu renderer when it is
+        // reopened, while the egui context retains its font atlas. In that
+        // case egui may not emit a new delta for Managed(0), leaving every
+        // text mesh without a GPU texture. Seed the renderer from the current
+        // atlas before applying this frame's incremental deltas.
+        let font_texture_id = egui::TextureId::Managed(0);
+        if self.egui_renderer.texture(&font_texture_id).is_none() {
+            let font_image = context.fonts(|fonts| fonts.image());
+            let font_delta =
+                egui::epaint::ImageDelta::full(font_image, egui::TextureOptions::LINEAR);
+            self.egui_renderer.update_texture(
+                &self.device,
+                &self.queue,
+                font_texture_id,
+                &font_delta,
+            );
+        }
         for (id, image_delta) in &full_output.textures_delta.set {
             self.egui_renderer
                 .update_texture(&self.device, &self.queue, *id, image_delta);
@@ -150,12 +188,7 @@ impl GpuState {
             depth_slice: None,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color {
-                    r: 0.04,
-                    g: 0.07,
-                    b: 0.11,
-                    a: 1.0,
-                }),
+                load: wgpu::LoadOp::Clear(clear_color),
                 store: wgpu::StoreOp::Store,
             },
         })];
@@ -190,7 +223,29 @@ fn surface_dimensions(width: u32, height: u32) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::surface_dimensions;
+    use super::{GpuState, surface_dimensions};
+
+    #[test]
+    fn settings_clear_color_matches_the_settings_surface() {
+        assert_eq!(
+            GpuState::settings_clear_color(false),
+            wgpu::Color {
+                r: 246.0 / 255.0,
+                g: 247.0 / 255.0,
+                b: 249.0 / 255.0,
+                a: 1.0,
+            }
+        );
+        assert_eq!(
+            GpuState::settings_clear_color(true),
+            wgpu::Color {
+                r: 31.0 / 255.0,
+                g: 32.0 / 255.0,
+                b: 37.0 / 255.0,
+                a: 1.0,
+            }
+        );
+    }
 
     #[test]
     fn zero_sized_surfaces_are_not_renderable() {

@@ -19,7 +19,7 @@ pub(crate) enum SelectionHandle {
 
 impl SelectionHandle {
     /// Returns the horizontal movement axis represented by this handle.
-    const fn horizontal(self) -> Option<bool> {
+    pub(crate) const fn horizontal(self) -> Option<bool> {
         match self {
             Self::TopLeft | Self::Left | Self::BottomLeft => Some(false),
             Self::TopRight | Self::Right | Self::BottomRight => Some(true),
@@ -28,7 +28,7 @@ impl SelectionHandle {
     }
 
     /// Returns the vertical movement axis represented by this handle.
-    const fn vertical(self) -> Option<bool> {
+    pub(crate) const fn vertical(self) -> Option<bool> {
         match self {
             Self::TopLeft | Self::Top | Self::TopRight => Some(false),
             Self::BottomLeft | Self::Bottom | Self::BottomRight => Some(true),
@@ -154,6 +154,32 @@ pub(crate) fn resize_transform(
         size: Size::new(new_right - new_left, new_bottom - new_top),
         rotation: start.rotation,
     }
+}
+
+/// Resizes one element and scales any world-space points it owns.
+#[must_use]
+pub(crate) fn resized_element(
+    element: &Element,
+    handle: SelectionHandle,
+    pointer: Point,
+) -> Element {
+    let mut resized = element.clone();
+    resized.transform = resize_transform(element, handle, pointer);
+    if element.points.is_empty() {
+        return resized;
+    }
+
+    let source = Rect::new(element.transform.position, element.transform.size);
+    let target = Rect::new(resized.transform.position, resized.transform.size);
+    let scale_x = axis_scale(source.size.width, target.size.width);
+    let scale_y = axis_scale(source.size.height, target.size.height);
+    resized.points = element
+        .points
+        .iter()
+        .copied()
+        .map(|point| scale_point(point, source, target, scale_x, scale_y))
+        .collect();
+    resized
 }
 
 /// Translates an element and any world-space points it owns.
@@ -356,9 +382,25 @@ fn group_resize_bounds(bounds: Rect, handle: SelectionHandle, pointer: Point) ->
 
 fn scale_point(point: Point, source: Rect, target: Rect, scale_x: f32, scale_y: f32) -> Point {
     Point::new(
-        target.min.x + (point.x - source.min.x) * scale_x,
-        target.min.y + (point.y - source.min.y) * scale_y,
+        if source.size.width > f32::EPSILON {
+            target.min.x + (point.x - source.min.x) * scale_x
+        } else {
+            target.min.x + target.size.width / 2.0
+        },
+        if source.size.height > f32::EPSILON {
+            target.min.y + (point.y - source.min.y) * scale_y
+        } else {
+            target.min.y + target.size.height / 2.0
+        },
     )
+}
+
+fn axis_scale(source: f32, target: f32) -> f32 {
+    if source > f32::EPSILON {
+        target / source
+    } else {
+        1.0
+    }
 }
 
 /// Returns whether a pointer is over the outward-padded rotation handle.
@@ -474,7 +516,7 @@ mod tests {
     use super::{
         SelectionHandle, angle_delta, group_resized_element, marquee_intersects,
         padded_selection_corners, padded_selection_handle_position, resize_transform,
-        translated_element,
+        resized_element, translated_element,
     };
 
     #[test]
@@ -509,6 +551,36 @@ mod tests {
 
         assert_eq!(resized.position, Point::new(10.0, 20.0));
         assert_eq!(resized.size, Size::new(70.0, 70.0));
+    }
+
+    #[test]
+    fn resizing_lines_and_arrows_scales_their_points_with_the_transform() {
+        for (index, kind) in [
+            canvas_core::ElementKind::Line,
+            canvas_core::ElementKind::Arrow,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let element = Element::with_points(
+                ElementId::from_u128(7 + u128::try_from(index).unwrap_or(0)),
+                kind,
+                Transform::new(Point::new(10.0, 20.0), Size::new(40.0, 30.0)),
+                vec![Point::new(10.0, 20.0), Point::new(50.0, 50.0)],
+            );
+
+            let resized = resized_element(
+                &element,
+                SelectionHandle::BottomRight,
+                Point::new(90.0, 80.0),
+            );
+
+            assert_eq!(resized.transform.size, Size::new(80.0, 60.0));
+            assert_eq!(
+                resized.points,
+                vec![Point::new(10.0, 20.0), Point::new(90.0, 80.0)]
+            );
+        }
     }
 
     #[test]

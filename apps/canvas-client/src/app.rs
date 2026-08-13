@@ -1,6 +1,9 @@
 //! Desktop application shell boundary.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use canvas_core::ClientId;
 use canvas_renderer::Camera;
@@ -11,16 +14,18 @@ use winit::{
     event::{ElementState, KeyEvent, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
-    window::{Icon as WindowIcon, Theme, Window, WindowId},
+    window::{Icon as WindowIcon, Theme, Window, WindowButtons, WindowId},
 };
 
 use crate::editor::Editor;
 use crate::gpu::GpuState;
 use crate::remix_icons;
+use crate::storage;
 use crate::supervisor::LocalServer;
 use crate::tools::{Tool, ToolController};
 use crate::ui::WorkspaceUi;
-use crate::window_state::{self, WindowState};
+use crate::window_state::WindowState;
+use crate::{settings, window_state};
 
 /// Application state shared by the winit event loop and renderer.
 pub struct AppState {
@@ -91,7 +96,7 @@ impl DesktopShell {
     }
 
     /// Enters the non-blocking native event loop.
-    pub fn run(self) -> ! {
+    pub fn run(self) {
         let DesktopShell {
             event_loop,
             egui,
@@ -105,14 +110,38 @@ impl DesktopShell {
                 None
             }
         };
-        let mut ui = WorkspaceUi::default();
-        ui.set_restore_session(
-            saved_window_state
-                .as_ref()
-                .is_none_or(|state| state.restore_session),
-        );
+        let saved_settings = match settings::load() {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(error = %error, "Sketchi could not load settings");
+                None
+            }
+        };
+        let settings_state = saved_settings.clone().unwrap_or_default();
+        let mut ui = WorkspaceUi::from_settings(&settings_state);
+        let restore_session = saved_window_state
+            .as_ref()
+            .is_none_or(|state| state.restore_session);
+        ui.set_restore_session(restore_session);
+        let editor = if restore_session {
+            match storage::load_document(&settings_state.autosave_directory) {
+                Ok(Some(document)) => match Editor::from_document(ClientId::new(), &document) {
+                    Ok(editor) => editor,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Sketchi could not restore autosave");
+                        Editor::new(ClientId::new())
+                    }
+                },
+                Ok(None) => Editor::new(ClientId::new()),
+                Err(error) => {
+                    tracing::warn!(error = %error, "Sketchi could not read autosave");
+                    Editor::new(ClientId::new())
+                }
+            }
+        } else {
+            Editor::new(ClientId::new())
+        };
         let settings_egui = egui::Context::default();
-        remix_icons::install(&settings_egui);
         let mut application = DesktopApplication {
             window: None,
             gpu: None,
@@ -125,23 +154,27 @@ impl DesktopShell {
             wgpu_instance,
             local_server,
             ui,
-            editor: Editor::new(ClientId::new()),
+            editor,
             tools: ToolController::new(Tool::Select),
             camera: Camera::default(),
             first_frame_logged: false,
             settings_first_frame_logged: false,
             window_state: saved_window_state,
             window_state_dirty: false,
+            settings_state,
+            settings_dirty: false,
+            last_autosave: Instant::now(),
+            autosave_retry_at: None,
             modifiers: ModifiersState::default(),
         };
         let result = event_loop.run_app(&mut application);
         if let Err(error) = result {
             tracing::error!(error = %error, "Sketchi event loop stopped");
         }
-        std::process::exit(0);
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct DesktopApplication {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
@@ -161,6 +194,10 @@ struct DesktopApplication {
     settings_first_frame_logged: bool,
     window_state: Option<WindowState>,
     window_state_dirty: bool,
+    settings_state: settings::Settings,
+    settings_dirty: bool,
+    last_autosave: Instant,
+    autosave_retry_at: Option<Instant>,
     modifiers: ModifiersState,
 }
 
@@ -277,6 +314,9 @@ impl ApplicationHandler for DesktopApplication {
             WindowEvent::CloseRequested => {
                 tracing::info!("close requested");
                 self.save_window_state(true);
+                self.sync_settings_preferences();
+                self.save_settings(true);
+                self.save_document_if_enabled(true);
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -316,6 +356,8 @@ impl ApplicationHandler for DesktopApplication {
                         .show(context, &mut self.editor, &mut self.tools, &mut self.camera);
                 });
                 self.sync_window_state_preferences();
+                self.sync_settings_preferences();
+                self.maybe_autosave();
                 self.sync_settings_window(event_loop);
                 if let Some(egui_state) = &mut self.egui_state {
                     egui_state.handle_platform_output(
@@ -327,7 +369,16 @@ impl ApplicationHandler for DesktopApplication {
                     tracing::warn!("redraw requested before GPU initialization");
                     return;
                 };
-                match gpu.render(&context, full_output) {
+                match gpu.render(
+                    &context,
+                    full_output,
+                    wgpu::Color {
+                        r: 0.04,
+                        g: 0.07,
+                        b: 0.11,
+                        a: 1.0,
+                    },
+                ) {
                     Ok(()) => {
                         if !self.first_frame_logged {
                             self.first_frame_logged = true;
@@ -357,7 +408,16 @@ impl ApplicationHandler for DesktopApplication {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.save_window_state(false);
-        event_loop.set_control_flow(ControlFlow::Wait);
+        self.save_settings(false);
+        self.maybe_autosave();
+        if let Some(duration) = self.settings_state.autosave_interval.duration() {
+            let next_autosave = self
+                .autosave_retry_at
+                .unwrap_or(self.last_autosave + duration);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next_autosave));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
         let _ = &self.local_server;
     }
 }
@@ -372,8 +432,10 @@ impl DesktopApplication {
             let attributes = Window::default_attributes()
                 .with_title("Settings — Sketchi")
                 .with_window_icon(native_window_icon())
-                .with_inner_size(PhysicalSize::new(860, 680))
-                .with_min_inner_size(PhysicalSize::new(720, 520))
+                .with_inner_size(PhysicalSize::new(860, 560))
+                .with_min_inner_size(PhysicalSize::new(720, 480))
+                .with_decorations(true)
+                .with_enabled_buttons(settings_window_buttons())
                 .with_resizable(true);
             #[cfg(target_os = "linux")]
             let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
@@ -385,6 +447,9 @@ impl DesktopApplication {
                 Err(error) => {
                     tracing::error!(error = %error, "Sketchi could not create settings window");
                     self.ui.close_settings();
+                    if let Some(main_window) = &self.window {
+                        main_window.request_redraw();
+                    }
                     return;
                 }
             };
@@ -398,6 +463,11 @@ impl DesktopApplication {
             );
             match GpuState::new(window.clone(), &self.wgpu_instance) {
                 Ok(gpu) => {
+                    // The settings renderer is recreated when the window is
+                    // reopened. Reinstalling the fonts invalidates the
+                    // retained egui atlas so the next frame uploads it to
+                    // this new renderer.
+                    remix_icons::install(&self.settings_egui);
                     tracing::info!(
                         width = window.inner_size().width,
                         height = window.inner_size().height,
@@ -413,6 +483,9 @@ impl DesktopApplication {
                 Err(error) => {
                     tracing::error!(error = %error, "Sketchi could not initialize settings window GPU");
                     self.ui.close_settings();
+                    if let Some(main_window) = &self.window {
+                        main_window.request_redraw();
+                    }
                 }
             }
         } else if self.settings_window.is_some() {
@@ -425,6 +498,9 @@ impl DesktopApplication {
         self.settings_gpu = None;
         self.settings_window = None;
         self.settings_first_frame_logged = false;
+        if let Some(main_window) = &self.window {
+            main_window.request_redraw();
+        }
     }
 
     fn handle_settings_window_event(&mut self, event_loop: &ActiveEventLoop, event: &WindowEvent) {
@@ -484,6 +560,7 @@ impl DesktopApplication {
             self.ui
                 .show_settings_window(context, &mut self.editor, &mut self.tools);
         });
+        self.sync_settings_preferences();
         if let Some(egui_state) = &mut self.settings_egui_state {
             egui_state.handle_platform_output(window.as_ref(), full_output.platform_output.clone());
         }
@@ -491,7 +568,11 @@ impl DesktopApplication {
             tracing::warn!("settings redraw requested before GPU initialization");
             return;
         };
-        match gpu.render(&context, full_output) {
+        match gpu.render(
+            &context,
+            full_output,
+            GpuState::settings_clear_color(self.ui.settings_dark_mode()),
+        ) {
             Ok(()) => {
                 if !self.settings_first_frame_logged {
                     self.settings_first_frame_logged = true;
@@ -513,6 +594,9 @@ impl DesktopApplication {
             Err(wgpu::SurfaceError::Other) => {
                 tracing::error!("settings GPU surface returned an unspecified error");
             }
+        }
+        if !self.ui.settings_open() {
+            self.close_settings_window();
         }
     }
 
@@ -572,6 +656,60 @@ impl DesktopApplication {
         }
     }
 
+    fn sync_settings_preferences(&mut self) {
+        let settings = self.ui.settings_snapshot();
+        if settings != self.settings_state {
+            self.settings_state = settings;
+            self.settings_dirty = true;
+        }
+    }
+
+    fn save_settings(&mut self, force: bool) {
+        if !force && !self.settings_dirty {
+            return;
+        }
+        if let Err(error) = settings::save(&self.settings_state) {
+            tracing::warn!(error = %error, "Sketchi could not save settings");
+            return;
+        }
+        self.settings_dirty = false;
+    }
+
+    fn maybe_autosave(&mut self) {
+        let Some(interval) = self.settings_state.autosave_interval.duration() else {
+            return;
+        };
+        let due = self
+            .autosave_retry_at
+            .unwrap_or(self.last_autosave + interval);
+        if Instant::now() >= due {
+            self.save_document_if_enabled(false);
+        }
+    }
+
+    fn save_document_if_enabled(&mut self, force: bool) {
+        if !force && self.settings_state.autosave_interval.duration().is_none() {
+            return;
+        }
+        if force && !self.ui.restore_session_enabled() {
+            return;
+        }
+        match storage::save_document(
+            &self.settings_state.autosave_directory,
+            self.editor.document(),
+        ) {
+            Ok(path) => {
+                self.last_autosave = Instant::now();
+                self.autosave_retry_at = None;
+                tracing::info!(path = %path.display(), "Sketchi saved local document");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "Sketchi could not save local document");
+                self.autosave_retry_at = Some(Instant::now() + Duration::from_secs(5));
+            }
+        }
+    }
+
     fn capture_window_state(&mut self) {
         let Some(window) = self.window.as_ref() else {
             return;
@@ -622,6 +760,9 @@ impl DesktopApplication {
 impl Drop for DesktopApplication {
     fn drop(&mut self) {
         self.save_window_state(true);
+        self.sync_settings_preferences();
+        self.save_settings(true);
+        self.save_document_if_enabled(true);
     }
 }
 
@@ -641,6 +782,10 @@ pub fn run() {
         Ok(shell) => shell.run(),
         Err(error) => tracing::error!(error = %error, "Sketchi could not start"),
     }
+}
+
+const fn settings_window_buttons() -> WindowButtons {
+    WindowButtons::CLOSE
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -679,4 +824,60 @@ fn is_clipboard_paste(event: &KeyEvent, modifiers: ModifiersState) -> bool {
     let is_v = matches!(&event.logical_key, Key::Character(key) if key.as_str().eq_ignore_ascii_case("v"))
         || matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyV));
     is_v && (modifiers.control_key() || modifiers.super_key())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WindowButtons, remix_icons, settings_window_buttons};
+
+    #[test]
+    fn settings_window_keeps_only_the_native_close_button() {
+        assert_eq!(settings_window_buttons(), WindowButtons::CLOSE);
+    }
+
+    #[test]
+    fn settings_context_emits_the_first_font_atlas_upload() {
+        let context = egui::Context::default();
+        remix_icons::install(&context);
+
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                ui.label("Settings");
+            });
+        });
+
+        assert!(
+            output
+                .textures_delta
+                .set
+                .iter()
+                .any(|(id, _)| *id == egui::TextureId::Managed(0))
+        );
+        assert!(
+            !output
+                .textures_delta
+                .free
+                .contains(&egui::TextureId::Managed(0))
+        );
+
+        remix_icons::install(&context);
+        let reopened_output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                ui.label("Settings reopened");
+            });
+        });
+        assert!(
+            reopened_output
+                .textures_delta
+                .set
+                .iter()
+                .any(|(id, _)| *id == egui::TextureId::Managed(0))
+        );
+        assert!(
+            !reopened_output
+                .textures_delta
+                .free
+                .contains(&egui::TextureId::Managed(0))
+        );
+    }
 }

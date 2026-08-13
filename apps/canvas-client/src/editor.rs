@@ -54,6 +54,28 @@ impl Editor {
         }
     }
 
+    /// Creates an editor from a previously saved materialized document.
+    ///
+    /// The restored document is treated as local state: its create operations
+    /// remain pending so a future connection can publish the autosaved data.
+    /// Restored state does not create undo history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError::Core`] if a restored element fails core validation.
+    pub fn from_document(
+        client_id: canvas_core::ClientId,
+        document: &Document,
+    ) -> Result<Self, EditorError> {
+        let mut editor = Self::new(client_id);
+        for element in document.elements() {
+            editor.apply_command(EditorCommand::Create(element.clone()))?;
+        }
+        editor.undo.clear();
+        editor.redo.clear();
+        Ok(editor)
+    }
+
     /// Executes a command locally and queues its operation for transport.
     ///
     /// # Errors
@@ -110,8 +132,8 @@ impl Editor {
 
     /// Returns the current materialized document.
     #[must_use]
-    pub fn document(&self) -> Document {
-        self.crdt.document()
+    pub fn document(&self) -> &Document {
+        self.crdt.document_ref()
     }
 
     /// Returns queued local operations awaiting acknowledgement.

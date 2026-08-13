@@ -128,6 +128,23 @@ impl RoomStore {
         self.append_operations(room_id, std::slice::from_ref(operation))
     }
 
+    /// Removes the operation log covered by the latest room snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when the room is missing or `SQLite` cannot
+    /// delete the covered rows.
+    pub fn compact_operations(&mut self, room_id: RoomId) -> Result<(), StoreError> {
+        if !self.room_exists(room_id)? {
+            return Err(StoreError::RoomNotFound);
+        }
+        self.connection.execute(
+            "DELETE FROM operations WHERE room_id = ?1",
+            params![room_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Loads the complete operation log in insertion order.
     ///
     /// # Errors

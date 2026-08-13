@@ -120,6 +120,12 @@ impl RenderPrimitive {
             | Self::Image { id, .. } => *id,
         }
     }
+
+    /// Converts one document element into the renderer boundary type.
+    #[must_use]
+    pub fn from_element(element: &Element) -> Self {
+        to_primitive(element)
+    }
 }
 
 /// A renderer-ready ordered scene.
@@ -147,9 +153,7 @@ impl Scene {
     }
 
     pub(crate) fn from_document(document: &Document) -> Self {
-        let mut elements = document.elements().collect::<Vec<_>>();
-        elements.sort_by_key(|element| (element.z_index, element.id));
-        let primitives = elements.into_iter().map(to_primitive).collect();
+        let primitives = document.elements_in_z_order().map(to_primitive).collect();
         Self { primitives }
     }
 }
@@ -200,7 +204,7 @@ fn to_primitive(element: &Element) -> RenderPrimitive {
         },
         ElementKind::Freehand => RenderPrimitive::Freehand {
             id: element.id,
-            points: element.points.clone(),
+            points: points_or_bounds(element),
             style: element.style,
         },
         ElementKind::Image => match element.image.clone() {
@@ -245,14 +249,10 @@ fn points_or_bounds(element: &Element) -> Vec<Point> {
 #[must_use]
 pub fn hit_test(document: &Document, point: Point, tolerance: f32) -> Option<ElementId> {
     let tolerance = tolerance.max(0.0);
-    let mut elements = document.elements().collect::<Vec<_>>();
-    elements.sort_by_key(|element| (element.z_index, element.id));
-    let hits = elements
-        .into_iter()
+    let topmost = document
+        .elements_in_z_order()
         .rev()
-        .filter(|element| element_contains(element, point, tolerance))
-        .collect::<Vec<_>>();
-    let topmost = hits.first()?;
+        .find(|element| element_contains(element, point, tolerance))?;
     let topmost_id = topmost.id;
     let topmost_is_unfilled_shape = is_unfilled_bounded_shape(topmost);
 
@@ -261,8 +261,10 @@ pub fn hit_test(document: &Document, point: Point, tolerance: f32) -> Option<Ele
     // This mirrors the visible geometry more closely and keeps nested outline
     // shapes reachable with the select tool.
     if topmost_is_unfilled_shape {
-        return hits
-            .into_iter()
+        return document
+            .elements_in_z_order()
+            .rev()
+            .filter(|element| element_contains(element, point, tolerance))
             .min_by(|left, right| {
                 element_area(left)
                     .total_cmp(&element_area(right))

@@ -1,9 +1,9 @@
 use std::fmt::Write as _;
 use std::{
-    collections::{BTreeSet, HashMap, hash_map::Entry},
+    collections::{BTreeSet, HashMap},
     env, fs,
     path::PathBuf,
-    sync::mpsc::{self, Receiver, TryRecvError},
+    sync::mpsc::{Receiver, TryRecvError},
     time::Duration,
 };
 
@@ -11,23 +11,26 @@ use canvas_core::{
     Color, Document, EdgeStyle, EditorCommand, Element, ElementId, ElementKind, EmbeddedImage,
     Point, Size, Sloppiness, StrokeStyle, Style, StylePatch, TextAlign, TextFontFamily, Transform,
 };
-use canvas_renderer::{Camera, hit_test};
+use canvas_renderer::{Camera, RenderPrimitive, Renderer, Scene};
 use egui::epaint::{TextShape, Vertex};
 use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Key, Margin, Mesh, Modifiers, Painter,
     PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
 };
 
+#[path = "settings_ui.rs"]
+mod settings_ui;
+use self::settings_ui::{settings_palette_row, settings_visuals};
+
 use crate::{
     components::{
         STANDARD_CONTROL_SIZE, button, color_picker_editor, color_picker_trigger, color_swatch,
-        dropdown_field, numeric_field, numeric_field_with_decimals, range_slider, text_field,
+        dropdown_field_sized, numeric_field, numeric_field_with_decimals, range_slider,
+        sized_text_field,
     },
     editor::Editor,
-    images::{
-        ImageImportError, embedded_image_from_bytes, embedded_image_from_rgba,
-        embedded_image_with_rgba,
-    },
+    images::{embedded_image_from_rgba, embedded_image_with_rgba},
+    preview::{DropPreviewDecode, DropPreviewDecodeError, PreviewCancellation, PreviewWorker},
     remix_icons::{self, RemixIcon as Icon},
     selection::{
         SelectionHandle, angle_delta, element_bounds, group_resized_element, marquee_intersects,
@@ -36,21 +39,35 @@ use crate::{
         pointer_angle, rotate_around, selection_bounds, selection_handle_at_bounds,
         selection_handle_position, translated_element,
     },
+    settings,
     tools::{Tool, ToolController, ToolOutput},
 };
 
 const DARK_CANVAS: Color32 = Color32::from_rgb(26, 27, 30);
-const LIGHT_CANVAS: Color32 = Color32::from_rgb(252, 252, 253);
+const LIGHT_CANVAS: Color32 = Color32::from_rgb(246, 247, 249);
 const ACCENT: Color32 = Color32::from_rgb(91, 87, 214);
 const LIGHT_PANEL: Color32 = Color32::from_rgb(255, 255, 255);
 const DARK_PANEL: Color32 = Color32::from_rgb(37, 38, 43);
-const LIGHT_BORDER: Color32 = Color32::from_rgb(229, 231, 235);
+const LIGHT_BORDER: Color32 = Color32::from_rgb(205, 209, 218);
 const DARK_BORDER: Color32 = Color32::from_rgb(62, 64, 72);
-const LIGHT_TEXT: Color32 = Color32::from_rgb(38, 39, 43);
+const LIGHT_TEXT: Color32 = Color32::from_rgb(31, 35, 43);
 const DARK_TEXT: Color32 = Color32::from_rgb(232, 233, 237);
-const LIGHT_MUTED: Color32 = Color32::from_rgb(107, 111, 122);
+const LIGHT_MUTED: Color32 = Color32::from_rgb(91, 97, 108);
 const DARK_MUTED: Color32 = Color32::from_rgb(160, 163, 174);
 const SELECTION_STROKE_WIDTH: f32 = 2.0;
+const SETTINGS_NAV_WIDTH: f32 = 152.0;
+const SETTINGS_NAV_ITEM_WIDTH: f32 = 136.0;
+const SETTINGS_NAV_ITEM_HEIGHT: f32 = 40.0;
+const SETTINGS_CONTROL_RADIUS: u8 = 8;
+const SETTINGS_ROOT_RADIUS: u8 = 10;
+const SETTINGS_DIVIDER_INSET: f32 = 12.0;
+const SETTINGS_ROOT_DARK: Color32 = Color32::from_rgb(31, 32, 37);
+const SETTINGS_CARD_DARK: Color32 = Color32::from_rgb(39, 40, 46);
+const SETTINGS_CONTROL_DARK: Color32 = Color32::from_rgb(52, 54, 62);
+const SETTINGS_CONTROL_HOVER_DARK: Color32 = Color32::from_rgb(61, 63, 72);
+const SETTINGS_CARD_BORDER_DARK: Color32 = Color32::from_rgb(52, 54, 62);
+const SETTINGS_CARD_BORDER_LIGHT: Color32 = Color32::from_rgb(218, 221, 228);
+const SETTINGS_DIVIDER_LIGHT: Color32 = Color32::from_rgb(225, 227, 232);
 
 const STROKE_COLORS: [Color32; 7] = [
     Color32::from_rgb(31, 31, 31),
@@ -90,6 +107,7 @@ const COLOR_PICKER_COLORS: [Color32; 15] = [
 ];
 
 /// Immediate-mode UI state for the desktop whiteboard workspace.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct WorkspaceUi {
     active_tool: Tool,
     dark_mode: bool,
@@ -97,6 +115,9 @@ pub(crate) struct WorkspaceUi {
     appearance: AppearanceMode,
     settings_open: bool,
     settings_page: SettingsPage,
+    settings_baseline: Option<SettingsBaseline>,
+    settings_restore_baseline: Option<bool>,
+    new_document_confirmation: bool,
     restore_session: bool,
     autosave_interval: AutosaveInterval,
     autosave_directory: String,
@@ -106,11 +127,15 @@ pub(crate) struct WorkspaceUi {
     dark_palette: [Color32; 7],
     stabilization: f32,
     pressure_sensitivity: f32,
+    remember_drawing_style: bool,
     keybinds: Keybinds,
     capturing_keybind: Option<KeybindAction>,
     status: String,
     selected: BTreeSet<ElementId>,
+    element_clipboard: Vec<Element>,
     selection_gesture: Option<SelectionGesture>,
+    new_object_style: Style,
+    drawing_style_loaded: bool,
     draft_style: Style,
     custom_font_size: CustomFontSizeState,
     text_edit: Option<TextEditState>,
@@ -125,8 +150,12 @@ pub(crate) struct WorkspaceUi {
     pending_dropped_files: Vec<PathBuf>,
     drop_preview: Option<DropPreview>,
     drop_preview_decode: Option<Receiver<DropPreviewDecode>>,
+    drop_preview_cancel: Option<PreviewCancellation>,
+    preview_worker: PreviewWorker,
     drop_screen_position: Option<Pos2>,
-    image_textures: HashMap<ElementId, egui::TextureHandle>,
+    decoded_images: HashMap<ElementId, DecodedImage>,
+    image_textures: HashMap<ElementId, ImageTexture>,
+    renderer: Renderer,
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +191,8 @@ struct TextEditState {
     position: Point,
     rotation: f32,
     text: String,
+    /// Character-based insertion point within `text`.
+    cursor: usize,
     style: Style,
     just_started: bool,
 }
@@ -172,37 +203,23 @@ struct DropPreview {
     texture: Option<egui::TextureHandle>,
 }
 
-struct DropPreviewDecode {
-    path: PathBuf,
-    result: Result<(EmbeddedImage, Vec<u8>), DropPreviewDecodeError>,
+#[derive(Clone, Debug)]
+struct SettingsBaseline {
+    settings: settings::Settings,
+    new_object_style: Style,
+    drawing_style_loaded: bool,
+    draft_style: Style,
 }
 
-enum DropPreviewDecodeError {
-    Read(String),
-    Decode(ImageImportError),
+struct DecodedImage {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
 }
 
-fn start_drop_preview_decode(path: PathBuf) -> Receiver<DropPreviewDecode> {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        tracing::info!(
-            path = %path.display(),
-            "preparing hovered image preview"
-        );
-        let result = match fs::read(&path) {
-            Ok(bytes) => {
-                tracing::info!(
-                    path = %path.display(),
-                    bytes = bytes.len(),
-                    "hovered image preview bytes read"
-                );
-                embedded_image_with_rgba(bytes).map_err(DropPreviewDecodeError::Decode)
-            }
-            Err(error) => Err(DropPreviewDecodeError::Read(error.to_string())),
-        };
-        let _ = sender.send(DropPreviewDecode { path, result });
-    });
-    receiver
+struct ImageTexture {
+    fingerprint: u64,
+    texture: egui::TextureHandle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -281,6 +298,9 @@ struct Keybinds {
     arrow: KeyBinding,
     pan: KeyBinding,
     select_all: KeyBinding,
+    copy: KeyBinding,
+    paste: KeyBinding,
+    duplicate: KeyBinding,
     delete: KeyBinding,
     undo: KeyBinding,
     redo: KeyBinding,
@@ -336,6 +356,18 @@ impl Default for Keybinds {
                 key: Key::A,
                 modifiers: Modifiers::CTRL,
             },
+            copy: KeyBinding {
+                key: Key::C,
+                modifiers: Modifiers::CTRL,
+            },
+            paste: KeyBinding {
+                key: Key::V,
+                modifiers: Modifiers::CTRL,
+            },
+            duplicate: KeyBinding {
+                key: Key::D,
+                modifiers: Modifiers::CTRL,
+            },
             delete: KeyBinding {
                 key: Key::Backspace,
                 modifiers: Modifiers::NONE,
@@ -377,6 +409,9 @@ enum KeybindAction {
     Arrow,
     Pan,
     SelectAll,
+    Copy,
+    Paste,
+    Duplicate,
     Delete,
     Undo,
     Redo,
@@ -386,7 +421,7 @@ enum KeybindAction {
 }
 
 impl KeybindAction {
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 20] = [
         Self::Select,
         Self::Text,
         Self::Freehand,
@@ -398,6 +433,9 @@ impl KeybindAction {
         Self::Arrow,
         Self::Pan,
         Self::SelectAll,
+        Self::Copy,
+        Self::Paste,
+        Self::Duplicate,
         Self::Delete,
         Self::Undo,
         Self::Redo,
@@ -419,6 +457,9 @@ impl KeybindAction {
             Self::Arrow => "Arrow tool",
             Self::Pan => "Pan canvas",
             Self::SelectAll => "Select all",
+            Self::Copy => "Copy selection",
+            Self::Paste => "Paste selection",
+            Self::Duplicate => "Duplicate selection",
             Self::Delete => "Delete selection",
             Self::Undo => "Undo",
             Self::Redo => "Redo",
@@ -441,6 +482,9 @@ impl KeybindAction {
             Self::Arrow => Some(Tool::Arrow),
             Self::Pan => Some(Tool::Pan),
             Self::SelectAll
+            | Self::Copy
+            | Self::Paste
+            | Self::Duplicate
             | Self::Delete
             | Self::Undo
             | Self::Redo
@@ -465,6 +509,9 @@ impl Keybinds {
             KeybindAction::Arrow => self.arrow,
             KeybindAction::Pan => self.pan,
             KeybindAction::SelectAll => self.select_all,
+            KeybindAction::Copy => self.copy,
+            KeybindAction::Paste => self.paste,
+            KeybindAction::Duplicate => self.duplicate,
             KeybindAction::Delete => self.delete,
             KeybindAction::Undo => self.undo,
             KeybindAction::Redo => self.redo,
@@ -487,6 +534,9 @@ impl Keybinds {
             KeybindAction::Arrow => self.arrow = binding,
             KeybindAction::Pan => self.pan = binding,
             KeybindAction::SelectAll => self.select_all = binding,
+            KeybindAction::Copy => self.copy = binding,
+            KeybindAction::Paste => self.paste = binding,
+            KeybindAction::Duplicate => self.duplicate = binding,
             KeybindAction::Delete => self.delete = binding,
             KeybindAction::Undo => self.undo = binding,
             KeybindAction::Redo => self.redo = binding,
@@ -613,12 +663,15 @@ impl SelectionGesture {
                 .iter()
                 .map(|element| {
                     if elements.len() == 1 {
-                        let mut preview = element.clone();
-                        preview.transform =
-                            crate::selection::resize_transform(element, *handle, *pointer_current);
+                        let mut preview =
+                            crate::selection::resized_element(element, *handle, *pointer_current);
+                        apply_text_resize_font_size(&mut preview, element, *handle);
                         preview
                     } else {
-                        group_resized_element(element, *bounds, *handle, *pointer_current)
+                        let mut preview =
+                            group_resized_element(element, *bounds, *handle, *pointer_current);
+                        apply_text_resize_font_size(&mut preview, element, *handle);
+                        preview
                     }
                 })
                 .collect(),
@@ -651,9 +704,12 @@ impl Default for WorkspaceUi {
             appearance: AppearanceMode::System,
             settings_open: false,
             settings_page: SettingsPage::General,
+            settings_baseline: None,
+            settings_restore_baseline: None,
+            new_document_confirmation: false,
             restore_session: true,
             autosave_interval: AutosaveInterval::OneMinute,
-            autosave_directory: String::from("~/.cache/sketchi/sketchi.autosave"),
+            autosave_directory: settings::Settings::default().autosave_directory,
             light_canvas_color: LIGHT_CANVAS,
             dark_canvas_color: DARK_CANVAS,
             light_palette: STROKE_COLORS,
@@ -668,11 +724,15 @@ impl Default for WorkspaceUi {
             ],
             stabilization: 0.5,
             pressure_sensitivity: 0.5,
+            remember_drawing_style: true,
             keybinds: Keybinds::default(),
             capturing_keybind: None,
             status: String::from("Select a tool to start drawing"),
             selected: BTreeSet::new(),
+            element_clipboard: Vec::new(),
             selection_gesture: None,
+            new_object_style: Style::default(),
+            drawing_style_loaded: false,
             draft_style: Style::default(),
             custom_font_size: CustomFontSizeState::Closed,
             text_edit: None,
@@ -687,13 +747,156 @@ impl Default for WorkspaceUi {
             pending_dropped_files: Vec::new(),
             drop_preview: None,
             drop_preview_decode: None,
+            drop_preview_cancel: None,
+            preview_worker: PreviewWorker::new(),
             drop_screen_position: None,
+            decoded_images: HashMap::new(),
             image_textures: HashMap::new(),
+            renderer: Renderer::new(),
         }
     }
 }
 
 impl WorkspaceUi {
+    fn cancel_drop_preview_decode(&mut self) {
+        if let Some(cancel) = self.drop_preview_cancel.take() {
+            cancel.cancel();
+        }
+        self.drop_preview_decode = None;
+    }
+
+    pub(crate) const fn settings_dark_mode(&self) -> bool {
+        self.dark_mode
+    }
+
+    /// Creates workspace UI state from persisted preferences.
+    pub(crate) fn from_settings(settings: &settings::Settings) -> Self {
+        let mut workspace = Self::default();
+        workspace.apply_settings(settings);
+        workspace
+    }
+
+    /// Returns the preferences currently held by the workspace.
+    #[must_use]
+    pub(crate) fn settings_snapshot(&self) -> settings::Settings {
+        let mut keybinds = std::collections::BTreeMap::new();
+        for action in KeybindAction::ALL {
+            let binding = self.keybinds.binding(action);
+            keybinds.insert(
+                action.label().to_owned(),
+                settings::KeyBinding {
+                    key: binding.key.name().to_owned(),
+                    alt: binding.modifiers.alt,
+                    ctrl: binding.modifiers.ctrl,
+                    shift: binding.modifiers.shift,
+                    mac_cmd: binding.modifiers.mac_cmd,
+                    command: binding.modifiers.command,
+                },
+            );
+        }
+        settings::Settings {
+            version: 2,
+            appearance: match self.appearance {
+                AppearanceMode::System => settings::Appearance::System,
+                AppearanceMode::Light => settings::Appearance::Light,
+                AppearanceMode::Dark => settings::Appearance::Dark,
+            },
+            autosave_interval: match self.autosave_interval {
+                AutosaveInterval::ThirtySeconds => settings::AutosaveInterval::ThirtySeconds,
+                AutosaveInterval::OneMinute => settings::AutosaveInterval::OneMinute,
+                AutosaveInterval::FiveMinutes => settings::AutosaveInterval::FiveMinutes,
+                AutosaveInterval::TenMinutes => settings::AutosaveInterval::TenMinutes,
+                AutosaveInterval::Never => settings::AutosaveInterval::Never,
+            },
+            autosave_directory: self.autosave_directory.clone(),
+            light_canvas_color: self.light_canvas_color.to_array(),
+            dark_canvas_color: self.dark_canvas_color.to_array(),
+            light_palette: self.light_palette.iter().map(Color32::to_array).collect(),
+            dark_palette: self.dark_palette.iter().map(Color32::to_array).collect(),
+            stabilization: self.stabilization,
+            pressure_sensitivity: self.pressure_sensitivity,
+            remember_drawing_style: self.remember_drawing_style,
+            drawing_style: self.remember_drawing_style.then_some(self.new_object_style),
+            keybinds,
+        }
+    }
+
+    /// Applies persisted preferences with bounds and malformed-shortcut recovery.
+    pub(crate) fn apply_settings(&mut self, persisted: &settings::Settings) {
+        self.appearance = match persisted.appearance {
+            settings::Appearance::System => AppearanceMode::System,
+            settings::Appearance::Light => AppearanceMode::Light,
+            settings::Appearance::Dark => AppearanceMode::Dark,
+        };
+        self.autosave_interval = match persisted.autosave_interval {
+            settings::AutosaveInterval::ThirtySeconds => AutosaveInterval::ThirtySeconds,
+            settings::AutosaveInterval::OneMinute => AutosaveInterval::OneMinute,
+            settings::AutosaveInterval::FiveMinutes => AutosaveInterval::FiveMinutes,
+            settings::AutosaveInterval::TenMinutes => AutosaveInterval::TenMinutes,
+            settings::AutosaveInterval::Never => AutosaveInterval::Never,
+        };
+        if !persisted.autosave_directory.trim().is_empty() {
+            self.autosave_directory
+                .clone_from(&persisted.autosave_directory);
+        }
+        self.light_canvas_color = Color32::from_rgba_unmultiplied(
+            persisted.light_canvas_color[0],
+            persisted.light_canvas_color[1],
+            persisted.light_canvas_color[2],
+            persisted.light_canvas_color[3],
+        );
+        self.dark_canvas_color = Color32::from_rgba_unmultiplied(
+            persisted.dark_canvas_color[0],
+            persisted.dark_canvas_color[1],
+            persisted.dark_canvas_color[2],
+            persisted.dark_canvas_color[3],
+        );
+        apply_palette(&mut self.light_palette, &persisted.light_palette);
+        apply_palette(&mut self.dark_palette, &persisted.dark_palette);
+        self.stabilization = bounded_input_setting(persisted.stabilization);
+        self.pressure_sensitivity = bounded_input_setting(persisted.pressure_sensitivity);
+        self.remember_drawing_style = persisted.remember_drawing_style;
+        let saved_style = persisted
+            .drawing_style
+            .filter(|style| style.validate().is_ok());
+        self.drawing_style_loaded = self.remember_drawing_style && saved_style.is_some();
+        self.new_object_style = saved_style.unwrap_or_default();
+        self.draft_style = self.new_object_style;
+
+        let mut keybinds = Keybinds::default();
+        for action in KeybindAction::ALL {
+            let Some(saved) = persisted.keybinds.get(action.label()) else {
+                continue;
+            };
+            let Some(key) = Key::from_name(&saved.key) else {
+                continue;
+            };
+            let binding = KeyBinding {
+                key,
+                modifiers: Modifiers {
+                    alt: saved.alt,
+                    ctrl: saved.ctrl,
+                    shift: saved.shift,
+                    mac_cmd: saved.mac_cmd,
+                    command: saved.command,
+                },
+            };
+            let conflicts = KeybindAction::ALL
+                .into_iter()
+                .any(|other| other != action && keybinds.binding(other) == binding);
+            if !conflicts {
+                keybinds.set_binding(action, binding);
+            }
+        }
+        self.keybinds = keybinds;
+        self.dark_mode = match self.appearance {
+            AppearanceMode::System => self.system_dark_mode.unwrap_or(false),
+            AppearanceMode::Light => false,
+            AppearanceMode::Dark => true,
+        };
+        self.sync_draft_palette();
+    }
+
     /// Sets whether the last native-window geometry should be restored.
     pub(crate) fn set_restore_session(&mut self, restore_session: bool) {
         self.restore_session = restore_session;
@@ -712,7 +915,72 @@ impl WorkspaceUi {
     /// Closes the native settings window and abandons an in-progress shortcut capture.
     pub(crate) fn close_settings(&mut self) {
         self.settings_open = false;
+        self.settings_baseline = None;
+        self.settings_restore_baseline = None;
         self.capturing_keybind = None;
+    }
+
+    fn toggle_settings(&mut self) {
+        if self.settings_open {
+            self.close_settings();
+        } else {
+            self.settings_baseline = Some(SettingsBaseline {
+                settings: self.settings_snapshot(),
+                new_object_style: self.new_object_style,
+                drawing_style_loaded: self.drawing_style_loaded,
+                draft_style: self.draft_style,
+            });
+            self.settings_restore_baseline = Some(self.restore_session);
+            self.settings_open = true;
+        }
+    }
+
+    fn cancel_settings(&mut self) {
+        if let Some(baseline) = self.settings_baseline.take() {
+            self.apply_settings(&baseline.settings);
+            self.new_object_style = baseline.new_object_style;
+            self.drawing_style_loaded = baseline.drawing_style_loaded;
+            self.draft_style = baseline.draft_style;
+        }
+        if let Some(restore_session) = self.settings_restore_baseline.take() {
+            self.restore_session = restore_session;
+        }
+        self.settings_open = false;
+        self.capturing_keybind = None;
+    }
+
+    fn restore_settings_defaults(&mut self) {
+        let defaults = Self::default();
+        self.appearance = AppearanceMode::System;
+        self.restore_session = defaults.restore_session;
+        self.autosave_interval = defaults.autosave_interval;
+        self.autosave_directory
+            .clone_from(&defaults.autosave_directory);
+        self.light_canvas_color = defaults.light_canvas_color;
+        self.dark_canvas_color = defaults.dark_canvas_color;
+        self.light_palette = defaults.light_palette;
+        self.dark_palette = defaults.dark_palette;
+        self.stabilization = defaults.stabilization;
+        self.pressure_sensitivity = defaults.pressure_sensitivity;
+        self.remember_drawing_style = defaults.remember_drawing_style;
+        self.keybinds = defaults.keybinds;
+        self.new_object_style = defaults.new_object_style;
+        self.drawing_style_loaded = false;
+        self.draft_style = self.new_object_style;
+        self.capturing_keybind = None;
+        self.dark_mode = self.system_dark_mode.unwrap_or(false);
+        self.sync_draft_palette();
+    }
+
+    fn reset_drawing_style(&mut self) {
+        let style = Style {
+            stroke: to_core_color(self.active_palette()[0]),
+            ..Style::default()
+        };
+        self.new_object_style = style;
+        self.drawing_style_loaded = false;
+        self.draft_style = self.new_object_style;
+        self.status = String::from("Drawing style reset to defaults");
     }
 
     /// Requests a native clipboard image paste on the next canvas frame.
@@ -726,7 +994,7 @@ impl WorkspaceUi {
         if !hovered {
             self.egui_hovered_path = None;
             self.drop_preview = None;
-            self.drop_preview_decode = None;
+            self.cancel_drop_preview_decode();
             self.drop_screen_position = None;
         }
     }
@@ -748,7 +1016,10 @@ impl WorkspaceUi {
             .as_ref()
             .is_none_or(|preview| preview.path != path);
         if path_changed {
-            self.drop_preview_decode = Some(start_drop_preview_decode(path.clone()));
+            self.cancel_drop_preview_decode();
+            let (receiver, cancel) = self.preview_worker.queue(path.clone());
+            self.drop_preview_decode = Some(receiver);
+            self.drop_preview_cancel = Some(cancel);
             self.drop_preview = Some(DropPreview {
                 path,
                 image: None,
@@ -763,7 +1034,7 @@ impl WorkspaceUi {
         self.egui_hovered_path = None;
         self.drop_hovered = None;
         self.drop_preview = None;
-        self.drop_preview_decode = None;
+        self.cancel_drop_preview_decode();
         self.drop_screen_position = None;
     }
 
@@ -784,14 +1055,11 @@ impl WorkspaceUi {
         tools: &mut ToolController,
         camera: &mut Camera,
     ) {
+        tools.set_input_settings(self.stabilization, self.pressure_sensitivity);
         if self.appearance == AppearanceMode::System {
             self.dark_mode = self.system_dark_mode.unwrap_or(false);
         }
-        context.set_visuals(if self.dark_mode {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        });
+        context.set_visuals(sketchi_visuals(self.dark_mode));
 
         self.handle_keybind_input(context, editor, tools);
         self.show_canvas(context, editor, tools, camera);
@@ -835,7 +1103,7 @@ impl WorkspaceUi {
                 self.handle_dropped_images(context, editor, camera, canvas_rect);
                 self.handle_clipboard_image(context, editor, camera, canvas_rect);
                 self.prepare_drop_preview(context);
-                let input_document = editor.document();
+                let input_document = editor.document().clone();
                 if !navigation_handled {
                     self.handle_canvas_input(ui, &response, &input_document, editor, tools, camera);
                 }
@@ -852,15 +1120,18 @@ impl WorkspaceUi {
                     paint_drop_target(&painter, canvas_rect, self.dark_mode);
                 }
                 let document = editor.document();
-                let hovered_element =
-                    if self.active_tool == Tool::Select && self.selection_gesture.is_none() {
-                        response.hover_pos().and_then(|position| {
-                            let world = screen_to_world(*camera, position);
-                            hit_test(&document, world, selection_tolerance(camera.zoom()))
-                        })
-                    } else {
-                        None
-                    };
+                let scene = self.renderer.draw(document);
+                let hovered_element = if self.active_tool == Tool::Select
+                    && self.selection_gesture.is_none()
+                {
+                    response.hover_pos().and_then(|position| {
+                        let world = screen_to_world(*camera, position);
+                        self.renderer
+                            .hit_test(document, world, selection_tolerance(camera.zoom()))
+                    })
+                } else {
+                    None
+                };
                 let selection_preview = self
                     .selection_gesture
                     .as_ref()
@@ -873,12 +1144,14 @@ impl WorkspaceUi {
                 };
                 paint_document(
                     &painter,
-                    &document,
+                    document,
+                    &scene,
                     *camera,
                     hidden,
                     self.text_edit
                         .as_ref()
                         .and_then(|text_edit| text_edit.element_id),
+                    &mut self.decoded_images,
                     &mut self.image_textures,
                 );
                 self.paint_drop_preview(context, &painter, *camera, canvas_rect);
@@ -886,12 +1159,26 @@ impl WorkspaceUi {
                     paint_text_edit_preview(&painter, text_edit, *camera);
                 }
                 if let Some(mut preview) = tools.preview() {
-                    preview.style = self.draft_style;
-                    paint_element(&painter, &preview, *camera, &mut self.image_textures);
+                    preview.style = self.new_object_style;
+                    paint_element(
+                        &painter,
+                        &preview,
+                        None,
+                        *camera,
+                        &mut self.decoded_images,
+                        &mut self.image_textures,
+                    );
                 }
                 if !selection_preview.is_empty() {
                     for preview in &selection_preview {
-                        paint_element(&painter, preview, *camera, &mut self.image_textures);
+                        paint_element(
+                            &painter,
+                            preview,
+                            None,
+                            *camera,
+                            &mut self.decoded_images,
+                            &mut self.image_textures,
+                        );
                     }
                     let elements = selection_preview.iter().collect::<Vec<_>>();
                     paint_selection(&painter, &elements, *camera, self.dark_mode);
@@ -931,6 +1218,7 @@ impl WorkspaceUi {
         match result {
             Ok(decoded) => {
                 self.drop_preview_decode = None;
+                self.drop_preview_cancel = None;
                 let Some(preview) = self.drop_preview.as_ref() else {
                     return;
                 };
@@ -981,6 +1269,7 @@ impl WorkspaceUi {
             }
             Err(TryRecvError::Disconnected) => {
                 self.drop_preview_decode = None;
+                self.drop_preview_cancel = None;
                 tracing::warn!("hovered image preview worker stopped before returning a result");
             }
         }
@@ -1173,8 +1462,8 @@ impl WorkspaceUi {
                 bytes = bytes.len(),
                 "dropped image bytes read"
             );
-            let image = match embedded_image_from_bytes(bytes) {
-                Ok(image) => image,
+            let (image, rgba) = match embedded_image_with_rgba(bytes) {
+                Ok(decoded) => decoded,
                 Err(error) => {
                     tracing::warn!(
                         path = %path.display(),
@@ -1188,11 +1477,20 @@ impl WorkspaceUi {
             let offset = f32::from(u16::try_from(index).unwrap_or(u16::MAX)) * 24.0;
             let position = Point::new(world_position.x + offset, world_position.y + offset);
             let size = image_display_size(image.width, image.height);
+            let dimensions = (image.width, image.height);
             let element_id = ElementId::new();
             let mut element = Element::image(element_id, Transform::new(position, size), image);
-            element.style = self.draft_style;
+            element.style = image_style(self.new_object_style);
             match Self::execute_editor_command(editor, EditorCommand::Create(element)) {
                 Ok(_) => {
+                    self.decoded_images.insert(
+                        element_id,
+                        DecodedImage {
+                            width: dimensions.0,
+                            height: dimensions.1,
+                            rgba,
+                        },
+                    );
                     tracing::info!(
                         path = %path.display(),
                         element_id = ?element_id,
@@ -1235,6 +1533,9 @@ impl WorkspaceUi {
         if std::mem::take(&mut self.clipboard_paste_requested).is_none() {
             return;
         }
+        if !self.element_clipboard.is_empty() {
+            return;
+        }
         if self.text_edit.is_some() || context.wants_keyboard_input() {
             return;
         }
@@ -1257,6 +1558,7 @@ impl WorkspaceUi {
         let width = clipboard_image.width;
         let height = clipboard_image.height;
         let bytes = clipboard_image.into_owned_bytes().into_owned();
+        let cached_rgba = bytes.clone();
         let image = match embedded_image_from_rgba(width, height, bytes) {
             Ok(image) => image,
             Err(error) => {
@@ -1270,11 +1572,20 @@ impl WorkspaceUi {
             .unwrap_or_else(|| canvas.center());
         let position = screen_to_world(*camera, screen_position);
         let size = image_display_size(image.width, image.height);
+        let dimensions = (image.width, image.height);
         let element_id = ElementId::new();
         let mut element = Element::image(element_id, Transform::new(position, size), image);
-        element.style = self.draft_style;
+        element.style = image_style(self.new_object_style);
         match Self::execute_editor_command(editor, EditorCommand::Create(element)) {
             Ok(_) => {
+                self.decoded_images.insert(
+                    element_id,
+                    DecodedImage {
+                        width: dimensions.0,
+                        height: dimensions.1,
+                        rgba: cached_rgba,
+                    },
+                );
                 self.selected.clear();
                 self.selected.insert(element_id);
                 self.selection_gesture = None;
@@ -1284,6 +1595,7 @@ impl WorkspaceUi {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn show_text_editor(&mut self, context: &egui::Context, editor: &mut Editor, _camera: &Camera) {
         let mut commit = false;
         let mut cancel = false;
@@ -1296,25 +1608,65 @@ impl WorkspaceUi {
 
         for event in events {
             match event {
-                egui::Event::Text(text) => text_edit.text.push_str(&text),
+                egui::Event::Text(text) => {
+                    insert_text_at_cursor(&mut text_edit.text, &mut text_edit.cursor, &text);
+                }
+                egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.command => {
+                    delete_previous_word(&mut text_edit.text, &mut text_edit.cursor);
+                }
                 egui::Event::Key {
                     key: egui::Key::Backspace,
                     pressed: true,
                     ..
                 } => {
-                    text_edit.text.pop();
+                    if text_edit.cursor > 0 {
+                        let start =
+                            char_cursor_to_byte_index(&text_edit.text, text_edit.cursor - 1);
+                        let end = char_cursor_to_byte_index(&text_edit.text, text_edit.cursor);
+                        text_edit.text.replace_range(start..end, "");
+                        text_edit.cursor -= 1;
+                    }
+                }
+                egui::Event::Key {
+                    key: egui::Key::ArrowLeft,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.command => {
+                    text_edit.cursor = previous_word_cursor(&text_edit.text, text_edit.cursor);
+                }
+                egui::Event::Key {
+                    key: egui::Key::ArrowLeft,
+                    pressed: true,
+                    ..
+                } => {
+                    text_edit.cursor = previous_char_cursor(text_edit.cursor);
+                }
+                egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.command => {
+                    text_edit.cursor = next_word_cursor(&text_edit.text, text_edit.cursor);
+                }
+                egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    pressed: true,
+                    ..
+                } => {
+                    text_edit.cursor = next_char_cursor(&text_edit.text, text_edit.cursor);
                 }
                 egui::Event::Key {
                     key: egui::Key::Enter,
                     pressed: true,
-                    modifiers,
                     ..
-                } if modifiers.shift => text_edit.text.push('\n'),
-                egui::Event::Key {
-                    key: egui::Key::Enter,
-                    pressed: true,
-                    ..
-                } => commit = true,
+                } => insert_text_at_cursor(&mut text_edit.text, &mut text_edit.cursor, "\n"),
                 egui::Event::Key {
                     key: egui::Key::Escape,
                     pressed: true,
@@ -1341,7 +1693,7 @@ impl WorkspaceUi {
             {
                 self.selected.clear();
                 self.selected.insert(element_id);
-                self.sync_selected_style(&editor.document());
+                self.sync_selected_style(editor.document());
             }
             self.status = String::from("Text entry cancelled");
         } else if commit {
@@ -1472,11 +1824,12 @@ impl WorkspaceUi {
                 && let Some(position) = response.interact_pointer_pos()
             {
                 let world_position = screen_to_world(*camera, position);
-                let text_target =
-                    hit_test(document, world_position, selection_tolerance(camera.zoom()))
-                        .and_then(|element_id| document.element(element_id))
-                        .filter(|element| element.kind == ElementKind::Text)
-                        .cloned();
+                let text_target = self
+                    .renderer
+                    .hit_test(document, world_position, selection_tolerance(camera.zoom()))
+                    .and_then(|element_id| document.element(element_id))
+                    .filter(|element| element.kind == ElementKind::Text)
+                    .cloned();
                 if let Some(element) = text_target {
                     self.begin_text_edit(Some(&element));
                 } else {
@@ -1516,7 +1869,7 @@ impl WorkspaceUi {
                 && let Some(ToolOutput::Command(command)) =
                     tools.pointer_up(screen_to_world(*camera, position))
             {
-                let command = apply_draft_style(command, self.draft_style);
+                let command = apply_draft_style(command, self.new_object_style);
                 match Self::execute_editor_command(editor, command) {
                     Ok(_) => {
                         self.status = format!("Created {}", tool_name(self.active_tool));
@@ -1537,7 +1890,8 @@ impl WorkspaceUi {
             position,
             rotation: 0.0,
             text: String::new(),
-            style: self.draft_style,
+            cursor: 0,
+            style: self.new_object_style,
             just_started: true,
         });
         self.status = String::from("Type text, then click outside to place it");
@@ -1555,10 +1909,13 @@ impl WorkspaceUi {
             position: element.transform.position,
             rotation: element.transform.rotation,
             text: element.text.clone(),
+            cursor: element.text.chars().count(),
             style: element.style,
             just_started: true,
         });
-        self.status = String::from("Editing text — press Enter to save or Escape to cancel");
+        self.status = String::from(
+            "Editing text — press Enter for a new line, click outside to save or Escape to cancel",
+        );
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1574,7 +1931,8 @@ impl WorkspaceUi {
         let text_edit_target = if response.double_clicked() {
             response.interact_pointer_pos().and_then(|position| {
                 let world_position = screen_to_world(*camera, position);
-                hit_test(document, world_position, selection_tolerance(camera.zoom()))
+                self.renderer
+                    .hit_test(document, world_position, selection_tolerance(camera.zoom()))
                     .and_then(|element_id| document.element(element_id))
                     .filter(|element| element.kind == ElementKind::Text)
                     .cloned()
@@ -1684,7 +2042,7 @@ impl WorkspaceUi {
                 return;
             }
 
-            let hit = hit_test(document, world_position, tolerance);
+            let hit = self.renderer.hit_test(document, world_position, tolerance);
             let group_bounds_contains_pointer = self.selected.len() > 1
                 && selection_bounds(self.selected.iter().filter_map(|id| document.element(*id)))
                     .is_some_and(|bounds| {
@@ -1876,14 +2234,27 @@ impl WorkspaceUi {
                 let mut resized = 0_usize;
                 for element in elements {
                     let next = if count == 1 {
-                        let mut next = element.clone();
-                        next.transform =
-                            crate::selection::resize_transform(&element, handle, pointer_current);
+                        let mut next =
+                            crate::selection::resized_element(&element, handle, pointer_current);
+                        apply_text_resize_font_size(&mut next, &element, handle);
                         next
                     } else {
-                        group_resized_element(&element, bounds, handle, pointer_current)
+                        let mut next =
+                            group_resized_element(&element, bounds, handle, pointer_current);
+                        apply_text_resize_font_size(&mut next, &element, handle);
+                        next
                     };
                     let mut changed = false;
+                    if (next.style.font_size - element.style.font_size).abs() > f32::EPSILON {
+                        let _ = editor.execute(EditorCommand::SetStyle(
+                            element.id,
+                            StylePatch {
+                                font_size: Some(next.style.font_size),
+                                ..StylePatch::default()
+                            },
+                        ));
+                        changed = true;
+                    }
                     if next.transform.position != element.transform.position {
                         let _ = editor.execute(EditorCommand::SetPosition(
                             element.id,
@@ -1933,7 +2304,9 @@ impl WorkspaceUi {
     }
 
     fn select_at(&mut self, document: &Document, position: Point, zoom: f32, shift: bool) {
-        let hit = hit_test(document, position, selection_tolerance(zoom));
+        let hit = self
+            .renderer
+            .hit_test(document, position, selection_tolerance(zoom));
         if shift {
             if let Some(element_id) = hit
                 && !self.selected.remove(&element_id)
@@ -1963,6 +2336,8 @@ impl WorkspaceUi {
             && let Some(element) = document.element(*selected)
         {
             self.draft_style = element.style;
+        } else if self.selected.is_empty() {
+            self.draft_style = self.new_object_style;
         }
     }
 
@@ -1975,14 +2350,19 @@ impl WorkspaceUi {
     }
 
     fn sync_draft_palette(&mut self) {
-        if self.selected.is_empty() {
-            self.draft_style.stroke = to_core_color(self.active_palette()[0]);
+        if self.selected.is_empty() && !self.drawing_style_loaded {
+            let stroke = to_core_color(self.active_palette()[0]);
+            self.draft_style.stroke = stroke;
+            self.new_object_style.stroke = stroke;
         }
     }
 
     fn update_draft_palette_color(&mut self, previous: Color32, next: Color32) {
         if self.selected.is_empty() && to_color32(self.draft_style.stroke) == previous {
-            self.draft_style.stroke = to_core_color(next);
+            let stroke = to_core_color(next);
+            self.draft_style.stroke = stroke;
+            self.new_object_style.stroke = stroke;
+            self.drawing_style_loaded = true;
         }
     }
 
@@ -2037,7 +2417,7 @@ impl WorkspaceUi {
                     SelectionHandle::Left | SelectionHandle::Right => CursorIcon::ResizeHorizontal,
                 };
             }
-            if hit_test(document, world, tolerance) == Some(*selected) {
+            if self.renderer.hit_test(document, world, tolerance) == Some(*selected) {
                 return if dragging {
                     CursorIcon::Grabbing
                 } else {
@@ -2058,7 +2438,9 @@ impl WorkspaceUi {
             ) {
                 return resize_cursor(handle);
             }
-            if hit_test(document, world, selection_tolerance(camera.zoom()))
+            if self
+                .renderer
+                .hit_test(document, world, selection_tolerance(camera.zoom()))
                 .is_some_and(|id| self.selected.contains(&id))
                 || (world.x >= bounds.min.x
                     && world.x <= bounds.max().x
@@ -2077,6 +2459,9 @@ impl WorkspaceUi {
         editor: &mut Editor,
         tools: &mut ToolController,
     ) {
+        if self.new_document_confirmation {
+            return;
+        }
         if self.text_edit.is_some() {
             return;
         }
@@ -2139,8 +2524,13 @@ impl WorkspaceUi {
                 let document = editor.document();
                 self.choose_tool(Tool::Select, tools);
                 self.selected = document.elements().map(|element| element.id).collect();
-                self.sync_selected_style(&document);
+                self.sync_selected_style(document);
                 self.status = format!("Selected {} objects", self.selected.len());
+            }
+            Some(KeybindAction::Copy) => self.copy_selected(editor),
+            Some(KeybindAction::Paste) => self.paste_copied_elements(editor),
+            Some(KeybindAction::Duplicate) => {
+                self.apply_element_action(context, editor, ElementAction::Duplicate);
             }
             Some(KeybindAction::Delete) => self.delete_selected(editor),
             Some(KeybindAction::Undo) => {
@@ -2155,12 +2545,12 @@ impl WorkspaceUi {
                     Err(error) => error.to_string(),
                 };
             }
-            Some(KeybindAction::NewDocument) => self.new_document(editor),
+            Some(KeybindAction::NewDocument) => self.request_new_document(editor),
             Some(KeybindAction::Save) => {
-                self.status = String::from("Local save will use the journal");
+                self.save_document(editor);
             }
             Some(KeybindAction::Settings) => {
-                self.settings_open = !self.settings_open;
+                self.toggle_settings();
             }
             Some(action) => {
                 if let Some(tool) = action.tool() {
@@ -2173,6 +2563,49 @@ impl WorkspaceUi {
 
     fn set_keybind(&mut self, action: KeybindAction, binding: KeyBinding) {
         self.keybinds.set_binding(action, binding);
+    }
+
+    fn copy_selected(&mut self, editor: &Editor) {
+        let copied = self
+            .selected
+            .iter()
+            .filter_map(|id| editor.document().element(*id).cloned())
+            .collect::<Vec<_>>();
+        if copied.is_empty() {
+            self.status = String::from("Nothing selected to copy");
+        } else {
+            self.element_clipboard = copied;
+            self.status = String::from("Objects copied");
+        }
+    }
+
+    fn paste_copied_elements(&mut self, editor: &mut Editor) {
+        if self.element_clipboard.is_empty() {
+            self.status = String::from("Nothing to paste");
+            return;
+        }
+        self.create_element_copies(editor, self.element_clipboard.clone(), "Objects pasted");
+    }
+
+    fn create_element_copies(
+        &mut self,
+        editor: &mut Editor,
+        elements: Vec<Element>,
+        status: &'static str,
+    ) {
+        let mut copied_ids = BTreeSet::new();
+        for element in elements {
+            let offset = 24.0;
+            let mut copy = translated_element(&element, Point::new(offset, offset));
+            copy.id = ElementId::new();
+            if Self::execute_editor_command(editor, EditorCommand::Create(copy.clone())).is_ok() {
+                copied_ids.insert(copy.id);
+            }
+        }
+        if !copied_ids.is_empty() {
+            self.selected = copied_ids;
+            self.status = String::from(status);
+        }
     }
 
     fn delete_selected(&mut self, editor: &mut Editor) {
@@ -2189,11 +2622,94 @@ impl WorkspaceUi {
     }
 
     fn new_document(&mut self, editor: &mut Editor) {
+        if !self.save_document(editor) {
+            return;
+        }
         let client_id = editor.client_id();
         *editor = Editor::new(client_id);
         self.selected.clear();
         self.selection_gesture = None;
         self.status = String::from("New whiteboard created");
+    }
+
+    fn request_new_document(&mut self, editor: &mut Editor) {
+        if editor.document().is_empty() {
+            self.new_document(editor);
+        } else {
+            self.new_document_confirmation = true;
+        }
+    }
+
+    fn show_new_document_confirmation(&mut self, context: &egui::Context, editor: &mut Editor) {
+        if !self.new_document_confirmation {
+            return;
+        }
+
+        if context.input(|input| input.key_pressed(Key::Escape)) {
+            self.new_document_confirmation = false;
+            return;
+        }
+
+        let mut decision = None;
+        egui::Area::new(Id::new("sketchi.new_document_confirmation"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(context, |ui| {
+                confirmation_frame(self.dark_mode).show(ui, |ui| {
+                    ui.set_width(360.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("Create new whiteboard?")
+                                .size(18.0)
+                                .strong()
+                                .color(text_color(self.dark_mode)),
+                        );
+                    });
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("Your current work will be saved locally first.")
+                            .color(muted_color(self.dark_mode)),
+                    );
+                    ui.add_space(16.0);
+                    let button_width = ((ui.available_width() - 10.0) / 2.0).max(1.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        if button(
+                            ui,
+                            "Cancel",
+                            Vec2::new(button_width, STANDARD_CONTROL_SIZE.y),
+                            if self.dark_mode {
+                                Color32::from_rgb(52, 54, 62)
+                            } else {
+                                Color32::from_rgb(245, 246, 249)
+                            },
+                        )
+                        .clicked()
+                        {
+                            decision = Some(false);
+                        }
+                        if button(
+                            ui,
+                            egui::RichText::new("Save & create").color(Color32::WHITE),
+                            Vec2::new(button_width, STANDARD_CONTROL_SIZE.y),
+                            ACCENT,
+                        )
+                        .clicked()
+                        {
+                            decision = Some(true);
+                        }
+                    });
+                });
+            });
+
+        if let Some(save_and_create) = decision {
+            self.new_document_confirmation = false;
+            if save_and_create {
+                self.new_document(editor);
+            }
+        }
     }
 
     fn choose_tool(&mut self, tool: Tool, tools: &mut ToolController) {
@@ -2243,13 +2759,27 @@ impl WorkspaceUi {
             });
 
         if new_requested {
-            self.new_document(editor);
+            self.request_new_document(editor);
         }
         if save_requested {
-            self.status = String::from("Local save will use the journal");
+            self.save_document(editor);
         }
         if settings_requested {
-            self.settings_open = !self.settings_open;
+            self.toggle_settings();
+        }
+        self.show_new_document_confirmation(context, editor);
+    }
+
+    fn save_document(&mut self, editor: &Editor) -> bool {
+        match crate::storage::save_document(&self.autosave_directory, editor.document()) {
+            Ok(path) => {
+                self.status = format!("Saved locally to {}", path.display());
+                true
+            }
+            Err(error) => {
+                self.status = format!("Could not save locally: {error}");
+                false
+            }
         }
     }
 
@@ -2269,66 +2799,87 @@ impl WorkspaceUi {
         }
         let mut selected_page = self.settings_page;
         let pages = [
-            (SettingsPage::General, "General", Icon::Sun),
-            (SettingsPage::Keybinds, "Keybinds", Icon::Settings),
-            (SettingsPage::Input, "Input", Icon::Brush),
-            (SettingsPage::About, "About", Icon::Save),
+            (SettingsPage::General, "General", Icon::ListSettings),
+            (SettingsPage::Keybinds, "Keybinds", Icon::Keyboard),
+            (SettingsPage::Input, "Input", Icon::InputMethod),
+            (SettingsPage::About, "About", Icon::Information),
         ];
-        context.set_visuals(if self.dark_mode {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        });
+        context.set_visuals(settings_visuals(self.dark_mode));
+        let visuals_mode = self.dark_mode;
         self.handle_keybind_input(context, editor, tools);
+        let root_stroke = Stroke::new(
+            1.0_f32,
+            if self.dark_mode {
+                DARK_BORDER
+            } else {
+                LIGHT_BORDER
+            },
+        );
+        let root_corner_radius = CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: SETTINGS_ROOT_RADIUS,
+            se: SETTINGS_ROOT_RADIUS,
+        };
         egui::CentralPanel::default()
-            .frame(settings_window_frame(self.dark_mode))
+            // Paint the border explicitly inside the panel clip. A CentralPanel frame
+            // at the exact content bounds can have its outside half clipped, most
+            // noticeably on the right edge of a native settings window.
+            .frame(settings_window_frame(self.dark_mode).stroke(Stroke::NONE))
             .show(context, |ui| {
+                let root_rect = ui.max_rect();
                 let settings_body_width = ui.available_width();
                 let settings_body_height = ui.available_height();
                 ui.allocate_ui_with_layout(
                     Vec2::new(settings_body_width, settings_body_height),
-                    egui::Layout::left_to_right(egui::Align::Min),
+                    egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let footer_height = 49.0;
+                    let content_height = (settings_body_height - footer_height).max(0.0);
                     ui.allocate_ui_with_layout(
-                        Vec2::new(160.0, settings_body_height),
-                        egui::Layout::top_down(egui::Align::Min),
+                        Vec2::new(settings_body_width, content_height),
+                        egui::Layout::left_to_right(egui::Align::Min),
                         |ui| {
-                        ui.add_space(4.0);
-                        for (page, label, icon) in pages {
-                            if settings_nav_item(
-                                ui,
-                                label,
-                                icon,
-                                selected_page == page,
-                                self.dark_mode,
-                            )
-                            .clicked()
-                            {
-                                selected_page = page;
-                            }
-                        }
-                        ui.add_space(12.0);
-                        ui.label(
-                            egui::RichText::new("Sketchi settings")
-                                .size(11.0)
-                                .color(muted_color(self.dark_mode)),
-                        );
-                    });
-                    ui.separator();
-                    ui.add_space(22.0);
-                    let content_width = ui.available_width();
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(content_width, settings_body_height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt(("sketchi.settings.content", selected_page))
-                            .max_height(settings_body_height)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                        ui.set_width(content_width);
-                        match selected_page {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(SETTINGS_NAV_WIDTH, content_height),
+                                egui::Layout::top_down(egui::Align::Center),
+                                |ui| {
+                                    ui.add_space(12.0);
+                                    ui.spacing_mut().item_spacing.y = 4.0;
+                                    for (page, label, icon) in pages {
+                                        if settings_nav_item(
+                                            ui,
+                                            label,
+                                            icon,
+                                            selected_page == page,
+                                            self.dark_mode,
+                                        )
+                                        .clicked()
+                                        {
+                                            selected_page = page;
+                                        }
+                                    }
+                                },
+                            );
+                            settings_sidebar_divider(ui, content_height, self.dark_mode);
+                            ui.add_space(10.0);
+                            let content_width = ui.available_width();
+                            let page_width = (content_width - 12.0).max(0.0);
+                            let page_content_height = (content_height - 10.0).max(0.0);
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(content_width, content_height),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.add_space(10.0);
+                                    egui::ScrollArea::vertical()
+                                        .id_salt(("sketchi.settings.content", selected_page))
+                                        .max_height(page_content_height)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            ui.set_width(page_width);
+                                            match selected_page {
                         SettingsPage::General => {
                             ui.heading(
                                 egui::RichText::new("General")
@@ -2340,21 +2891,22 @@ impl WorkspaceUi {
                             );
                             ui.add_space(16.0);
                             settings_group_frame(self.dark_mode).show(ui, |ui| {
-                                ui.vertical_centered(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Session")
-                                            .strong()
-                                            .color(text_color(self.dark_mode)),
-                                    );
-                                });
+                                ui.label(
+                                    egui::RichText::new("Session")
+                                        .strong()
+                                        .color(text_color(self.dark_mode)),
+                                );
                                 ui.add_space(8.0);
                                 ui.checkbox(
                                     &mut self.restore_session,
                                     "Restore previous session on start",
                                 );
-                                ui.add_space(6.0);
-                                settings_form_row(ui, "Time interval for automatic saving", 160.0, |ui| {
-                                    dropdown_field(
+                                ui.add_space(8.0);
+                                settings_stacked_field(
+                                    ui,
+                                    "Time interval for automatic saving",
+                                    |ui| {
+                                    settings_dropdown_field(
                                         ui,
                                         "sketchi.autosave_interval",
                                         self.autosave_interval.label(),
@@ -2368,33 +2920,66 @@ impl WorkspaceUi {
                                             }
                                         },
                                     );
-                                });
-                                ui.add_space(6.0);
-                                settings_form_row(ui, "Directory for automatic saving", 160.0, |ui| {
-                                    text_field(
-                                        ui,
-                                        &mut self.autosave_directory,
-                                        "",
-                                    );
-                                });
+                                    },
+                                );
+                                ui.add_space(10.0);
+                                settings_stacked_field(
+                                    ui,
+                                    "Directory for automatic saving",
+                                    |ui| {
+                                        if settings_directory_field(
+                                            ui,
+                                            &mut self.autosave_directory,
+                                            self.dark_mode,
+                                        ) {
+                                            self.choose_autosave_directory();
+                                        }
+                                    },
+                                );
                             });
                             ui.add_space(12.0);
                             settings_group_frame(self.dark_mode).show(ui, |ui| {
-                                ui.vertical_centered(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Canvas")
-                                            .strong()
-                                            .color(text_color(self.dark_mode)),
-                                    );
-                                });
+                                ui.label(
+                                    egui::RichText::new("Drawing defaults")
+                                        .strong()
+                                        .color(text_color(self.dark_mode)),
+                                );
                                 ui.add_space(8.0);
-                                settings_form_row(ui, "Theme", 160.0, |ui| {
+                                ui.checkbox(
+                                    &mut self.remember_drawing_style,
+                                    "Remember last-used drawing style",
+                                );
+                                ui.add_space(8.0);
+                                if button(
+                                    ui,
+                                    "Reset drawing style to defaults",
+                                    Vec2::new(ui.available_width(), STANDARD_CONTROL_SIZE.y),
+                                    if self.dark_mode {
+                                        SETTINGS_CONTROL_DARK
+                                    } else {
+                                        Color32::from_rgb(245, 246, 249)
+                                    },
+                                )
+                                .clicked()
+                                {
+                                    self.reset_drawing_style();
+                                }
+                            });
+                            ui.add_space(12.0);
+                            settings_group_frame(self.dark_mode).show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("Canvas")
+                                        .strong()
+                                        .color(text_color(self.dark_mode)),
+                                );
+                                ui.add_space(8.0);
+                                settings_stacked_field(ui, "Theme", |ui| {
                                     let theme_label = match self.appearance {
                                         AppearanceMode::System => "Automatic",
                                         AppearanceMode::Light => "Light",
                                         AppearanceMode::Dark => "Dark",
                                     };
-                                    dropdown_field(
+                                    settings_dropdown_field(
                                         ui,
                                         "sketchi.canvas_theme",
                                         theme_label,
@@ -2419,6 +3004,8 @@ impl WorkspaceUi {
                                                     } else {
                                                         mode == AppearanceMode::Dark
                                                     };
+                                                    ui.ctx()
+                                                        .set_visuals(settings_visuals(self.dark_mode));
                                                     self.sync_draft_palette();
                                                 }
                                             }
@@ -2426,78 +3013,62 @@ impl WorkspaceUi {
                                     );
                                 });
                                 ui.add_space(8.0);
-                                settings_form_row(ui, "Light background color", 160.0, |ui| {
-                                    let light_color = color_swatch(
-                                        ui,
-                                        Some(self.light_canvas_color),
-                                        false,
-                                        self.dark_mode,
-                                    );
+                                let light_color = settings_color_row(
+                                    ui,
+                                    "Light background color",
+                                    self.light_canvas_color,
+                                    self.dark_mode,
+                                );
                                     if light_color.clicked() {
                                         self.light_canvas_color = next_settings_color(
                                             self.light_canvas_color,
                                         );
                                     }
-                                });
-                                settings_form_row(ui, "Dark background color", 160.0, |ui| {
-                                    let dark_color = color_swatch(
-                                        ui,
-                                        Some(self.dark_canvas_color),
-                                        false,
-                                        self.dark_mode,
-                                    );
+                                ui.add_space(8.0);
+                                let dark_color = settings_color_row(
+                                    ui,
+                                    "Dark background color",
+                                    self.dark_canvas_color,
+                                    self.dark_mode,
+                                );
                                     if dark_color.clicked() {
                                         self.dark_canvas_color =
                                             next_settings_color(self.dark_canvas_color);
                                     }
-                                });
                             });
                             ui.add_space(12.0);
                             settings_group_frame(self.dark_mode).show(ui, |ui| {
-                                ui.vertical_centered(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Color Palette")
-                                            .strong()
-                                            .color(text_color(self.dark_mode)),
-                                    );
-                                });
+                                ui.label(
+                                    egui::RichText::new("Color Palette")
+                                        .strong()
+                                        .color(text_color(self.dark_mode)),
+                                );
                                 ui.add_space(8.0);
-                                settings_form_row(ui, "Light Mode", 160.0, |ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    for index in 0..5 {
-                                        let Some(color) = self.light_palette.get(index).copied()
-                                        else {
-                                            continue;
-                                        };
-                                        if color_swatch(ui, Some(color), false, self.dark_mode)
-                                            .clicked()
-                                        {
-                                            let next = next_settings_color(color);
-                                            if let Some(slot) = self.light_palette.get_mut(index) {
-                                                *slot = next;
-                                            }
-                                            self.update_draft_palette_color(color, next);
-                                        }
+                                if let Some(index) = settings_palette_row(
+                                    ui,
+                                    "Light Mode",
+                                    &self.light_palette,
+                                    self.dark_mode,
+                                ) && let Some(color) = self.light_palette.get(index).copied() {
+                                    let next = next_settings_color(color);
+                                    if let Some(slot) = self.light_palette.get_mut(index) {
+                                        *slot = next;
                                     }
-                                });
-                                settings_form_row(ui, "Dark Mode", 160.0, |ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    for index in 0..5 {
-                                        let Some(color) = self.dark_palette.get(index).copied()
-                                        else {
-                                            continue;
-                                        };
-                                        if color_swatch(ui, Some(color), false, self.dark_mode)
-                                            .clicked()
-                                        {
-                                            let next = next_settings_color(color);
-                                            if let Some(slot) = self.dark_palette.get_mut(index) {
-                                                *slot = next;
-                                            }
-                                            self.update_draft_palette_color(color, next);
-                                        }
+                                    self.update_draft_palette_color(color, next);
+                                }
+                                ui.add_space(10.0);
+                                if let Some(index) = settings_palette_row(
+                                    ui,
+                                    "Dark Mode",
+                                    &self.dark_palette,
+                                    self.dark_mode,
+                                ) && let Some(color) = self.dark_palette.get(index).copied() {
+                                    let next = next_settings_color(color);
+                                    if let Some(slot) = self.dark_palette.get_mut(index) {
+                                        *slot = next;
                                     }
-                                });
+                                    self.update_draft_palette_color(color, next);
+                                }
                             });
                         }
                         SettingsPage::Keybinds => {
@@ -2516,73 +3087,31 @@ impl WorkspaceUi {
                                 .color(muted_color(self.dark_mode)),
                             );
                             ui.add_space(20.0);
-                            for action in KeybindAction::ALL {
-                                let label = action.label();
-                                let binding = self.keybinds.binding(action);
+                            let mut clicked_action = None;
+                            let card_gap = 12.0;
+                            let card_width = ((ui.available_width() - card_gap) * 0.5).max(180.0);
+                            for actions in KeybindAction::ALL.chunks(2) {
                                 ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 8.0;
-                                    let (label_rect, _) = ui.allocate_exact_size(
-                                        Vec2::new(235.0, STANDARD_CONTROL_SIZE.y),
-                                        Sense::hover(),
-                                    );
-                                    ui.painter().text(
-                                        label_rect.left_top(),
-                                        Align2::LEFT_TOP,
-                                        label,
-                                        FontId::proportional(13.0),
-                                        text_color(self.dark_mode),
-                                    );
-                                    ui.painter().text(
-                                        label_rect.left_top() + Vec2::new(0.0, 15.0),
-                                        Align2::LEFT_TOP,
-                                        key_binding_label(binding),
-                                        FontId::proportional(11.0),
-                                        muted_color(self.dark_mode),
-                                    );
-                                    let capturing = self.capturing_keybind == Some(action);
-                                    let shortcut_label = if capturing {
-                                        String::from("Press a key…")
-                                    } else {
-                                        String::from("Change shortcut")
-                                    };
-                                    let button = button(
-                                        ui,
-                                        egui::RichText::new(shortcut_label).color(if capturing {
-                                            Color32::WHITE
-                                        } else {
-                                            text_color(self.dark_mode)
-                                        }),
-                                        STANDARD_CONTROL_SIZE,
-                                        if capturing {
-                                            ACCENT
-                                        } else if self.dark_mode {
-                                            Color32::from_rgb(52, 54, 62)
-                                        } else {
-                                            Color32::from_rgb(245, 246, 249)
-                                        },
-                                    );
-                                    let button =
-                                        button.on_hover_text("Click to change this shortcut");
-                                    if button.clicked() {
-                                        self.capturing_keybind = Some(action);
+                                    ui.spacing_mut().item_spacing.x = card_gap;
+                                    for &action in actions {
+                                        let binding = self.keybinds.binding(action);
+                                        let capturing = self.capturing_keybind == Some(action);
+                                        if show_keybind_card(
+                                            ui,
+                                            action,
+                                            binding,
+                                            capturing,
+                                            self.dark_mode,
+                                            card_width,
+                                        ) {
+                                            clicked_action = Some(action);
+                                        }
                                     }
                                 });
-                                ui.add_space(8.0);
+                                ui.add_space(10.0);
                             }
-                            if button(
-                                ui,
-                                egui::RichText::new("Restore defaults").color(ACCENT),
-                                Vec2::new(104.0, STANDARD_CONTROL_SIZE.y),
-                                if self.dark_mode {
-                                    Color32::from_rgb(52, 54, 62)
-                                } else {
-                                    Color32::from_rgb(245, 246, 249)
-                                },
-                            )
-                            .clicked()
-                            {
-                                self.keybinds = Keybinds::default();
-                                self.capturing_keybind = None;
+                            if let Some(action) = clicked_action {
+                                self.capturing_keybind = Some(action);
                             }
                         }
                         SettingsPage::Input => {
@@ -2595,32 +3124,32 @@ impl WorkspaceUi {
                                     .color(muted_color(self.dark_mode)),
                             );
                             ui.add_space(16.0);
+                            let input_group_width = ui.available_width();
                             settings_group_frame(self.dark_mode).show(ui, |ui| {
-                                ui.vertical_centered(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Freehand settings")
-                                            .strong()
-                                            .color(text_color(self.dark_mode)),
-                                    );
-                                });
+                                ui.set_width((input_group_width - 16.0).max(0.0));
+                                ui.label(
+                                    egui::RichText::new("Freehand settings")
+                                        .strong()
+                                        .color(text_color(self.dark_mode)),
+                                );
                                 ui.add_space(12.0);
-                                ui.horizontal(|ui| {
-                                    ui.add_sized(
-                                        Vec2::new(125.0, 18.0),
-                                        egui::Label::new("Stabilization"),
-                                    );
+                                settings_form_row(ui, "Stabilization", SETTINGS_LABEL_WIDTH, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
                                     let stabilization_tooltip =
                                         format!("{:.0}%", self.stabilization * 100.0);
                                     let track = if self.dark_mode {
-                                        DARK_BORDER
+                                        SETTINGS_CARD_BORDER_DARK
                                     } else {
                                         LIGHT_BORDER
                                     };
+                                    let slider_width =
+                                        (ui.available_width() - INPUT_VALUE_WIDTH - INPUT_CONTROL_GAP)
+                                            .max(0.0);
                                     range_slider(
                                         ui,
                                         &mut self.stabilization,
                                         0.0..=1.0,
-                                        Vec2::new(180.0, 18.0),
+                                        Vec2::new(slider_width, 18.0),
                                         track,
                                         ACCENT,
                                         Some(stabilization_tooltip),
@@ -2629,40 +3158,46 @@ impl WorkspaceUi {
                                         ui,
                                         &mut self.stabilization,
                                         0.0..=1.0,
-                                        Vec2::new(58.0, 26.0),
+                                        Vec2::new(INPUT_VALUE_WIDTH, 30.0),
                                         "",
                                     );
                                 });
-                                ui.add_space(12.0);
-                                ui.horizontal(|ui| {
-                                    ui.add_sized(
-                                        Vec2::new(125.0, 18.0),
-                                        egui::Label::new("Pressure sensitivity"),
-                                    );
-                                    let pressure_tooltip =
-                                        format!("{:.0}%", self.pressure_sensitivity * 100.0);
-                                    let track = if self.dark_mode {
-                                        DARK_BORDER
-                                    } else {
-                                        LIGHT_BORDER
-                                    };
-                                    range_slider(
-                                        ui,
-                                        &mut self.pressure_sensitivity,
-                                        0.0..=1.0,
-                                        Vec2::new(180.0, 18.0),
-                                        track,
-                                        ACCENT,
-                                        Some(pressure_tooltip),
-                                    );
-                                    numeric_field(
-                                        ui,
-                                        &mut self.pressure_sensitivity,
-                                        0.0..=1.0,
-                                        Vec2::new(58.0, 26.0),
-                                        "",
-                                    );
-                                });
+                                ui.add_space(10.0);
+                                settings_form_row(
+                                    ui,
+                                    "Pressure sensitivity (when available)",
+                                    SETTINGS_LABEL_WIDTH,
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        let pressure_tooltip =
+                                            format!("{:.0}%", self.pressure_sensitivity * 100.0);
+                                        let track = if self.dark_mode {
+                                            SETTINGS_CARD_BORDER_DARK
+                                        } else {
+                                            LIGHT_BORDER
+                                        };
+                                        let slider_width = (ui.available_width()
+                                            - INPUT_VALUE_WIDTH
+                                            - INPUT_CONTROL_GAP)
+                                            .max(0.0);
+                                        range_slider(
+                                            ui,
+                                            &mut self.pressure_sensitivity,
+                                            0.0..=1.0,
+                                            Vec2::new(slider_width, 18.0),
+                                            track,
+                                            ACCENT,
+                                            Some(pressure_tooltip),
+                                        );
+                                        numeric_field(
+                                            ui,
+                                            &mut self.pressure_sensitivity,
+                                            0.0..=1.0,
+                                            Vec2::new(INPUT_VALUE_WIDTH, 30.0),
+                                            "",
+                                        );
+                                    },
+                                );
                             });
                         }
                         SettingsPage::About => {
@@ -2671,22 +3206,119 @@ impl WorkspaceUi {
                                     .color(text_color(self.dark_mode)),
                             );
                             ui.add_space(12.0);
-                            ui.label(
-                                egui::RichText::new("A collaborative Rust whiteboard for fast visual thinking.")
-                                    .color(text_color(self.dark_mode)),
-                            );
-                            ui.add_space(20.0);
-                            ui.label(
-                                egui::RichText::new("Draw, write, and work together on an infinite canvas.")
+                            let platform = platform_label();
+                            let build_type = if cfg!(debug_assertions) {
+                                "Development"
+                            } else {
+                                "Release"
+                            };
+                            settings_group_frame(self.dark_mode).show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("Sketchi")
+                                        .size(20.0)
+                                        .strong()
+                                        .color(text_color(self.dark_mode)),
+                                );
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "A collaborative Rust whiteboard for fast visual thinking.",
+                                    )
                                     .color(muted_color(self.dark_mode)),
-                            );
-                        }
-                        }
+                                );
+                                ui.add_space(16.0);
+                                ui.separator();
+                                ui.add_space(10.0);
+                                settings_info_row(
+                                    ui,
+                                    "Version",
+                                    env!("CARGO_PKG_VERSION"),
+                                    self.dark_mode,
+                                );
+                                settings_info_row(ui, "Platform", &platform, self.dark_mode);
+                                settings_info_row(ui, "Build", build_type, self.dark_mode);
+                                settings_info_row(ui, "License", "MIT", self.dark_mode);
+                                ui.add_space(12.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Draw, write, and work together on an infinite canvas.",
+                                    )
+                                    .color(muted_color(self.dark_mode)),
+                                );
                             });
-                    });
+                        }
+                        }
+                                        });
+                                },
+                            );
+                            ui.separator();
+                            ui.allocate_ui_with_layout(
+                                        Vec2::new(settings_body_width, 48.0),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                    ui.add_space(6.0);
+                                    if button(
+                                        ui,
+                                        "Defaults",
+                                        Vec2::new(90.0, 32.0),
+                                        if self.dark_mode {
+                                            SETTINGS_CONTROL_DARK
+                                        } else {
+                                            Color32::from_rgb(245, 246, 249)
+                                        },
+                                    )
+                                    .clicked()
+                                    {
+                                        self.restore_settings_defaults();
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if button(
+                                                ui,
+                                                "Cancel",
+                                                Vec2::new(82.0, 32.0),
+                                                if self.dark_mode {
+                                                    SETTINGS_CONTROL_DARK
+                                                } else {
+                                                    Color32::from_rgb(245, 246, 249)
+                                                },
+                                            )
+                                            .clicked()
+                                            {
+                                                self.cancel_settings();
+                                            }
+                                            if button(
+                                                ui,
+                                                egui::RichText::new("OK").color(Color32::WHITE),
+                                                Vec2::new(82.0, 32.0),
+                                                ACCENT,
+                                            )
+                                            .clicked()
+                                            {
+                                                self.close_settings();
+                                            }
+                                        },
+                                    );
+                                },
+                            );
+                        },
+                    );
                 });
-            });
+                ui.painter().rect_stroke(
+                    // StrokeKind::Inside keeps the complete stroke within the
+                    // client rect, so every edge uses the same origin without
+                    // introducing a half-pixel inset on the top and left.
+                    root_rect,
+                    root_corner_radius,
+                    root_stroke,
+                    StrokeKind::Inside,
+                );
+        });
 
+        if visuals_mode != self.dark_mode {
+            context.set_visuals(settings_visuals(self.dark_mode));
+        }
         self.settings_page = selected_page;
     }
 
@@ -3679,7 +4311,7 @@ impl WorkspaceUi {
     ) -> Result<canvas_core::OperationId, crate::editor::EditorError> {
         let command = match command {
             EditorCommand::Create(mut element) => {
-                element.z_index = next_z_index(&editor.document());
+                element.z_index = next_z_index(editor.document());
                 EditorCommand::Create(element)
             }
             command => command,
@@ -3696,6 +4328,8 @@ impl WorkspaceUi {
         let next_style = patch.apply_to(self.property_style(editor));
         if self.selected.is_empty() {
             self.draft_style = next_style;
+            self.new_object_style = next_style;
+            self.drawing_style_loaded = true;
             if let Some(text_edit) = &mut self.text_edit {
                 text_edit.style = next_style;
             }
@@ -3837,21 +4471,7 @@ impl WorkspaceUi {
                     .iter()
                     .filter_map(|id| editor.document().element(*id).cloned())
                     .collect::<Vec<_>>();
-                let mut duplicated = BTreeSet::new();
-                for (index, element) in elements.into_iter().enumerate() {
-                    let offset = 24.0 + f32::from(u16::try_from(index).unwrap_or(u16::MAX)) * 8.0;
-                    let mut copy = translated_element(&element, Point::new(offset, offset));
-                    copy.id = ElementId::new();
-                    if Self::execute_editor_command(editor, EditorCommand::Create(copy.clone()))
-                        .is_ok()
-                    {
-                        duplicated.insert(copy.id);
-                    }
-                }
-                if !duplicated.is_empty() {
-                    self.selected = duplicated;
-                    self.status = String::from("Objects duplicated");
-                }
+                self.create_element_copies(editor, elements, "Objects duplicated");
             }
             ElementAction::CopyLink => {
                 if let Some(element_id) = self.selected.iter().next() {
@@ -3859,6 +4479,19 @@ impl WorkspaceUi {
                     self.status = String::from("Element link copied");
                 }
             }
+        }
+    }
+
+    fn choose_autosave_directory(&mut self) {
+        let current = PathBuf::from(&self.autosave_directory);
+        let mut dialog = rfd::FileDialog::new().set_title("Choose automatic save folder");
+        if current.is_dir() {
+            dialog = dialog.set_directory(current);
+        } else if let Ok(directory) = env::current_dir() {
+            dialog = dialog.set_directory(directory);
+        }
+        if let Some(directory) = dialog.pick_folder() {
+            self.autosave_directory = directory.to_string_lossy().into_owned();
         }
     }
 
@@ -3941,28 +4574,111 @@ impl WorkspaceUi {
 fn settings_window_frame(dark_mode: bool) -> egui::Frame {
     egui::Frame::new()
         .fill(if dark_mode {
-            Color32::from_rgb(31, 32, 37)
+            SETTINGS_ROOT_DARK
         } else {
-            Color32::from_rgb(255, 255, 255)
+            LIGHT_CANVAS
         })
         .stroke(Stroke::new(
             1.0_f32,
             if dark_mode { DARK_BORDER } else { LIGHT_BORDER },
         ))
-        .corner_radius(CornerRadius::same(14))
-        .inner_margin(Margin::same(24))
+        .corner_radius(CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: SETTINGS_ROOT_RADIUS,
+            se: SETTINGS_ROOT_RADIUS,
+        })
+        .inner_margin(Margin::ZERO)
 }
 
 fn settings_group_frame(dark_mode: bool) -> egui::Frame {
     egui::Frame::new()
         .fill(if dark_mode {
-            Color32::from_rgb(39, 40, 46)
+            SETTINGS_CARD_DARK
         } else {
-            Color32::from_rgb(248, 249, 251)
+            LIGHT_PANEL
         })
-        .corner_radius(CornerRadius::same(9))
-        .inner_margin(Margin::same(14))
+        .stroke(Stroke::new(
+            1.0_f32,
+            if dark_mode {
+                SETTINGS_CARD_BORDER_DARK
+            } else {
+                SETTINGS_CARD_BORDER_LIGHT
+            },
+        ))
+        .corner_radius(CornerRadius::same(SETTINGS_CONTROL_RADIUS))
+        .inner_margin(Margin::same(8))
 }
+
+fn settings_sidebar_divider(ui: &mut egui::Ui, height: f32, dark_mode: bool) {
+    let divider_height = (height - 2.0 * SETTINGS_DIVIDER_INSET).max(0.0);
+    ui.allocate_ui_with_layout(
+        Vec2::new(1.0, height),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            ui.add_space(SETTINGS_DIVIDER_INSET);
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(1.0, divider_height), egui::Sense::hover());
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::ZERO,
+                if dark_mode {
+                    SETTINGS_CARD_BORDER_DARK
+                } else {
+                    SETTINGS_DIVIDER_LIGHT
+                },
+            );
+        },
+    );
+}
+
+fn sketchi_visuals(dark_mode: bool) -> egui::Visuals {
+    let mut visuals = if dark_mode {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    if !dark_mode {
+        let widget_fill = Color32::from_rgb(240, 242, 246);
+        let widget_hover = Color32::from_rgb(232, 235, 240);
+        let widget_active = Color32::from_rgb(222, 225, 232);
+        let weak_fill = Color32::from_rgb(246, 247, 249);
+        let text_stroke = Stroke::new(1.0_f32, LIGHT_TEXT);
+        let border_stroke = Stroke::new(1.0_f32, LIGHT_BORDER);
+
+        visuals.override_text_color = Some(LIGHT_TEXT);
+        visuals.weak_text_color = Some(LIGHT_MUTED);
+        visuals.extreme_bg_color = Color32::from_rgb(236, 238, 242);
+        visuals.text_edit_bg_color = Some(Color32::from_rgb(250, 251, 252));
+        visuals.window_fill = LIGHT_PANEL;
+        visuals.panel_fill = LIGHT_CANVAS;
+        visuals.widgets.noninteractive.bg_fill = LIGHT_PANEL;
+        visuals.widgets.noninteractive.bg_stroke = border_stroke;
+        visuals.widgets.noninteractive.fg_stroke = text_stroke;
+        visuals.widgets.inactive.bg_fill = widget_fill;
+        visuals.widgets.inactive.weak_bg_fill = weak_fill;
+        visuals.widgets.inactive.bg_stroke = border_stroke;
+        visuals.widgets.inactive.fg_stroke = text_stroke;
+        visuals.widgets.hovered.bg_fill = widget_hover;
+        visuals.widgets.hovered.weak_bg_fill = widget_fill;
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+        visuals.widgets.hovered.fg_stroke = text_stroke;
+        visuals.widgets.active.bg_fill = widget_active;
+        visuals.widgets.active.weak_bg_fill = widget_fill;
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+        visuals.widgets.active.fg_stroke = text_stroke;
+        visuals.widgets.open = visuals.widgets.active;
+        visuals.selection.bg_fill = ACCENT;
+        visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
+    }
+    visuals
+}
+
+const SETTINGS_LABEL_WIDTH: f32 = 220.0;
+const INPUT_VALUE_WIDTH: f32 = 96.0;
+const INPUT_CONTROL_GAP: f32 = 8.0;
+const SETTINGS_PALETTE_LABEL_WIDTH: f32 = 72.0;
+const SETTINGS_PALETTE_GAP: f32 = 12.0;
 
 fn settings_form_row(
     ui: &mut egui::Ui,
@@ -3970,15 +4686,173 @@ fn settings_form_row(
     label_width: f32,
     add_control: impl FnOnce(&mut egui::Ui),
 ) {
+    let control_width = (ui.available_width() - label_width - 10.0).max(0.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 10.0;
-        let (label_rect, _) = ui.allocate_exact_size(
+        ui.add_sized(
             Vec2::new(label_width, STANDARD_CONTROL_SIZE.y),
-            Sense::hover(),
+            egui::Label::new(label).truncate().halign(egui::Align::LEFT),
         );
-        ui.put(label_rect, egui::Label::new(label).truncate());
-        add_control(ui);
+        ui.allocate_ui_with_layout(
+            Vec2::new(control_width, STANDARD_CONTROL_SIZE.y),
+            egui::Layout::left_to_right(egui::Align::Center),
+            add_control,
+        );
     });
+}
+
+fn settings_stacked_field(ui: &mut egui::Ui, label: &str, add_control: impl FnOnce(&mut egui::Ui)) {
+    ui.vertical(|ui| {
+        ui.label(label);
+        ui.add_space(5.0);
+        let width = ui.available_width();
+        ui.allocate_ui_with_layout(
+            Vec2::new(width, STANDARD_CONTROL_SIZE.y),
+            egui::Layout::left_to_right(egui::Align::Center),
+            add_control,
+        );
+    });
+}
+
+fn settings_dropdown_field(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    selected_text: &str,
+    add_options: impl FnOnce(&mut egui::Ui),
+) {
+    let width = ui.available_width();
+    let _ = dropdown_field_sized(ui, id, selected_text, width, add_options);
+}
+
+fn settings_directory_field(ui: &mut egui::Ui, value: &mut String, dark_mode: bool) -> bool {
+    let width = ui.available_width();
+    let browse_width = 88.0;
+    let field_width = (width - browse_width - 8.0).max(1.0);
+    let mut choose = false;
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, STANDARD_CONTROL_SIZE.y),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let _ = sized_text_field(
+                ui,
+                value,
+                Vec2::new(field_width, STANDARD_CONTROL_SIZE.y),
+                "",
+            );
+            choose = button(
+                ui,
+                "Choose…",
+                Vec2::new(browse_width, STANDARD_CONTROL_SIZE.y),
+                if dark_mode {
+                    SETTINGS_CONTROL_DARK
+                } else {
+                    Color32::from_rgb(245, 246, 249)
+                },
+            )
+            .clicked();
+        },
+    );
+    choose
+}
+
+fn settings_info_row(ui: &mut egui::Ui, label: &str, value: &str, dark_mode: bool) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        ui.add_sized(
+            Vec2::new(100.0, STANDARD_CONTROL_SIZE.y),
+            egui::Label::new(egui::RichText::new(label).color(muted_color(dark_mode)))
+                .halign(egui::Align::LEFT),
+        );
+        ui.label(
+            egui::RichText::new(value)
+                .color(text_color(dark_mode))
+                .strong(),
+        );
+    });
+}
+
+fn platform_label() -> String {
+    let architecture = std::env::consts::ARCH;
+    let platform = if cfg!(target_os = "windows") {
+        windows_platform_name()
+    } else if cfg!(target_os = "linux") {
+        linux_platform_name()
+    } else {
+        match std::env::consts::OS {
+            "macos" => String::from("macOS"),
+            "freebsd" => String::from("FreeBSD"),
+            os => os.to_owned(),
+        }
+    };
+    format!("{platform} {architecture}")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_platform_name() -> String {
+    let release = fs::read_to_string("/etc/os-release").unwrap_or_default();
+    if release.contains("CachyOS")
+        || release.lines().any(|line| {
+            line.trim().eq_ignore_ascii_case("ID=cachyos")
+                || line.trim().eq_ignore_ascii_case("ID=\"cachyos\"")
+        })
+    {
+        String::from("CachyOS")
+    } else {
+        String::from("Linux")
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_platform_name() -> String {
+    String::from("Linux")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_platform_name() -> String {
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    let mut version = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    let status = unsafe { RtlGetVersion(&mut version) };
+    if status >= 0 && version.dwMajorVersion == 10 && version.dwMinorVersion == 0 {
+        let release = if version.dwBuildNumber >= 22_000 {
+            "Windows 11"
+        } else {
+            "Windows 10"
+        };
+        format!("{release} (build {})", version.dwBuildNumber)
+    } else {
+        format!(
+            "Windows {}.{} (build {})",
+            version.dwMajorVersion, version.dwMinorVersion, version.dwBuildNumber
+        )
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_platform_name() -> String {
+    String::from("Windows")
+}
+
+fn settings_color_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    color: Color32,
+    dark_mode: bool,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        ui.add_sized(
+            Vec2::new(133.0, STANDARD_CONTROL_SIZE.y),
+            egui::Label::new(egui::RichText::new(label).color(text_color(dark_mode))),
+        );
+        color_swatch(ui, Some(color), false, dark_mode)
+    })
+    .inner
 }
 
 fn settings_nav_item(
@@ -3988,25 +4862,28 @@ fn settings_nav_item(
     selected: bool,
     dark_mode: bool,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(160.0, 38.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(SETTINGS_NAV_ITEM_WIDTH, SETTINGS_NAV_ITEM_HEIGHT),
+        Sense::click(),
+    );
     let fill = if selected {
         if dark_mode {
-            Color32::from_rgb(65, 62, 128)
+            ACCENT
         } else {
-            Color32::from_rgb(232, 230, 255)
+            Color32::from_rgb(225, 221, 253)
         }
     } else if response.hovered() {
         if dark_mode {
-            Color32::from_rgb(48, 49, 56)
+            SETTINGS_CONTROL_HOVER_DARK
         } else {
-            Color32::from_rgb(246, 247, 250)
+            Color32::from_rgb(235, 237, 242)
         }
     } else {
         Color32::TRANSPARENT
     };
     ui.painter().rect(
         rect,
-        CornerRadius::same(7),
+        CornerRadius::same(SETTINGS_CONTROL_RADIUS),
         fill,
         Stroke::NONE,
         StrokeKind::Inside,
@@ -4016,21 +4893,21 @@ fn settings_nav_item(
         icon,
         Rect::from_center_size(
             Pos2::new(rect.left() + 22.0, rect.center().y),
-            Vec2::splat(22.0),
+            Vec2::splat(20.0),
         ),
         if selected {
-            ACCENT
+            if dark_mode { Color32::WHITE } else { ACCENT }
         } else {
             muted_color(dark_mode)
         },
     );
     ui.painter().text(
-        Pos2::new(rect.left() + 42.0, rect.center().y),
+        Pos2::new(rect.left() + 44.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::new(14.0, egui::FontFamily::Proportional),
+        FontId::new(13.0, egui::FontFamily::Proportional),
         if selected {
-            text_color(dark_mode)
+            if dark_mode { Color32::WHITE } else { ACCENT }
         } else {
             muted_color(dark_mode)
         },
@@ -4038,10 +4915,134 @@ fn settings_nav_item(
     response
 }
 
+fn show_keybind_card(
+    ui: &mut egui::Ui,
+    action: KeybindAction,
+    binding: KeyBinding,
+    capturing: bool,
+    dark_mode: bool,
+    width: f32,
+) -> bool {
+    let mut clicked = false;
+    ui.push_id(action.label(), |ui| {
+        settings_keybind_card_frame(dark_mode).show(ui, |ui| {
+            ui.set_width((width - 22.0).max(1.0));
+            ui.vertical_centered(|ui| {
+                let header_width = ui.available_width();
+                ui.allocate_ui_with_layout(
+                    Vec2::new(header_width, 22.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(action.label())
+                                    .size(12.0)
+                                    .color(text_color(dark_mode)),
+                            )
+                            .truncate(),
+                        );
+                        shortcut_pill(ui, binding, dark_mode);
+                    },
+                );
+                ui.add_space(8.0);
+                let button_label = if capturing {
+                    "Press a key…"
+                } else {
+                    "Change shortcut"
+                };
+                let button = button(
+                    ui,
+                    egui::RichText::new(button_label).color(if capturing {
+                        Color32::WHITE
+                    } else {
+                        text_color(dark_mode)
+                    }),
+                    Vec2::new(ui.available_width(), STANDARD_CONTROL_SIZE.y),
+                    if capturing {
+                        ACCENT
+                    } else if dark_mode {
+                        SETTINGS_CONTROL_DARK
+                    } else {
+                        Color32::from_rgb(238, 239, 243)
+                    },
+                );
+                clicked = button
+                    .on_hover_text("Click to change this shortcut")
+                    .clicked();
+            });
+        });
+    });
+    clicked
+}
+
+fn settings_keybind_card_frame(dark_mode: bool) -> egui::Frame {
+    egui::Frame::new()
+        .fill(if dark_mode {
+            SETTINGS_CARD_DARK
+        } else {
+            Color32::from_rgb(248, 249, 251)
+        })
+        .stroke(Stroke::new(
+            1.0_f32,
+            if dark_mode {
+                SETTINGS_CARD_BORDER_DARK
+            } else {
+                LIGHT_BORDER
+            },
+        ))
+        .corner_radius(CornerRadius::same(SETTINGS_CONTROL_RADIUS))
+        .inner_margin(Margin::same(10))
+}
+
+fn shortcut_pill(ui: &mut egui::Ui, binding: KeyBinding, dark_mode: bool) -> egui::Response {
+    let label = key_binding_label(binding);
+    let color = text_color(dark_mode);
+    let width = ui.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(label.clone(), FontId::proportional(11.0), color)
+            .size()
+            .x
+            .max(24.0)
+            + 16.0
+    });
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::hover());
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(SETTINGS_CONTROL_RADIUS),
+        if dark_mode {
+            SETTINGS_CONTROL_HOVER_DARK
+        } else {
+            Color32::from_rgb(232, 233, 238)
+        },
+        Stroke::new(
+            1.0_f32,
+            if dark_mode {
+                SETTINGS_CARD_BORDER_DARK
+            } else {
+                LIGHT_BORDER
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(11.0),
+        color,
+    );
+    response
+}
+
 fn key_binding_label(binding: KeyBinding) -> String {
     let mut label = String::new();
-    if binding.modifiers.command {
-        label.push_str("Ctrl + ");
+    if binding.modifiers.command || binding.modifiers.ctrl {
+        label.push_str(if binding.modifiers.mac_cmd {
+            "Cmd + "
+        } else {
+            "Ctrl + "
+        });
     }
     if binding.modifiers.alt {
         label.push_str("Alt + ");
@@ -4080,6 +5081,23 @@ fn properties_frame(dark_mode: bool) -> egui::Frame {
             if dark_mode { DARK_BORDER } else { LIGHT_BORDER },
         ))
         .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 12))
+}
+
+fn confirmation_frame(dark_mode: bool) -> egui::Frame {
+    egui::Frame::new()
+        .fill(if dark_mode { DARK_PANEL } else { LIGHT_PANEL })
+        .stroke(Stroke::new(
+            1.0_f32,
+            if dark_mode { DARK_BORDER } else { LIGHT_BORDER },
+        ))
+        .corner_radius(CornerRadius::same(8))
+        .shadow(egui::Shadow {
+            offset: [0, 4],
+            blur: 16,
+            spread: 1,
+            color: Color32::from_rgba_unmultiplied(0, 0, 0, if dark_mode { 64 } else { 32 }),
+        })
         .inner_margin(Margin::symmetric(12, 12))
 }
 
@@ -4159,6 +5177,20 @@ fn next_settings_color(current: Color32) -> Color32 {
         .get((index + 1) % colors.len())
         .copied()
         .unwrap_or(current)
+}
+
+fn apply_palette(target: &mut [Color32; 7], persisted: &[[u8; 4]]) {
+    for (target, color) in target.iter_mut().zip(persisted.iter()) {
+        *target = Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+    }
+}
+
+fn bounded_input_setting(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.5
+    }
 }
 
 fn kde_system_dark_mode() -> Option<bool> {
@@ -4474,24 +5506,44 @@ fn grid_step_for_zoom(zoom: f32) -> f32 {
     1024.0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_document(
     painter: &Painter,
     document: &Document,
+    scene: &Scene,
     camera: Camera,
     hidden: Option<&BTreeSet<ElementId>>,
     editing_element_id: Option<ElementId>,
-    image_textures: &mut HashMap<ElementId, egui::TextureHandle>,
+    decoded_images: &mut HashMap<ElementId, DecodedImage>,
+    image_textures: &mut HashMap<ElementId, ImageTexture>,
 ) {
-    let mut elements = document
-        .elements()
-        .filter(|element| {
-            !hidden.is_some_and(|hidden| hidden.contains(&element.id))
-                && editing_element_id != Some(element.id)
-        })
-        .collect::<Vec<_>>();
-    elements.sort_by_key(|element| (element.z_index, element.id));
-    for element in elements {
-        paint_element(painter, element, camera, image_textures);
+    image_textures.retain(|id, _| {
+        document
+            .element(*id)
+            .is_some_and(|element| element.kind == ElementKind::Image && element.image.is_some())
+    });
+    decoded_images.retain(|id, _| {
+        document
+            .element(*id)
+            .is_some_and(|element| element.kind == ElementKind::Image && element.image.is_some())
+    });
+    for primitive in scene.primitives() {
+        let Some(element) = document.element(primitive.id()) else {
+            continue;
+        };
+        if hidden.is_some_and(|hidden| hidden.contains(&element.id))
+            || editing_element_id == Some(element.id)
+        {
+            continue;
+        }
+        paint_element(
+            painter,
+            element,
+            Some(primitive),
+            camera,
+            decoded_images,
+            image_textures,
+        );
     }
 }
 
@@ -4554,6 +5606,80 @@ fn resized_text_transform_for_content(
     }
 }
 
+fn apply_text_resize_font_size(next: &mut Element, original: &Element, handle: SelectionHandle) {
+    if next.kind != ElementKind::Text {
+        return;
+    }
+
+    let scale = match (handle.horizontal(), handle.vertical()) {
+        (Some(_), _) => axis_scale(original.transform.size.width, next.transform.size.width),
+        (None, Some(_)) => axis_scale(original.transform.size.height, next.transform.size.height),
+        (None, None) => 1.0,
+    };
+    next.style.font_size = (original.style.font_size * scale).clamp(1.0, 512.0);
+}
+
+fn axis_scale(original: f32, next: f32) -> f32 {
+    if original > f32::EPSILON {
+        (next / original).max(0.01)
+    } else {
+        1.0
+    }
+}
+
+fn char_cursor_to_byte_index(text: &str, cursor: usize) -> usize {
+    text.char_indices()
+        .nth(cursor)
+        .map_or(text.len(), |(index, _)| index)
+}
+
+fn insert_text_at_cursor(text: &mut String, cursor: &mut usize, inserted: &str) {
+    let character_cursor = (*cursor).min(text.chars().count());
+    let byte_index = char_cursor_to_byte_index(text, character_cursor);
+    text.insert_str(byte_index, inserted);
+    *cursor = character_cursor.saturating_add(inserted.chars().count());
+}
+
+fn previous_char_cursor(cursor: usize) -> usize {
+    cursor.saturating_sub(1)
+}
+
+fn next_char_cursor(text: &str, cursor: usize) -> usize {
+    (cursor + 1).min(text.chars().count())
+}
+
+fn previous_word_cursor(text: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut cursor = cursor.min(chars.len());
+    while cursor > 0 && chars.get(cursor - 1).is_some_and(|ch| ch.is_whitespace()) {
+        cursor -= 1;
+    }
+    while cursor > 0 && chars.get(cursor - 1).is_some_and(|ch| !ch.is_whitespace()) {
+        cursor -= 1;
+    }
+    cursor
+}
+
+fn next_word_cursor(text: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut cursor = cursor.min(chars.len());
+    while cursor < chars.len() && chars.get(cursor).is_some_and(|ch| !ch.is_whitespace()) {
+        cursor += 1;
+    }
+    while cursor < chars.len() && chars.get(cursor).is_some_and(|ch| ch.is_whitespace()) {
+        cursor += 1;
+    }
+    cursor
+}
+
+fn delete_previous_word(text: &mut String, cursor: &mut usize) {
+    let start = previous_word_cursor(text, *cursor);
+    let start_byte = char_cursor_to_byte_index(text, start);
+    let end_byte = char_cursor_to_byte_index(text, *cursor);
+    text.replace_range(start_byte..end_byte, "");
+    *cursor = start;
+}
+
 fn full_style_patch(style: Style) -> StylePatch {
     StylePatch {
         stroke: Some(style.stroke),
@@ -4586,22 +5712,17 @@ fn paint_text_edit_preview(painter: &Painter, text_edit: &TextEditState, camera:
         TextAlign::Right => screen_position - Vec2::new(text_width, 0.0),
     };
     let text_rect = Rect::from_min_size(text_position, galley.size());
+    let caret = galley.pos_from_cursor(egui::text::CCursor::new(text_edit.cursor));
     let rotated_position = rotated_text_origin(text_position, text_rect, text_edit.rotation);
     painter.add(TextShape::new(rotated_position, galley, color).with_angle(text_edit.rotation));
 
-    let caret_x = match text_edit.style.text_align {
-        TextAlign::Left => screen_position.x + text_width,
-        TextAlign::Center => screen_position.x + text_width / 2.0,
-        TextAlign::Right => screen_position.x,
-    };
-    let caret_height = (font_id.size * 1.25).max(16.0);
     let caret_start = rotate_screen_point(
-        Pos2::new(caret_x, screen_position.y),
+        text_position + caret.min.to_vec2(),
         text_rect.center(),
         text_edit.rotation,
     );
     let caret_end = rotate_screen_point(
-        Pos2::new(caret_x, screen_position.y + caret_height),
+        text_position + caret.max.to_vec2(),
         text_rect.center(),
         text_edit.rotation,
     );
@@ -4612,8 +5733,10 @@ fn paint_text_edit_preview(painter: &Painter, text_edit: &TextEditState, camera:
 fn paint_element(
     painter: &Painter,
     element: &Element,
+    primitive: Option<&RenderPrimitive>,
     camera: Camera,
-    image_textures: &mut HashMap<ElementId, egui::TextureHandle>,
+    decoded_images: &mut HashMap<ElementId, DecodedImage>,
+    image_textures: &mut HashMap<ElementId, ImageTexture>,
 ) {
     let min = camera.world_to_screen(element.transform.position);
     let size = Vec2::new(
@@ -4819,7 +5942,24 @@ fn paint_element(
             }
         }
         ElementKind::Line | ElementKind::Arrow => {
-            let base_points = element_screen_points(element, camera, rect);
+            let base_points = primitive
+                .and_then(|primitive| match primitive {
+                    RenderPrimitive::Line { points, .. }
+                    | RenderPrimitive::Arrow { points, .. } => Some(points),
+                    _ => None,
+                })
+                .map_or_else(
+                    || element_screen_points(element, camera, rect),
+                    |points| {
+                        points
+                            .iter()
+                            .map(|point| {
+                                let screen = camera.world_to_screen(*point);
+                                Pos2::new(screen.x, screen.y)
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                );
             let points = sloppy_polyline(
                 &base_points,
                 element.style.sloppiness,
@@ -4843,20 +5983,16 @@ fn paint_element(
             }
         }
         ElementKind::Freehand => {
-            let center = Point::new(
-                element.transform.position.x + element.transform.size.width / 2.0,
-                element.transform.position.y + element.transform.size.height / 2.0,
-            );
-            let points: Vec<Pos2> = element
-                .points
+            let points: Vec<Pos2> = primitive
+                .and_then(|primitive| match primitive {
+                    RenderPrimitive::Freehand { points, .. } => Some(points),
+                    _ => None,
+                })
+                .unwrap_or(&element.points)
                 .iter()
                 .copied()
                 .map(|point| {
-                    let screen = camera.world_to_screen(rotate_around(
-                        point,
-                        center,
-                        element.transform.rotation,
-                    ));
+                    let screen = camera.world_to_screen(point);
                     Pos2::new(screen.x, screen.y)
                 })
                 .collect();
@@ -4872,6 +6008,7 @@ fn paint_element(
             stroke,
             corner_radius,
             element.transform.rotation,
+            decoded_images,
             image_textures,
         ),
     }
@@ -4902,10 +6039,30 @@ fn text_anchor(rect: Rect, align: TextAlign) -> (Align2, Pos2) {
     }
 }
 
+fn image_fingerprint(image: &EmbeddedImage) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in image.mime_type.bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+    }
+    for byte in image
+        .width
+        .to_le_bytes()
+        .into_iter()
+        .chain(image.height.to_le_bytes())
+    {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+    }
+    for byte in &image.bytes {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
 fn rotated_text_origin(position: Pos2, rect: Rect, rotation: f32) -> Pos2 {
     rotate_screen_point(position, rect.center(), rotation)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_image(
     painter: &Painter,
     element: &Element,
@@ -4913,7 +6070,8 @@ fn paint_image(
     stroke: Stroke,
     corner_radius: u8,
     rotation: f32,
-    image_textures: &mut HashMap<ElementId, egui::TextureHandle>,
+    decoded_images: &mut HashMap<ElementId, DecodedImage>,
+    image_textures: &mut HashMap<ElementId, ImageTexture>,
 ) {
     let Some(image) = element.image.as_ref() else {
         paint_image_placeholder(
@@ -4927,63 +6085,92 @@ fn paint_image(
         );
         return;
     };
-    if let Entry::Vacant(entry) = image_textures.entry(element.id) {
-        let Ok(decoded) = image::load_from_memory(&image.bytes) else {
-            paint_image_placeholder(
-                painter,
-                rect,
-                stroke,
-                corner_radius,
-                rotation,
-                element.style.sloppiness,
-                element.id.as_uuid().as_u128(),
-            );
-            return;
+    let fingerprint = image_fingerprint(image);
+    let needs_upload = image_textures
+        .get(&element.id)
+        .is_none_or(|cached| cached.fingerprint != fingerprint);
+    if needs_upload {
+        image_textures.remove(&element.id);
+        let (width, height, rgba) = if let Some(decoded) = decoded_images.remove(&element.id) {
+            (decoded.width, decoded.height, decoded.rgba)
+        } else {
+            let Ok(decoded) = image::load_from_memory(&image.bytes) else {
+                paint_image_placeholder(
+                    painter,
+                    rect,
+                    stroke,
+                    corner_radius,
+                    rotation,
+                    element.style.sloppiness,
+                    element.id.as_uuid().as_u128(),
+                );
+                return;
+            };
+            let rgba = decoded.to_rgba8().into_raw();
+            (image.width, image.height, rgba)
         };
-        let rgba = decoded.to_rgba8();
-        let width = usize::try_from(image.width).unwrap_or(usize::MAX);
-        let height = usize::try_from(image.height).unwrap_or(usize::MAX);
-        let color_image = egui::ColorImage::from_rgba_unmultiplied([width, height], rgba.as_raw());
+        let width = usize::try_from(width).unwrap_or(usize::MAX);
+        let height = usize::try_from(height).unwrap_or(usize::MAX);
+        let color_image = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
         let texture = painter.ctx().load_texture(
             format!("sketchi.image.{}", element.id),
             color_image,
             egui::TextureOptions::LINEAR,
         );
-        entry.insert(texture);
-    }
-    if let Some(texture) = image_textures.get(&element.id) {
-        let tint = apply_opacity(Color32::WHITE, element.style.opacity);
-        let local_points = rounded_rect_points(rect, corner_radius);
-        let points = rotated_screen_points(local_points.clone(), rect.center(), rotation);
-        let mut mesh = Mesh::with_texture(texture.id());
-        mesh.vertices.push(Vertex {
-            pos: rect.center(),
-            uv: Pos2::new(0.5, 0.5),
-            color: tint,
-        });
-        for (point, local_point) in points.iter().zip(local_points.iter()) {
-            mesh.vertices.push(Vertex {
-                pos: *point,
-                uv: image_uv(*local_point, rect),
-                color: tint,
-            });
-        }
-        for (index, _) in points.iter().enumerate() {
-            let current = u32::try_from(index + 1).unwrap_or(u32::MAX);
-            let next = u32::try_from((index + 1) % points.len() + 1).unwrap_or(u32::MAX);
-            mesh.add_triangle(0, current, next);
-        }
-        painter.add(egui::Shape::mesh(mesh));
-        paint_sloppiness_outline(
-            painter,
-            &points,
-            stroke,
-            element.style.stroke_style,
-            element.style.sloppiness,
-            element.id.as_uuid().as_u128(),
-            true,
+        image_textures.insert(
+            element.id,
+            ImageTexture {
+                fingerprint,
+                texture,
+            },
         );
     }
+    let Some(texture) = image_textures
+        .get(&element.id)
+        .map(|cached| &cached.texture)
+    else {
+        paint_image_placeholder(
+            painter,
+            rect,
+            stroke,
+            corner_radius,
+            rotation,
+            element.style.sloppiness,
+            element.id.as_uuid().as_u128(),
+        );
+        return;
+    };
+    let tint = apply_opacity(Color32::WHITE, element.style.opacity);
+    let local_points = rounded_rect_points(rect, corner_radius);
+    let points = rotated_screen_points(local_points.clone(), rect.center(), rotation);
+    let mut mesh = Mesh::with_texture(texture.id());
+    mesh.vertices.push(Vertex {
+        pos: rect.center(),
+        uv: Pos2::new(0.5, 0.5),
+        color: tint,
+    });
+    for (point, local_point) in points.iter().zip(local_points.iter()) {
+        mesh.vertices.push(Vertex {
+            pos: *point,
+            uv: image_uv(*local_point, rect),
+            color: tint,
+        });
+    }
+    for (index, _) in points.iter().enumerate() {
+        let current = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        let next = u32::try_from((index + 1) % points.len() + 1).unwrap_or(u32::MAX);
+        mesh.add_triangle(0, current, next);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+    paint_sloppiness_outline(
+        painter,
+        &points,
+        stroke,
+        element.style.stroke_style,
+        element.style.sloppiness,
+        element.id.as_uuid().as_u128(),
+        true,
+    );
 }
 
 fn image_uv(point: Pos2, rect: Rect) -> Pos2 {
@@ -5711,6 +6898,11 @@ fn apply_draft_style(command: EditorCommand, style: Style) -> EditorCommand {
     }
 }
 
+fn image_style(mut style: Style) -> Style {
+    style.stroke = Color::rgba(0, 0, 0, 0);
+    style
+}
+
 fn fill_choice_patch(current: Option<Color>, solid: bool) -> StylePatch {
     StylePatch {
         fill: Some(if solid {
@@ -5847,19 +7039,27 @@ mod tests {
         ClientId, Color, EditorCommand, Element, ElementId, ElementKind, Point, Size, Style,
         StylePatch, Transform,
     };
-    use egui::{Color32, Key, Modifiers, Pos2, Rect, Vec2};
+    use egui::{Color32, CornerRadius, Key, Margin, Modifiers, Pos2, Rect, Stroke, Vec2};
 
     use crate::editor::Editor;
 
     use super::{
-        ColorPickerTarget, CustomFontSizeState, KeyBinding, KeybindAction, Keybinds, LayerAction,
-        WorkspaceUi, color_picker_patch, custom_font_size_selected, fill_choice_patch,
-        grid_step_for_zoom, next_z_index, padded_selection_bounds, preset_font_size_selected,
-        reordered_layer_ids, rotated_text_origin, selection_drag_position,
-        selection_handle_cursor_tolerance, selection_handle_drag_tolerance, sloppiness_amplitude,
-        sloppy_polyline, text_create_command, text_update_command, zoom_delta_for_scroll,
-        zoom_percent,
+        ColorPickerTarget, CustomFontSizeState, DARK_BORDER, ElementAction, KeyBinding,
+        KeybindAction, Keybinds, LIGHT_BORDER, LIGHT_CANVAS, LIGHT_MUTED, LayerAction,
+        SETTINGS_CARD_BORDER_DARK, SETTINGS_CARD_DARK, SETTINGS_CONTROL_DARK,
+        SETTINGS_CONTROL_RADIUS, SETTINGS_ROOT_DARK, SETTINGS_ROOT_RADIUS, WorkspaceUi,
+        apply_text_resize_font_size, char_cursor_to_byte_index, color_picker_patch,
+        confirmation_frame, custom_font_size_selected, delete_previous_word, fill_choice_patch,
+        grid_step_for_zoom, insert_text_at_cursor, key_binding_label, next_char_cursor,
+        next_word_cursor, next_z_index, padded_selection_bounds, platform_label,
+        preset_font_size_selected, previous_char_cursor, previous_word_cursor, reordered_layer_ids,
+        rotated_text_origin, selection_drag_position, selection_handle_cursor_tolerance,
+        selection_handle_drag_tolerance, settings_group_frame, settings_keybind_card_frame,
+        settings_visuals, settings_window_frame, sloppiness_amplitude, sloppy_polyline,
+        text_create_command, text_update_command, zoom_delta_for_scroll, zoom_percent,
     };
+
+    use crate::selection::SelectionHandle;
 
     #[test]
     fn rotated_text_origin_uses_the_element_center() {
@@ -5874,7 +7074,17 @@ mod tests {
     fn default_keybinds_cover_all_toolbar_and_editing_actions() {
         let keybinds = Keybinds::default();
 
-        assert_eq!(KeybindAction::ALL.len(), 17);
+        assert_eq!(KeybindAction::ALL.len(), 20);
+        let labels = KeybindAction::ALL
+            .into_iter()
+            .map(KeybindAction::label)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(labels.len(), KeybindAction::ALL.len());
+        for (index, action) in KeybindAction::ALL.into_iter().enumerate() {
+            for other in KeybindAction::ALL.into_iter().skip(index + 1) {
+                assert_ne!(keybinds.binding(action), keybinds.binding(other));
+            }
+        }
         assert_eq!(
             keybinds.binding(KeybindAction::SelectAll),
             KeyBinding {
@@ -5890,10 +7100,446 @@ mod tests {
             }
         );
         assert_eq!(
+            keybinds.binding(KeybindAction::Duplicate),
+            KeyBinding {
+                key: Key::D,
+                modifiers: Modifiers::CTRL,
+            }
+        );
+        assert_eq!(
+            keybinds.binding(KeybindAction::Copy),
+            KeyBinding {
+                key: Key::C,
+                modifiers: Modifiers::CTRL,
+            }
+        );
+        assert_eq!(
+            keybinds.binding(KeybindAction::Paste),
+            KeyBinding {
+                key: Key::V,
+                modifiers: Modifiers::CTRL,
+            }
+        );
+        assert_eq!(
             KeybindAction::Rectangle.tool(),
             Some(super::Tool::Rectangle)
         );
         assert_eq!(KeybindAction::Settings.tool(), None);
+    }
+
+    #[test]
+    fn shortcut_labels_include_control_modifiers() {
+        assert_eq!(
+            key_binding_label(KeyBinding {
+                key: Key::A,
+                modifiers: Modifiers::CTRL,
+            }),
+            "Ctrl + A"
+        );
+        assert_eq!(
+            key_binding_label(KeyBinding {
+                key: Key::S,
+                modifiers: Modifiers::COMMAND,
+            }),
+            "Ctrl + S"
+        );
+    }
+
+    #[test]
+    fn platform_label_includes_the_target_architecture() {
+        assert!(platform_label().ends_with(std::env::consts::ARCH));
+    }
+
+    #[test]
+    fn light_mode_tokens_have_enough_surface_and_text_contrast() {
+        assert_eq!(LIGHT_CANVAS, Color32::from_rgb(246, 247, 249));
+        assert_eq!(LIGHT_BORDER, Color32::from_rgb(205, 209, 218));
+        assert_eq!(LIGHT_MUTED, Color32::from_rgb(91, 97, 108));
+    }
+
+    #[test]
+    fn palette_mode_rows_keep_swatch_origin_consistent() {
+        let swatch_lefts = std::cell::RefCell::new(Vec::new());
+        egui::__run_test_ui(|ui| {
+            for label in ["Light Mode", "Dark Mode"] {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = super::SETTINGS_PALETTE_GAP;
+                    ui.add_sized(
+                        Vec2::new(
+                            super::SETTINGS_PALETTE_LABEL_WIDTH,
+                            super::STANDARD_CONTROL_SIZE.y,
+                        ),
+                        egui::Label::new(label).truncate().halign(egui::Align::LEFT),
+                    );
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(26.0), egui::Sense::click());
+                    swatch_lefts.borrow_mut().push(rect.left());
+                });
+                ui.add_space(10.0);
+            }
+        });
+
+        let swatch_lefts = swatch_lefts.into_inner();
+        assert_eq!(swatch_lefts.len(), 2);
+        let mut swatch_lefts = swatch_lefts.into_iter();
+        let Some(first) = swatch_lefts.next() else {
+            return;
+        };
+        let Some(second) = swatch_lefts.next() else {
+            return;
+        };
+        assert!((first - second).abs() < f32::EPSILON);
+        assert!(swatch_lefts.next().is_none());
+    }
+
+    #[test]
+    fn light_confirmation_frame_has_separation_shadow() {
+        assert_eq!(
+            confirmation_frame(false).shadow,
+            egui::Shadow {
+                offset: [0, 4],
+                blur: 16,
+                spread: 1,
+                color: Color32::from_rgba_unmultiplied(0, 0, 0, 32),
+            }
+        );
+    }
+
+    #[test]
+    fn settings_window_has_an_outer_border_in_both_themes() {
+        assert_eq!(
+            settings_window_frame(false).stroke,
+            Stroke::new(1.0_f32, LIGHT_BORDER)
+        );
+        assert_eq!(
+            settings_window_frame(true).stroke,
+            Stroke::new(1.0_f32, DARK_BORDER)
+        );
+    }
+
+    #[test]
+    fn settings_root_preserves_its_window_corner_shape() {
+        let frame = settings_window_frame(false);
+        assert_eq!(
+            frame.corner_radius,
+            CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: SETTINGS_ROOT_RADIUS,
+                se: SETTINGS_ROOT_RADIUS,
+            }
+        );
+        assert_eq!(frame.inner_margin, Margin::ZERO);
+        assert!(frame.stroke.width.total_cmp(&1.0).is_eq());
+        assert_ne!(frame.stroke.color, Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn settings_cards_share_the_control_corner_radius() {
+        assert_eq!(
+            settings_group_frame(false).corner_radius,
+            CornerRadius::same(SETTINGS_CONTROL_RADIUS)
+        );
+        assert_eq!(
+            settings_keybind_card_frame(false).corner_radius,
+            CornerRadius::same(SETTINGS_CONTROL_RADIUS)
+        );
+    }
+
+    #[test]
+    fn settings_navigation_highlight_keeps_its_rounding() {
+        assert_eq!(
+            CornerRadius::same(SETTINGS_CONTROL_RADIUS),
+            CornerRadius::same(8)
+        );
+    }
+
+    #[test]
+    fn settings_card_frame_has_a_distinct_flat_border() {
+        let root = settings_window_frame(false);
+        let card = settings_group_frame(false);
+        assert_eq!(
+            card.corner_radius,
+            CornerRadius::same(SETTINGS_CONTROL_RADIUS)
+        );
+        assert!(card.stroke.width.total_cmp(&1.0).is_eq());
+        assert_ne!(card.stroke.color, Color32::TRANSPARENT);
+        assert_ne!(card.stroke.color, root.stroke.color);
+
+        let dark_root = settings_window_frame(true);
+        let dark_card = settings_group_frame(true);
+        assert_ne!(dark_card.stroke.color, Color32::TRANSPARENT);
+        assert_ne!(dark_card.stroke.color, dark_root.stroke.color);
+    }
+
+    #[test]
+    fn settings_keybind_cards_have_the_shared_rounding() {
+        assert_eq!(
+            settings_keybind_card_frame(false).corner_radius,
+            CornerRadius::same(SETTINGS_CONTROL_RADIUS)
+        );
+        assert_eq!(
+            settings_keybind_card_frame(true).corner_radius,
+            CornerRadius::same(SETTINGS_CONTROL_RADIUS)
+        );
+    }
+
+    #[test]
+    fn settings_dark_visuals_use_one_surface_palette() {
+        let visuals = settings_visuals(true);
+
+        assert_eq!(visuals.panel_fill, SETTINGS_ROOT_DARK);
+        assert_eq!(visuals.window_fill, SETTINGS_CARD_DARK);
+        assert_eq!(visuals.text_edit_bg_color, Some(SETTINGS_CONTROL_DARK));
+        assert_eq!(
+            visuals.widgets.noninteractive.bg_stroke,
+            Stroke::new(1.0_f32, SETTINGS_CARD_BORDER_DARK)
+        );
+        assert_eq!(visuals.widgets.inactive.bg_fill, SETTINGS_CONTROL_DARK);
+    }
+
+    #[test]
+    fn settings_light_visuals_match_dark_control_geometry() {
+        let light = settings_visuals(false);
+        let dark = settings_visuals(true);
+
+        assert_eq!(
+            light.window_corner_radius,
+            CornerRadius::same(SETTINGS_CONTROL_RADIUS)
+        );
+        assert_eq!(light.menu_corner_radius, dark.menu_corner_radius);
+        assert_eq!(
+            light.widgets.inactive.corner_radius,
+            dark.widgets.inactive.corner_radius
+        );
+        assert_eq!(light.window_stroke, Stroke::new(1.0_f32, LIGHT_BORDER));
+        assert_ne!(light.widgets.inactive.bg_stroke.color, Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn cancelling_settings_restores_the_session_preference() {
+        let mut workspace = WorkspaceUi::default();
+        workspace.toggle_settings();
+        workspace.restore_session = false;
+
+        workspace.cancel_settings();
+
+        assert!(workspace.restore_session_enabled());
+        assert!(!workspace.settings_open());
+    }
+
+    #[test]
+    fn restoring_settings_defaults_resets_appearance_mode() {
+        let mut workspace = WorkspaceUi {
+            appearance: super::AppearanceMode::Dark,
+            dark_mode: true,
+            ..WorkspaceUi::default()
+        };
+
+        workspace.restore_settings_defaults();
+
+        assert_eq!(workspace.appearance, super::AppearanceMode::System);
+        assert_eq!(
+            workspace.dark_mode,
+            workspace.system_dark_mode.unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn invalid_persisted_drawing_style_is_not_loaded() {
+        let persisted = crate::settings::Settings {
+            drawing_style: Some(Style {
+                stroke_width: f32::NAN,
+                ..Style::default()
+            }),
+            ..crate::settings::Settings::default()
+        };
+
+        let mut workspace = WorkspaceUi::default();
+        workspace.apply_settings(&persisted);
+
+        assert!(!workspace.drawing_style_loaded);
+        assert!(
+            (workspace.new_object_style.stroke_width - Style::default().stroke_width).abs()
+                < f32::EPSILON
+        );
+        assert_eq!(
+            workspace.new_object_style.stroke,
+            super::to_core_color(super::STROKE_COLORS[0])
+        );
+    }
+
+    #[test]
+    fn remembered_drawing_style_round_trips_without_selected_style_leaking_in() {
+        let mut workspace = WorkspaceUi::default();
+        let new_style = Style {
+            stroke: Color::rgba(12, 34, 56, 255),
+            stroke_width: 7.0,
+            ..Style::default()
+        };
+        workspace.new_object_style = new_style;
+        workspace.draft_style = new_style;
+        workspace.drawing_style_loaded = true;
+
+        let element_id = ElementId::from_u128(94);
+        let mut editor = Editor::new(ClientId::new());
+        let mut selected = Element::rectangle(
+            element_id,
+            Transform::new(Point::default(), Size::new(20.0, 20.0)),
+        );
+        selected.style.stroke = Color::rgba(200, 100, 50, 255);
+        assert!(editor.execute(EditorCommand::Create(selected)).is_ok());
+        workspace.selected.insert(element_id);
+        workspace.sync_selected_style(editor.document());
+
+        let snapshot = workspace.settings_snapshot();
+        assert_eq!(snapshot.drawing_style, Some(new_style));
+
+        let restored = WorkspaceUi::from_settings(&snapshot);
+        assert_eq!(restored.new_object_style, new_style);
+        assert_eq!(restored.draft_style, new_style);
+    }
+
+    #[test]
+    fn cancelling_settings_preserves_an_unremembered_drawing_style() {
+        let mut workspace = WorkspaceUi::default();
+        let style = Style {
+            stroke: Color::rgba(12, 34, 56, 255),
+            stroke_width: 7.0,
+            ..Style::default()
+        };
+        workspace.remember_drawing_style = false;
+        workspace.new_object_style = style;
+        workspace.draft_style = style;
+        workspace.toggle_settings();
+
+        workspace.cancel_settings();
+
+        assert_eq!(workspace.new_object_style, style);
+        assert_eq!(workspace.draft_style, style);
+    }
+
+    #[test]
+    fn new_document_saves_the_previous_document_before_replacing_it() {
+        let Ok(timestamp) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        else {
+            return;
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "sketchi-new-document-{}-{}",
+            std::process::id(),
+            timestamp.as_nanos()
+        ));
+        let directory_string = directory.to_string_lossy().into_owned();
+        let element_id = ElementId::from_u128(95);
+        let mut editor = Editor::new(ClientId::new());
+        assert!(
+            editor
+                .execute(EditorCommand::Create(Element::rectangle(
+                    element_id,
+                    Transform::new(Point::default(), Size::new(40.0, 30.0)),
+                )))
+                .is_ok()
+        );
+
+        let mut workspace = WorkspaceUi::default();
+        workspace.autosave_directory.clone_from(&directory_string);
+        workspace.new_document(&mut editor);
+
+        let restored = crate::storage::load_document(&directory_string);
+        assert!(restored.is_ok());
+        assert_eq!(
+            restored.ok().flatten().map(|document| document.len()),
+            Some(1)
+        );
+        assert_eq!(editor.document().len(), 0);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn new_document_requests_confirmation_when_work_exists() {
+        let element_id = ElementId::from_u128(96);
+        let mut editor = Editor::new(ClientId::new());
+        assert!(
+            editor
+                .execute(EditorCommand::Create(Element::rectangle(
+                    element_id,
+                    Transform::new(Point::default(), Size::new(40.0, 30.0)),
+                )))
+                .is_ok()
+        );
+
+        let mut workspace = WorkspaceUi::default();
+        workspace.request_new_document(&mut editor);
+
+        assert!(workspace.new_document_confirmation);
+        assert_eq!(editor.document().len(), 1);
+    }
+
+    #[test]
+    fn copy_and_paste_keybind_actions_round_trip_selected_elements() {
+        let element_id = ElementId::from_u128(91);
+        let mut editor = Editor::new(ClientId::new());
+        let element = Element::rectangle(
+            element_id,
+            Transform::new(Point::default(), Size::new(80.0, 60.0)),
+        );
+        assert!(editor.execute(EditorCommand::Create(element)).is_ok());
+
+        let mut workspace = WorkspaceUi::default();
+        workspace.selected.insert(element_id);
+        workspace.copy_selected(&editor);
+        workspace.paste_copied_elements(&mut editor);
+
+        assert_eq!(editor.document().len(), 2);
+        assert_eq!(workspace.selected.len(), 1);
+        assert!(!workspace.selected.contains(&element_id));
+    }
+
+    #[test]
+    fn duplicate_preserves_relative_placement_for_multiple_selection() {
+        let first_id = ElementId::from_u128(92);
+        let second_id = ElementId::from_u128(93);
+        let mut editor = Editor::new(ClientId::new());
+        let first = Element::rectangle(
+            first_id,
+            Transform::new(Point::new(40.0, 60.0), Size::new(80.0, 60.0)),
+        );
+        let second = Element::rectangle(
+            second_id,
+            Transform::new(Point::new(180.0, 150.0), Size::new(80.0, 60.0)),
+        );
+        assert!(editor.execute(EditorCommand::Create(first)).is_ok());
+        assert!(editor.execute(EditorCommand::Create(second)).is_ok());
+
+        let mut workspace = WorkspaceUi::default();
+        workspace.selected.extend([first_id, second_id]);
+        workspace.apply_element_action(
+            &egui::Context::default(),
+            &mut editor,
+            ElementAction::Duplicate,
+        );
+
+        let mut duplicated_positions = workspace
+            .selected
+            .iter()
+            .filter_map(|id| {
+                editor
+                    .document()
+                    .element(*id)
+                    .map(|element| element.transform.position)
+            })
+            .collect::<Vec<_>>();
+        duplicated_positions.sort_by(|left, right| left.x.total_cmp(&right.x));
+        assert_eq!(duplicated_positions.len(), 2);
+        let mut positions = duplicated_positions.into_iter();
+        let Some(left) = positions.next() else {
+            return;
+        };
+        let Some(right) = positions.next() else {
+            return;
+        };
+        assert!((right.x - left.x - 140.0).abs() < f32::EPSILON);
+        assert!((right.y - left.y - 90.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -6047,6 +7693,68 @@ mod tests {
     }
 
     #[test]
+    fn resizing_text_scales_font_size_with_the_dragged_axis() {
+        let mut element = Element::text(
+            ElementId::from_u128(47),
+            Transform::new(Point::default(), Size::new(100.0, 24.0)),
+            "Sketchi",
+        );
+        element.style.font_size = 24.0;
+        let original = element.clone();
+
+        element.transform.size.width = 200.0;
+        apply_text_resize_font_size(&mut element, &original, SelectionHandle::Right);
+        assert!((element.style.font_size - 48.0).abs() < f32::EPSILON);
+
+        element.transform.size = Size::new(100.0, 48.0);
+        apply_text_resize_font_size(&mut element, &original, SelectionHandle::Bottom);
+        assert!((element.style.font_size - 48.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn text_cursor_arrows_and_unicode_use_character_boundaries() {
+        let text = "Aé中";
+        assert_eq!(char_cursor_to_byte_index(text, 0), 0);
+        assert_eq!(char_cursor_to_byte_index(text, 1), 1);
+        assert_eq!(char_cursor_to_byte_index(text, 2), 3);
+        assert_eq!(char_cursor_to_byte_index(text, 3), 6);
+        assert_eq!(previous_char_cursor(2), 1);
+        assert_eq!(next_char_cursor(text, 2), 3);
+        assert_eq!(next_char_cursor(text, 3), 3);
+    }
+
+    #[test]
+    fn text_editor_inserts_newlines_at_the_character_cursor() {
+        let mut text = String::from("ab");
+        let mut cursor = 1;
+
+        insert_text_at_cursor(&mut text, &mut cursor, "X\nY");
+
+        assert_eq!(text, "aX\nYb");
+        assert_eq!(cursor, 4);
+    }
+
+    #[test]
+    fn text_cursor_word_navigation_and_deletion_skip_whitespace() {
+        let text = "hello  世界  sketchi";
+        assert_eq!(previous_word_cursor(text, text.chars().count()), 11);
+        assert_eq!(previous_word_cursor(text, 11), 7);
+        assert_eq!(previous_word_cursor(text, 7), 0);
+        assert_eq!(next_word_cursor(text, 0), 7);
+        assert_eq!(next_word_cursor(text, 7), 11);
+        assert_eq!(next_word_cursor(text, 11), text.chars().count());
+
+        let mut editable = String::from(text);
+        let mut cursor = editable.chars().count();
+        delete_previous_word(&mut editable, &mut cursor);
+        assert_eq!(editable, "hello  世界  ");
+        assert_eq!(cursor, 11);
+        delete_previous_word(&mut editable, &mut cursor);
+        assert_eq!(editable, "hello  ");
+        assert_eq!(cursor, 7);
+    }
+
+    #[test]
     fn text_editor_commits_one_text_create_command() {
         let command = text_create_command(
             ElementId::from_u128(42),
@@ -6096,7 +7804,7 @@ mod tests {
         existing.z_index = 7;
         assert!(editor.execute(EditorCommand::Create(existing)).is_ok());
 
-        assert_eq!(next_z_index(&editor.document()), 8);
+        assert_eq!(next_z_index(editor.document()), 8);
     }
 
     #[test]

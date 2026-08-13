@@ -1,8 +1,13 @@
 //! Durable local operation journal.
 
-use std::path::Path;
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
+use canvas_core::Document;
 use canvas_core::{Operation, OperationId};
+use directories::BaseDirs;
 use rusqlite::{Connection, params};
 use thiserror::Error;
 
@@ -15,6 +20,70 @@ pub enum StorageError {
     /// Operation JSON could not be encoded or decoded.
     #[error("operation JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    /// Document file could not be read or written.
+    #[error("document file error: {0}")]
+    DocumentIo(#[source] io::Error),
+}
+
+const DOCUMENT_FILE_NAME: &str = "sketchi.autosave.json";
+
+fn document_path(directory: &str) -> PathBuf {
+    let directory = directory.trim();
+    if let Some(relative) = directory.strip_prefix("~/")
+        && let Some(base_dirs) = BaseDirs::new()
+    {
+        return base_dirs.home_dir().join(relative).join(DOCUMENT_FILE_NAME);
+    }
+    Path::new(if directory.is_empty() {
+        "autosave"
+    } else {
+        directory
+    })
+    .join(DOCUMENT_FILE_NAME)
+}
+
+/// Loads the last locally saved materialized document, when present.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the file cannot be read or decoded.
+pub fn load_document(directory: &str) -> Result<Option<Document>, StorageError> {
+    let path = document_path(directory);
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StorageError::DocumentIo(error)),
+    };
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+/// Saves a materialized document in the configured local directory.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the directory cannot be created or the file
+/// cannot be encoded or written.
+pub fn save_document(directory: &str, document: &Document) -> Result<PathBuf, StorageError> {
+    let path = document_path(directory);
+    let Some(parent) = path.parent() else {
+        return Err(StorageError::DocumentIo(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "document path has no parent directory",
+        )));
+    };
+    fs::create_dir_all(parent).map_err(StorageError::DocumentIo)?;
+    let bytes = serde_json::to_vec_pretty(document)?;
+    let temporary_path = parent.join(format!(".{DOCUMENT_FILE_NAME}.{}.tmp", std::process::id()));
+    fs::write(&temporary_path, bytes).map_err(StorageError::DocumentIo)?;
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(&path).map_err(StorageError::DocumentIo)?;
+    }
+    if let Err(error) = fs::rename(&temporary_path, &path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(StorageError::DocumentIo(error));
+    }
+    Ok(path)
 }
 
 /// SQLite-backed queue for operations awaiting server acknowledgement.

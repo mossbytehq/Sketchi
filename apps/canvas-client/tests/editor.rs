@@ -6,7 +6,9 @@
 )]
 
 use canvas_client::{connection::SyncController, editor::Editor, storage::Journal};
-use canvas_core::{ClientId, EditorCommand, Element, ElementId, Point, Size, Transform};
+use canvas_core::{
+    ClientId, CrdtDocument, EditorCommand, Element, ElementId, Point, Size, Transform,
+};
 
 #[test]
 fn editor_applies_local_commands_as_operations_and_tracks_pending_work() {
@@ -75,4 +77,28 @@ fn local_operations_can_be_transferred_to_the_durable_sync_journal() {
     assert_eq!(editor.persist_pending(&mut sync).unwrap(), 1);
     assert!(editor.pending_operations().is_empty());
     assert_eq!(sync.pending_count().unwrap(), 1);
+}
+
+#[test]
+fn restoring_a_document_keeps_create_operations_pending_for_sync() {
+    let element = Element::rectangle(
+        ElementId::from_u128(46),
+        Transform::new(Point::default(), Size::new(4.0, 4.0)),
+    );
+    let mut replica = CrdtDocument::new();
+    replica
+        .apply(&canvas_core::Operation::new(
+            canvas_core::OperationId::new(ClientId::from_u128(90), 1),
+            canvas_core::LamportTimestamp::new(1),
+            canvas_core::VersionVector::default(),
+            canvas_core::OperationKind::Create {
+                element: element.clone(),
+            },
+        ))
+        .unwrap();
+
+    let restored = Editor::from_document(ClientId::from_u128(91), &replica.document()).unwrap();
+
+    assert_eq!(restored.pending_operations().len(), 1);
+    assert_eq!(restored.document().element(element.id), Some(&element));
 }

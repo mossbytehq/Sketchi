@@ -502,10 +502,10 @@ impl Element {
     /// Creates an image element with an embedded source payload.
     #[must_use]
     pub fn image(id: ElementId, transform: Transform, image: EmbeddedImage) -> Self {
-        Self {
-            image: Some(image),
-            ..Self::new(id, ElementKind::Image, transform)
-        }
+        let mut element = Self::new(id, ElementKind::Image, transform);
+        element.style.stroke = Color::rgba(0, 0, 0, 0);
+        element.image = Some(image);
+        element
     }
 
     /// Creates an element with a point sequence.

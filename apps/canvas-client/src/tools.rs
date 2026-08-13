@@ -146,6 +146,7 @@ impl LiveStroke {
 #[derive(Clone, Debug)]
 pub struct ToolController {
     tool: Tool,
+    stabilization: f32,
     active_element: Option<ElementId>,
     start: Option<Point>,
     last: Option<Point>,
@@ -158,6 +159,7 @@ impl ToolController {
     pub fn new(tool: Tool) -> Self {
         Self {
             tool,
+            stabilization: 0.0,
             active_element: None,
             start: None,
             last: None,
@@ -169,6 +171,15 @@ impl ToolController {
     pub fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
         self.cancel();
+    }
+
+    /// Applies the current input preferences to future freehand samples.
+    pub fn set_input_settings(&mut self, stabilization: f32, _pressure_sensitivity: f32) {
+        self.stabilization = if stabilization.is_finite() {
+            stabilization.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
     }
 
     /// Returns the active tool.
@@ -212,7 +223,7 @@ impl ToolController {
             });
         }
         if self.tool == Tool::Freehand {
-            self.points.push(position);
+            self.points.push(self.stabilized_sample(position));
         }
         None
     }
@@ -254,7 +265,7 @@ impl ToolController {
             Tool::Freehand => {
                 let mut points = self.points.clone();
                 if points.last().copied() != Some(end) {
-                    points.push(end);
+                    points.push(self.stabilized_sample(end));
                 }
                 let mut element = Element::freehand(
                     element_id,
@@ -274,7 +285,7 @@ impl ToolController {
         self.active_element?;
         self.last = Some(position);
         if self.tool == Tool::Freehand && self.points.last().copied() != Some(position) {
-            self.points.push(position);
+            self.points.push(self.stabilized_sample(position));
         }
         let output = self
             .preview()
@@ -289,6 +300,16 @@ impl ToolController {
         self.start = None;
         self.last = None;
         self.points.clear();
+    }
+
+    fn stabilized_sample(&self, position: Point) -> Point {
+        let previous = self.points.last().copied().unwrap_or(position);
+        let smoothing = self.stabilization;
+        let responsiveness = (1.0 - smoothing).max(0.05);
+        Point::new(
+            previous.x + (position.x - previous.x) * responsiveness,
+            previous.y + (position.y - previous.y) * responsiveness,
+        )
     }
 }
 

@@ -81,6 +81,12 @@ impl VersionVector {
         *entry = (*entry).max(operation_id.sequence);
     }
 
+    pub(crate) fn advance_to(&mut self, client_id: ClientId, sequence: u64) {
+        if sequence != 0 {
+            self.observe(OperationId::new(client_id, sequence));
+        }
+    }
+
     /// Merges another vector by taking per-client maxima.
     pub fn merge(&mut self, other: &Self) {
         for (&client_id, &sequence) in &other.entries {

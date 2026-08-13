@@ -9,7 +9,7 @@ use canvas_core::{
     CrdtDocument, Element, ElementId, EmbeddedImage, LamportTimestamp, Operation, OperationId,
     OperationKind, Point, Size, Transform, VersionVector,
 };
-use canvas_renderer::{Camera, RenderPrimitive, Renderer, hit_test};
+use canvas_renderer::{RenderPrimitive, Renderer, hit_test};
 
 fn document_with_rectangle() -> (CrdtDocument, ElementId) {
     let element_id = ElementId::from_u128(1);
@@ -84,7 +84,7 @@ fn transparent_outer_shape_does_not_hide_an_inner_shape() {
 #[test]
 fn renderer_extracts_document_primitives_without_crdt_or_transport_state() {
     let (document, element_id) = document_with_rectangle();
-    let renderer = Renderer::new(Camera::new(Size::new(800.0, 600.0)));
+    let renderer = Renderer::new();
     let scene = renderer.draw(&document.document());
     assert_eq!(scene.len(), 1);
     assert!(
@@ -111,7 +111,7 @@ fn renderer_preserves_text_rotation_in_the_scene() {
         ))
         .unwrap();
 
-    let renderer = Renderer::new(Camera::new(Size::new(800.0, 600.0)));
+    let renderer = Renderer::new();
     let scene = renderer.draw(&document.document());
     assert!(matches!(
         scene.primitives().next(),
@@ -138,7 +138,7 @@ fn renderer_extracts_and_hits_embedded_images() {
     let mut document = CrdtDocument::new();
     document.apply(&operation).unwrap();
 
-    let renderer = Renderer::new(Camera::new(Size::new(800.0, 600.0)));
+    let renderer = Renderer::new();
     let scene = renderer.draw(&document.document());
     assert!(matches!(
         scene.primitives().next(),
@@ -167,7 +167,7 @@ fn renderer_extracts_and_hits_a_diamond() {
     let mut document = CrdtDocument::new();
     document.apply(&operation).unwrap();
 
-    let renderer = Renderer::new(Camera::new(Size::new(800.0, 600.0)));
+    let renderer = Renderer::new();
     let scene = renderer.draw(&document.document());
     assert!(matches!(
         scene.primitives().next(),
@@ -196,7 +196,7 @@ fn renderer_extracts_and_hits_a_triangle() {
     let mut document = CrdtDocument::new();
     document.apply(&operation).unwrap();
 
-    let renderer = Renderer::new(Camera::new(Size::new(800.0, 600.0)));
+    let renderer = Renderer::new();
     let scene = renderer.draw(&document.document());
     assert!(matches!(
         scene.primitives().next(),

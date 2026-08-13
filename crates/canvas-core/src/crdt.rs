@@ -1,8 +1,9 @@
 //! Operation-based CRDT implementation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     clock::{LamportClock, LamportTimestamp},
@@ -288,6 +289,23 @@ pub struct CrdtSnapshot {
     pub version_vector: VersionVector,
     /// Current Lamport clock state.
     pub clock: LamportTimestamp,
+    /// Version-vector range covered by compacted operation history.
+    #[serde(default)]
+    pub compacted_version_vector: VersionVector,
+    /// Stable fingerprints for operations whose payload is still retained.
+    /// IDs covered by `compacted_version_vector` are permanently tombstoned
+    /// and are not replayed after compaction.
+    #[serde(default)]
+    pub operation_fingerprints: Vec<OperationFingerprint>,
+}
+
+/// Compact exact-content identity for one operation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct OperationFingerprint {
+    /// Operation identity.
+    pub id: OperationId,
+    /// SHA-256 digest of the canonical operation encoding.
+    pub digest: [u8; 32],
 }
 
 /// Result of accepting a valid operation.
@@ -295,7 +313,8 @@ pub struct CrdtSnapshot {
 pub enum ApplyResult {
     /// The operation was newly accepted and incorporated.
     Applied,
-    /// The exact operation had already been accepted.
+    /// The operation was already accepted or is covered by compacted causal
+    /// history.
     Duplicate,
 }
 
@@ -306,6 +325,9 @@ pub struct CrdtDocument {
     seen_operations: BTreeMap<OperationId, Operation>,
     version_vector: VersionVector,
     clock: LamportClock,
+    materialized: Document,
+    compacted_version_vector: VersionVector,
+    operation_fingerprints: BTreeMap<OperationId, [u8; 32]>,
 }
 
 impl CrdtDocument {
@@ -317,6 +339,9 @@ impl CrdtDocument {
             seen_operations: BTreeMap::new(),
             version_vector: VersionVector::default(),
             clock: LamportClock::new(),
+            materialized: Document::default(),
+            compacted_version_vector: VersionVector::default(),
+            operation_fingerprints: BTreeMap::new(),
         }
     }
 
@@ -324,12 +349,23 @@ impl CrdtDocument {
     ///
     /// # Errors
     ///
-    /// Returns a [`CrdtError`] when the operation is invalid, reuses an ID with
-    /// different content, or exceeds the element bound.
+    /// Returns a [`CrdtError`] when the operation is invalid, reuses a retained
+    /// ID with different content, or exceeds the element bound.
     pub fn apply(&mut self, operation: &Operation) -> Result<ApplyResult, CrdtError> {
         operation.validate()?;
+        let fingerprint = operation_fingerprint(operation)?;
+        if operation.id.sequence <= self.compacted_version_vector.get(operation.id.client_id) {
+            return Ok(ApplyResult::Duplicate);
+        }
         if let Some(previous) = self.seen_operations.get(&operation.id) {
             return if previous == operation {
+                Ok(ApplyResult::Duplicate)
+            } else {
+                Err(CrdtError::OperationIdReuse(operation.id.to_string()))
+            };
+        }
+        if let Some(previous) = self.operation_fingerprints.get(&operation.id) {
+            return if previous == &fingerprint {
                 Ok(ApplyResult::Duplicate)
             } else {
                 Err(CrdtError::OperationIdReuse(operation.id.to_string()))
@@ -342,13 +378,78 @@ impl CrdtDocument {
             return Err(CrdtError::TooManyElements);
         }
 
+        let target_element_id = operation.target_element_id();
         let metadata = RegisterMetadata::from_operation(operation);
         self.apply_kind(&operation.kind, metadata);
+        if let Some(element) = self
+            .elements
+            .get(&target_element_id)
+            .and_then(ElementSnapshot::materialize)
+        {
+            self.materialized.upsert_element(element);
+        } else {
+            self.materialized.remove_element(target_element_id);
+        }
         self.seen_operations.insert(operation.id, operation.clone());
+        self.operation_fingerprints
+            .insert(operation.id, fingerprint);
         self.version_vector.observe(operation.id);
         self.version_vector.merge(&operation.deps);
         self.clock.observe(operation.timestamp);
         Ok(ApplyResult::Applied)
+    }
+
+    /// Validates a batch against the current replica without cloning the
+    /// document. The returned results are the results `apply` will produce
+    /// when the batch is subsequently committed in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first validation, ID-reuse, or capacity error in the batch.
+    pub fn validate_batch(&self, operations: &[Operation]) -> Result<Vec<ApplyResult>, CrdtError> {
+        let mut fingerprints = BTreeMap::new();
+        let mut new_elements = BTreeSet::new();
+        let mut results = Vec::with_capacity(operations.len());
+
+        for operation in operations {
+            operation.validate()?;
+            let fingerprint = operation_fingerprint(operation)?;
+            if operation.id.sequence <= self.compacted_version_vector.get(operation.id.client_id) {
+                results.push(ApplyResult::Duplicate);
+                continue;
+            }
+            if let Some(previous) = self.seen_operations.get(&operation.id) {
+                if previous == operation {
+                    results.push(ApplyResult::Duplicate);
+                    continue;
+                }
+                return Err(CrdtError::OperationIdReuse(operation.id.to_string()));
+            }
+            if let Some(previous) = self.operation_fingerprints.get(&operation.id) {
+                if previous == &fingerprint {
+                    results.push(ApplyResult::Duplicate);
+                    continue;
+                }
+                return Err(CrdtError::OperationIdReuse(operation.id.to_string()));
+            }
+            if let Some(previous) = fingerprints.insert(operation.id, fingerprint) {
+                if previous == fingerprint {
+                    results.push(ApplyResult::Duplicate);
+                    continue;
+                }
+                return Err(CrdtError::OperationIdReuse(operation.id.to_string()));
+            }
+            if let OperationKind::Create { element } = &operation.kind
+                && !self.elements.contains_key(&element.id)
+                && new_elements.insert(element.id)
+                && self.elements.len() + new_elements.len() > MAX_ELEMENTS
+            {
+                return Err(CrdtError::TooManyElements);
+            }
+            results.push(ApplyResult::Applied);
+        }
+
+        Ok(results)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -469,6 +570,16 @@ impl CrdtDocument {
     /// Returns the visible materialized document.
     #[must_use]
     pub fn document(&self) -> Document {
+        self.materialized.clone()
+    }
+
+    /// Returns the visible materialized document without cloning it.
+    #[must_use]
+    pub const fn document_ref(&self) -> &Document {
+        &self.materialized
+    }
+
+    fn build_document(&self) -> Document {
         let elements = self
             .elements
             .values()
@@ -502,6 +613,59 @@ impl CrdtDocument {
         self.clock.current()
     }
 
+    /// Compacts remembered operation payloads while retaining contiguous
+    /// received coverage.
+    ///
+    /// Only sequences that were actually received in order are covered. This
+    /// avoids treating an unseen out-of-order operation as a duplicate while
+    /// allowing compacted IDs to be represented by a bounded version vector.
+    pub fn compact_seen_operations(&mut self, retention: usize) {
+        self.advance_compacted_version_vector();
+        let remove_count = self.seen_operations.len().saturating_sub(retention);
+        let ids = self
+            .seen_operations
+            .keys()
+            .filter(|id| id.sequence <= self.compacted_version_vector.get(id.client_id))
+            .take(remove_count)
+            .copied()
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.seen_operations.remove(&id);
+            self.operation_fingerprints.remove(&id);
+        }
+    }
+
+    /// Returns the number of operation payloads retained for exact duplicate
+    /// and operation-ID reuse checks.
+    #[must_use]
+    pub fn seen_operation_count(&self) -> usize {
+        self.seen_operations.len()
+    }
+
+    fn advance_compacted_version_vector(&mut self) {
+        let client_ids = self
+            .seen_operations
+            .keys()
+            .map(|id| id.client_id)
+            .collect::<BTreeSet<_>>();
+        for client_id in client_ids {
+            let mut next = self
+                .compacted_version_vector
+                .get(client_id)
+                .saturating_add(1);
+            while next != 0
+                && self
+                    .seen_operations
+                    .contains_key(&OperationId::new(client_id, next))
+            {
+                next = next.saturating_add(1);
+            }
+            let contiguous = next.saturating_sub(1);
+            self.compacted_version_vector
+                .advance_to(client_id, contiguous);
+        }
+    }
+
     /// Creates a canonical serializable snapshot.
     #[must_use]
     pub fn snapshot(&self) -> CrdtSnapshot {
@@ -510,6 +674,15 @@ impl CrdtDocument {
             seen_operations: self.seen_operations.values().cloned().collect(),
             version_vector: self.version_vector.clone(),
             clock: self.clock.current(),
+            compacted_version_vector: self.compacted_version_vector.clone(),
+            operation_fingerprints: self
+                .operation_fingerprints
+                .iter()
+                .map(|(id, digest)| OperationFingerprint {
+                    id: *id,
+                    digest: *digest,
+                })
+                .collect(),
         }
     }
 
@@ -525,8 +698,15 @@ impl CrdtDocument {
             seen_operations: snapshot_operations,
             version_vector,
             clock,
+            compacted_version_vector,
+            operation_fingerprints: snapshot_fingerprints,
         } = snapshot;
         version_vector.validate()?;
+        if !version_vector.dominates(&compacted_version_vector) {
+            return Err(CrdtError::InvalidSnapshot(
+                "compacted version vector exceeds snapshot knowledge".to_owned(),
+            ));
+        }
         if snapshot_elements.len() > MAX_ELEMENTS {
             return Err(CrdtError::TooManyElements);
         }
@@ -548,13 +728,55 @@ impl CrdtDocument {
                 ));
             }
         }
-        Ok(Self {
+        let mut operation_fingerprints = BTreeMap::new();
+        for fingerprint in snapshot_fingerprints {
+            if operation_fingerprints
+                .insert(fingerprint.id, fingerprint.digest)
+                .is_some()
+            {
+                return Err(CrdtError::InvalidSnapshot(
+                    "snapshot contains duplicate operation fingerprints".to_owned(),
+                ));
+            }
+        }
+        for operation in seen_operations.values() {
+            let fingerprint = operation_fingerprint(operation)?;
+            if let Some(previous) = operation_fingerprints.insert(operation.id, fingerprint)
+                && previous != fingerprint
+            {
+                return Err(CrdtError::InvalidSnapshot(
+                    "snapshot operation fingerprint does not match payload".to_owned(),
+                ));
+            }
+        }
+        for operation_id in operation_fingerprints.keys() {
+            if operation_id.client_id.is_nil()
+                || operation_id.sequence == 0
+                || version_vector.get(operation_id.client_id) < operation_id.sequence
+            {
+                return Err(CrdtError::InvalidSnapshot(
+                    "snapshot contains operation fingerprint outside version vector".to_owned(),
+                ));
+            }
+        }
+        let mut document = Self {
             elements,
             seen_operations,
             version_vector,
             clock: LamportClock::from_timestamp(clock),
-        })
+            materialized: Document::default(),
+            compacted_version_vector,
+            operation_fingerprints,
+        };
+        document.materialized = document.build_document();
+        Ok(document)
     }
+}
+
+fn operation_fingerprint(operation: &Operation) -> Result<[u8; 32], CrdtError> {
+    let bytes = serde_json::to_vec(operation)
+        .map_err(|error| CrdtError::OperationFingerprint(error.to_string()))?;
+    Ok(Sha256::digest(bytes).into())
 }
 
 trait TargetElementId {

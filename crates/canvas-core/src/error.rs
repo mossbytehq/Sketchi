@@ -26,4 +26,7 @@ pub enum CrdtError {
     /// A serialized snapshot is internally inconsistent.
     #[error("invalid snapshot: {0}")]
     InvalidSnapshot(String),
+    /// An operation could not be fingerprinted for durable ID tracking.
+    #[error("could not fingerprint operation: {0}")]
+    OperationFingerprint(String),
 }

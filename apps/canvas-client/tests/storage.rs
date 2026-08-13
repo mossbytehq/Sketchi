@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
 
-use canvas_client::storage::Journal;
+use canvas_client::storage::{Journal, load_document, save_document};
 use canvas_core::{
     ClientId, Element, ElementId, LamportTimestamp, Operation, OperationId, OperationKind, Point,
     Size, Transform, VersionVector,
@@ -54,6 +54,38 @@ fn journal_loads_deterministic_bounded_batches() {
             tenth,
         ]
     );
+}
+
+#[test]
+fn local_documents_round_trip_through_the_configured_directory() {
+    let directory = std::env::temp_dir().join(format!(
+        "sketchi-storage-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let directory_string = directory.to_string_lossy().into_owned();
+    let element = Element::rectangle(
+        ElementId::from_u128(30),
+        Transform::new(Point::new(2.0, 3.0), Size::new(40.0, 50.0)),
+    );
+    let operation = Operation::new(
+        OperationId::new(ClientId::from_u128(31), 1),
+        LamportTimestamp::new(1),
+        VersionVector::default(),
+        OperationKind::Create {
+            element: element.clone(),
+        },
+    );
+    let mut replica = canvas_core::CrdtDocument::new();
+    replica.apply(&operation).unwrap();
+    let document = replica.document();
+
+    save_document(&directory_string, &document).unwrap();
+    assert_eq!(load_document(&directory_string).unwrap(), Some(document));
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 fn operation_with_sequence(sequence: u64) -> Operation {

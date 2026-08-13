@@ -14,6 +14,10 @@ use crate::{auth::CapabilityToken, store::RoomStore};
 pub const SNAPSHOT_OPERATION_INTERVAL: usize = 500;
 /// Snapshot interval by elapsed wall time.
 pub const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
+/// Recent operation payloads retained for exact duplicate/reuse checks.
+const SEEN_OPERATION_RETENTION: usize = 256;
+/// Maximum number of idle rooms retained in the manager cache.
+const ROOM_CACHE_CAPACITY: usize = 256;
 
 /// A newly created room and its one-time returned capability secret.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +86,7 @@ pub struct Room {
     store: Arc<Mutex<RoomStore>>,
     operations_since_snapshot: usize,
     last_snapshot: Instant,
+    last_activity: Instant,
 }
 
 impl Room {
@@ -120,16 +125,23 @@ impl Room {
             store,
             operations_since_snapshot: 0,
             last_snapshot: Instant::now(),
+            last_activity: Instant::now(),
         })
     }
 
     pub(crate) fn join(&mut self, client_id: ClientId) {
         self.members.insert(client_id);
+        self.last_activity = Instant::now();
     }
 
     pub(crate) fn leave(&mut self, client_id: ClientId) {
         self.members.remove(&client_id);
         self.presence.remove(&client_id);
+        self.last_activity = Instant::now();
+    }
+
+    fn has_members(&self) -> bool {
+        !self.members.is_empty()
     }
 
     fn is_member(&self, client_id: ClientId) -> bool {
@@ -141,17 +153,20 @@ impl Room {
         client_id: ClientId,
         operations: &[Operation],
     ) -> Result<SubmitOutcome, RoomError> {
+        self.last_activity = Instant::now();
         if !self.is_member(client_id) {
             return Err(RoomError::NotInRoom);
         }
-        let mut candidate = self.document.clone();
-        let mut applied = Vec::new();
-        let mut acknowledged = Vec::new();
         for operation in operations {
             if operation.id.client_id != client_id {
                 return Err(RoomError::ClientMismatch);
             }
-            match candidate.apply(operation)? {
+        }
+        let mut applied = Vec::new();
+        let mut acknowledged = Vec::new();
+        let results = self.document.validate_batch(operations)?;
+        for (operation, result) in operations.iter().zip(results) {
+            match result {
                 canvas_core::ApplyResult::Applied => {
                     applied.push(operation.clone());
                     acknowledged.push(operation.id);
@@ -164,14 +179,23 @@ impl Room {
         if !applied.is_empty() {
             let mut store = self.store.lock().map_err(|_| RoomError::StoreLock)?;
             store.append_operations(self.room_id, &applied)?;
-            self.document = candidate;
+            for operation in &applied {
+                debug_assert_eq!(
+                    self.document.apply(operation)?,
+                    canvas_core::ApplyResult::Applied
+                );
+            }
             self.operations.extend(applied.iter().cloned());
             self.operations_since_snapshot += applied.len();
             if self.operations_since_snapshot >= SNAPSHOT_OPERATION_INTERVAL
                 || self.last_snapshot.elapsed() >= SNAPSHOT_INTERVAL
             {
+                self.document
+                    .compact_seen_operations(SEEN_OPERATION_RETENTION);
                 let snapshot = self.document.snapshot();
                 store.save_snapshot(self.room_id, &snapshot)?;
+                store.compact_operations(self.room_id)?;
+                self.operations.clear();
                 self.operations_since_snapshot = 0;
                 self.last_snapshot = Instant::now();
             }
@@ -182,7 +206,8 @@ impl Room {
         })
     }
 
-    pub(crate) fn sync(&self, known_version: &VersionVector) -> SyncPayload {
+    pub(crate) fn sync(&mut self, known_version: &VersionVector) -> SyncPayload {
+        self.last_activity = Instant::now();
         let operations = self
             .operations
             .iter()
@@ -204,6 +229,7 @@ impl Room {
             return Err(RoomError::NotInRoom);
         }
         self.presence.insert(state.client_id, state);
+        self.last_activity = Instant::now();
         Ok(())
     }
 }
@@ -230,6 +256,7 @@ impl RoomManager {
     ///
     /// Returns [`RoomError`] when `SQLite` initialization or room loading fails.
     pub fn create_room(&mut self) -> Result<CreatedRoom, RoomError> {
+        self.evict_idle_rooms();
         let room_id = RoomId::new();
         let token = CapabilityToken::generate();
         self.store
@@ -272,7 +299,14 @@ impl RoomManager {
     ///
     /// Returns [`RoomError::NotInRoom`] when the room is missing.
     pub fn leave(&mut self, room_id: RoomId, client_id: ClientId) -> Result<(), RoomError> {
-        self.room_mut(room_id)?.leave(client_id);
+        let remove = {
+            let room = self.room_mut(room_id)?;
+            room.leave(client_id);
+            !room.has_members()
+        };
+        if remove {
+            self.rooms.remove(&room_id);
+        }
         Ok(())
     }
 
@@ -328,6 +362,7 @@ impl RoomManager {
 
     fn room_mut(&mut self, room_id: RoomId) -> Result<&mut Room, RoomError> {
         if !self.rooms.contains_key(&room_id) {
+            self.evict_idle_rooms();
             let room =
                 Room::load(room_id, Arc::clone(&self.store)).map_err(|error| match error {
                     RoomError::Store(crate::store::StoreError::RoomNotFound) => {
@@ -338,5 +373,20 @@ impl RoomManager {
             self.rooms.insert(room_id, room);
         }
         self.rooms.get_mut(&room_id).ok_or(RoomError::NotInRoom)
+    }
+
+    fn evict_idle_rooms(&mut self) {
+        while self.rooms.len() >= ROOM_CACHE_CAPACITY {
+            let Some(room_id) = self
+                .rooms
+                .iter()
+                .filter(|(_, room)| !room.has_members())
+                .min_by_key(|(_, room)| room.last_activity)
+                .map(|(room_id, _)| *room_id)
+            else {
+                break;
+            };
+            self.rooms.remove(&room_id);
+        }
     }
 }

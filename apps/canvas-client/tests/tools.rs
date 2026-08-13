@@ -88,6 +88,22 @@ fn freehand_tool_commits_one_bounded_command_on_release() {
 }
 
 #[test]
+fn freehand_stabilization_is_applied_to_samples() {
+    let mut tools = ToolController::new(Tool::Freehand);
+    tools.set_input_settings(1.0, 0.5);
+    tools.pointer_down(ElementId::from_u128(50), Point::new(0.0, 0.0));
+    tools.pointer_move(Point::new(10.0, 10.0));
+    let ToolOutput::Command(EditorCommand::Create(element)) =
+        tools.pointer_up(Point::new(20.0, 20.0)).unwrap()
+    else {
+        panic!("stabilized freehand tool did not create an element");
+    };
+    assert_eq!(element.points[0], Point::default());
+    assert!(element.points.last().is_some_and(|point| point.x > 0.0));
+    assert!(element.transform.size.width > 0.0);
+}
+
+#[test]
 fn pan_is_reported_as_a_camera_delta_without_mutating_the_document() {
     let mut tools = ToolController::new(Tool::Pan);
     tools.pointer_down(ElementId::from_u128(6), Point::new(10.0, 20.0));

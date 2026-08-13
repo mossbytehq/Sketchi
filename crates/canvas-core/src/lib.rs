@@ -21,8 +21,8 @@ mod version_vector;
 pub use clock::{LamportClock, LamportTimestamp};
 pub use command::EditorCommand;
 pub use crdt::{
-    ApplyResult, CrdtDocument, CrdtSnapshot, ElementSnapshot, MAX_ELEMENTS, Register,
-    RegisterMetadata,
+    ApplyResult, CrdtDocument, CrdtSnapshot, ElementSnapshot, MAX_ELEMENTS, OperationFingerprint,
+    Register, RegisterMetadata,
 };
 pub use document::Document;
 pub use element::{

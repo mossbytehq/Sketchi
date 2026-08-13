@@ -28,6 +28,107 @@ fn embedded_image() -> EmbeddedImage {
 }
 
 #[test]
+fn image_elements_default_to_a_transparent_stroke() {
+    let image = Element::image(
+        ElementId::from_u128(13),
+        Transform::new(Point::default(), Size::new(20.0, 20.0)),
+        embedded_image(),
+    );
+
+    assert_eq!(image.style.stroke, Color::rgba(0, 0, 0, 0));
+    assert!((image.style.stroke_width - 2.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn compacted_operation_history_keeps_idempotence_without_retaining_every_payload() {
+    let mut document = CrdtDocument::new();
+    let operations = (1..=3)
+        .map(|sequence| {
+            operation(
+                1,
+                sequence,
+                sequence,
+                OperationKind::Create {
+                    element: rectangle(ElementId::from_u128(u128::from(sequence))),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    for operation in &operations {
+        document.apply(operation).unwrap();
+    }
+
+    document.compact_seen_operations(1);
+
+    assert_eq!(document.seen_operation_count(), 1);
+    assert_eq!(document.snapshot().operation_fingerprints.len(), 1);
+    assert_eq!(
+        document
+            .apply(operations.first().expect("first operation exists"))
+            .unwrap(),
+        ApplyResult::Duplicate
+    );
+    assert_eq!(document.document().len(), 3);
+
+    let mut restored = CrdtDocument::from_snapshot(document.snapshot()).unwrap();
+    assert_eq!(restored.seen_operation_count(), 1);
+    assert_eq!(
+        restored
+            .apply(operations.get(1).expect("second operation exists"))
+            .unwrap(),
+        ApplyResult::Duplicate
+    );
+}
+
+#[test]
+fn compaction_does_not_turn_unreceived_out_of_order_ids_into_duplicates() {
+    let mut document = CrdtDocument::new();
+    let second = operation(
+        1,
+        2,
+        2,
+        OperationKind::Create {
+            element: rectangle(ElementId::from_u128(32)),
+        },
+    );
+    let first = operation(
+        1,
+        1,
+        1,
+        OperationKind::Create {
+            element: rectangle(ElementId::from_u128(31)),
+        },
+    );
+
+    assert_eq!(document.apply(&second).unwrap(), ApplyResult::Applied);
+    document.compact_seen_operations(0);
+    assert_eq!(document.apply(&first).unwrap(), ApplyResult::Applied);
+}
+
+#[test]
+fn compaction_treats_ids_in_a_compacted_prefix_as_idempotent() {
+    let mut document = CrdtDocument::new();
+    let original = operation(
+        1,
+        1,
+        1,
+        OperationKind::Create {
+            element: rectangle(ElementId::from_u128(33)),
+        },
+    );
+    let mut reused = original.clone();
+    reused.kind = OperationKind::Create {
+        element: rectangle(ElementId::from_u128(34)),
+    };
+
+    document.apply(&original).unwrap();
+    document.compact_seen_operations(0);
+
+    assert_eq!(document.apply(&reused).unwrap(), ApplyResult::Duplicate);
+    assert_eq!(document.apply(&original).unwrap(), ApplyResult::Duplicate);
+}
+
+#[test]
 fn embedded_image_survives_crdt_delivery_and_snapshot_round_trip() {
     let element_id = ElementId::from_u128(14);
     let create = operation(
