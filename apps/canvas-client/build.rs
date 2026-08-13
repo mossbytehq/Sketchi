@@ -19,10 +19,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             println!("cargo:rerun-if-changed={}", server.display());
             let path = server.to_string_lossy().to_string();
-            format!(concat!(
-                "#[allow(missing_docs)]\n",
-                "pub static EMBEDDED_SERVER: &[u8] = include_bytes!({path:?});\n"
-            ))
+            format!(
+                concat!(
+                    "#[allow(missing_docs)]\n",
+                    "pub static EMBEDDED_SERVER: &[u8] = include_bytes!({:?});\n"
+                ),
+                path
+            )
         }
         None => "#[allow(missing_docs)]\npub static EMBEDDED_SERVER: &[u8] = &[];\n".to_owned(),
     };
