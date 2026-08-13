@@ -206,7 +206,8 @@ impl LocalServer {
             let _ = std::fs::remove_dir_all(&extraction_directory);
             return Err(SupervisorError::Io(error));
         }
-        if cfg!(unix) {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
 
             let mut permissions = std::fs::metadata(&executable)?.permissions();
