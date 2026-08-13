@@ -4810,27 +4810,7 @@ fn linux_platform_name() -> String {
 
 #[cfg(target_os = "windows")]
 fn windows_platform_name() -> String {
-    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
-    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
-
-    let mut version = OSVERSIONINFOW {
-        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
-        ..Default::default()
-    };
-    let status = unsafe { RtlGetVersion(&mut version) };
-    if status >= 0 && version.dwMajorVersion == 10 && version.dwMinorVersion == 0 {
-        let release = if version.dwBuildNumber >= 22_000 {
-            "Windows 11"
-        } else {
-            "Windows 10"
-        };
-        format!("{release} (build {})", version.dwBuildNumber)
-    } else {
-        format!(
-            "Windows {}.{} (build {})",
-            version.dwMajorVersion, version.dwMinorVersion, version.dwBuildNumber
-        )
-    }
+    String::from("Windows")
 }
 
 #[cfg(not(target_os = "windows"))]
