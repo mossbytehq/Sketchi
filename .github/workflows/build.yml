@@ -46,8 +46,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: sketchi-release-${{ matrix.target }}
-      - name: Build client and server
-        run: cargo build --locked --release --target ${{ matrix.target }} --bin sketchi --bin sketchi-server
+      - name: Build server
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin sketchi-server
+      - name: Build Linux client
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          export SKETCHI_EMBED_SERVER="$(pwd)/target/${{ matrix.target }}/release/sketchi-server"
+          cargo build --locked --release --target ${{ matrix.target }} --bin sketchi
+      - name: Build Windows standalone client
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          export SKETCHI_EMBED_SERVER="$(pwd -W)/target/${{ matrix.target }}/release/sketchi-server.exe"
+          cargo build --locked --release --target ${{ matrix.target }} --bin sketchi
       - name: Stage client package
         shell: bash
         run: cargo xtask package --target "${{ matrix.target }}" --format portable --target-dir target --out-dir dist/staging

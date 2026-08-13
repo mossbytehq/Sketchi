@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 description = "Sketchi collaborative whiteboard desktop client"
 default-run = "sketchi"
+build = "build.rs"
 
 [package.metadata.deb]
 maintainer = "Sketchi contributors"

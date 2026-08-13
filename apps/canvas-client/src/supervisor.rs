@@ -2,6 +2,7 @@
 
 use std::{
     io::{BufRead, BufReader},
+    path::PathBuf,
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -9,6 +10,8 @@ use std::{
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+include!(concat!(env!("OUT_DIR"), "/embedded_server.rs"));
 
 /// Maximum number of reconnect attempts permitted by the client state machine.
 pub const MAX_RECONNECT_ATTEMPTS: u32 = 8;
@@ -72,6 +75,7 @@ pub fn parse_ready_line(line: &str) -> Result<ReadyMessage, SupervisorError> {
 pub struct LocalServer {
     child: Child,
     readiness: ReadyMessage,
+    extracted_server: Option<PathBuf>,
 }
 
 impl LocalServer {
@@ -100,16 +104,14 @@ impl LocalServer {
         } else {
             ["Sketchi-server", "sketchi-server"]
         };
-        let executable = names
+        let (executable, extracted_server) = match names
             .iter()
             .map(|name| directory.join(name))
             .find(|candidate| candidate.is_file())
-            .ok_or_else(|| {
-                SupervisorError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "Sketchi server sidecar was not found next to the client",
-                ))
-            })?;
+        {
+            Some(executable) => (executable, None),
+            None => Self::extract_embedded_server()?,
+        };
         let database = ProjectDirs::from("org", "Sketchi", "Sketchi").map_or_else(
             || directory.join("sketchi.sqlite3"),
             |directories| directories.data_dir().join("sketchi.sqlite3"),
@@ -124,7 +126,9 @@ impl LocalServer {
             .arg("127.0.0.1:0")
             .arg("--database")
             .arg(database);
-        Self::spawn(command)
+        let mut server = Self::spawn(command)?;
+        server.extracted_server = extracted_server;
+        Ok(server)
     }
 
     /// Spawns a server command and waits for its first readiness line.
@@ -143,7 +147,11 @@ impl LocalServer {
             .spawn()?;
         let result = Self::readiness_from_child(&mut child);
         match result {
-            Ok(readiness) => Ok(Self { child, readiness }),
+            Ok(readiness) => Ok(Self {
+                child,
+                readiness,
+                extracted_server: None,
+            }),
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -176,12 +184,46 @@ impl LocalServer {
             .ok_or(SupervisorError::ExitedBeforeReadiness)?;
         parse_ready_line(&line)
     }
+
+    fn extract_embedded_server() -> Result<(PathBuf, Option<PathBuf>), SupervisorError> {
+        if EMBEDDED_SERVER.is_empty() {
+            return Err(SupervisorError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Sketchi server sidecar was not found next to the client",
+            )));
+        }
+
+        let extraction_directory = std::env::temp_dir()
+            .join("Sketchi")
+            .join(std::process::id().to_string());
+        std::fs::create_dir_all(&extraction_directory)?;
+        let executable = extraction_directory.join(if cfg!(windows) {
+            "Sketchi-server.exe"
+        } else {
+            "Sketchi-server"
+        });
+        if let Err(error) = std::fs::write(&executable, EMBEDDED_SERVER) {
+            let _ = std::fs::remove_dir_all(&extraction_directory);
+            return Err(SupervisorError::Io(error));
+        }
+        if cfg!(unix) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&executable)?.permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&executable, permissions)?;
+        }
+        Ok((executable, Some(extraction_directory)))
+    }
 }
 
 impl Drop for LocalServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(directory) = self.extracted_server.take() {
+            let _ = std::fs::remove_dir_all(directory);
+        }
     }
 }
 
