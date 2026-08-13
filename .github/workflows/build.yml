@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Workspace version encoded in staged artifact names
+        description: Must match the version in Cargo.toml at the selected ref
         required: false
         default: 0.1.0
         type: string
@@ -57,8 +57,19 @@ jobs:
       - name: Verify staged contents
         shell: bash
         run: |
-          cargo xtask artifact-check --path "dist/staging/Sketchi-${{ inputs.version }}-${{ matrix.target }}" --target "${{ matrix.target }}" --kind client
-          cargo xtask artifact-check --path "dist/staging/Sketchi-server-${{ inputs.version }}-${{ matrix.target }}" --target "${{ matrix.target }}" --kind server
+          set -euo pipefail
+          client_stage="$(find dist/staging -mindepth 1 -maxdepth 1 -type d -name "Sketchi-*-${{ matrix.target }}" ! -name "Sketchi-server-*" -print -quit)"
+          server_stage="$(find dist/staging -mindepth 1 -maxdepth 1 -type d -name "Sketchi-server-*-${{ matrix.target }}" -print -quit)"
+          test -n "$client_stage" || { echo "client staging directory was not created"; exit 1; }
+          test -n "$server_stage" || { echo "server staging directory was not created"; exit 1; }
+          staged_version="$(tr -d '\r\n' < "$client_stage/VERSION")"
+          if [[ "$staged_version" != "${{ inputs.version }}" ]]; then
+            echo "workflow version ${{ inputs.version }} does not match staged workspace version $staged_version"
+            echo "Update Cargo.toml before running this workflow, or pass the matching version."
+            exit 1
+          fi
+          cargo xtask artifact-check --path "$client_stage" --target "${{ matrix.target }}" --kind client
+          cargo xtask artifact-check --path "$server_stage" --target "${{ matrix.target }}" --kind server
       - uses: actions/upload-artifact@v4
         with:
           name: sketchi-staging-${{ matrix.target }}
@@ -79,15 +90,22 @@ jobs:
           path: dist/staging
       - name: Build Arch package
         shell: bash
-        env:
-          SKETCHI_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          stage="$(find dist/staging -mindepth 1 -maxdepth 1 -type d -name 'Sketchi-*-x86_64-unknown-linux-gnu' ! -name 'Sketchi-server-*' -print -quit)"
+          test -n "$stage" || { echo "client staging directory was not downloaded"; exit 1; }
+          export SKETCHI_VERSION="$(tr -d '\r\n' < "$stage/VERSION")"
+          export SKETCHI_STAGE_NAME="$(basename "$stage")"
+          if [[ "$SKETCHI_VERSION" != "${{ inputs.version }}" ]]; then
+            echo "workflow version ${{ inputs.version }} does not match staged workspace version $SKETCHI_VERSION"
+            exit 1
+          fi
           mkdir -p dist/artifacts dist/arch-build
           docker run --rm \
             --volume "$PWD:/workspace" \
             --workdir /workspace \
             --env SKETCHI_VERSION \
+            --env SKETCHI_STAGE_NAME \
             archlinux:base \
             bash -euxo pipefail -c '
               pacman -Syu --noconfirm --needed base-devel
@@ -95,7 +113,7 @@ jobs:
               chown -R builder:builder /workspace/dist /workspace/packaging/arch
               su builder -s /bin/bash -c "
                 export SKETCHI_VERSION=${SKETCHI_VERSION}
-                export SKETCHI_STAGE_DIR=/workspace/dist/staging/Sketchi-${SKETCHI_VERSION}-x86_64-unknown-linux-gnu
+                export SKETCHI_STAGE_DIR=/workspace/dist/staging/${SKETCHI_STAGE_NAME}
                 export PKGDEST=/workspace/dist/artifacts
                 export BUILDDIR=/workspace/dist/arch-build
                 makepkg --cleanbuild --force --nodeps --skipinteg \
@@ -132,11 +150,15 @@ jobs:
           sudo apt-get install --no-install-recommends -y rpm
       - name: Build RPM package
         shell: bash
-        env:
-          SKETCHI_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          stage="$PWD/dist/staging/Sketchi-${SKETCHI_VERSION}-x86_64-unknown-linux-gnu"
+          stage="$(find dist/staging -mindepth 1 -maxdepth 1 -type d -name 'Sketchi-*-x86_64-unknown-linux-gnu' ! -name 'Sketchi-server-*' -print -quit)"
+          test -n "$stage" || { echo "client staging directory was not downloaded"; exit 1; }
+          export SKETCHI_VERSION="$(tr -d '\r\n' < "$stage/VERSION")"
+          if [[ "$SKETCHI_VERSION" != "${{ inputs.version }}" ]]; then
+            echo "workflow version ${{ inputs.version }} does not match staged workspace version $SKETCHI_VERSION"
+            exit 1
+          fi
           rpm_top="$PWD/dist/rpmbuild"
           mkdir -p "$PWD/dist/artifacts" "$rpm_top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
           rpmbuild -bb \
