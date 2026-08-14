@@ -20,7 +20,7 @@
     </Feature>
   </Package>
   <Fragment>
-    <StandardDirectory Id="ProgramFilesFolder">
+    <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="Sketchi" />
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder">
