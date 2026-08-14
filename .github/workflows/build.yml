@@ -7,6 +7,10 @@ on:
         required: false
         type: string
         default: ""
+      sign_windows:
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       ref:
@@ -107,6 +111,285 @@ jobs:
           fi
           cargo run --locked --package xtask -- artifact-check --path "$client_stage" --target "${{ matrix.target }}" --kind client
           cargo run --locked --package xtask -- artifact-check --path "$server_stage" --target "${{ matrix.target }}" --kind server
+      - name: Sign Windows binaries
+        if: ${{ runner.os == 'Windows' && inputs.sign_windows }}
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+          WINDOWS_SIGNING_TIMESTAMP_URL: https://timestamp.digicert.com
+          SKETCHI_TARGET: ${{ matrix.target }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERTIFICATE_BASE64)) {
+            throw "WINDOWS_SIGNING_CERTIFICATE_BASE64 is not configured"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD)) {
+            throw "WINDOWS_SIGNING_CERTIFICATE_PASSWORD is not configured"
+          }
+
+          $pfx = Join-Path $env:RUNNER_TEMP "sketchi-signing.pfx"
+          try {
+            $bytes = [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERTIFICATE_BASE64)
+            [IO.File]::WriteAllBytes($pfx, $bytes)
+          } catch {
+            throw "The Windows signing certificate is not valid base64: $($_.Exception.Message)"
+          }
+
+          $signtool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
+          if ([string]::IsNullOrWhiteSpace($signtool)) {
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if ([string]::IsNullOrWhiteSpace($signtool)) {
+            throw "signtool.exe was not found on the Windows runner"
+          }
+
+          $stage = Get-ChildItem "$env:GITHUB_WORKSPACE\dist\staging" -Directory |
+            Where-Object { $_.Name -like "Sketchi-*-$env:SKETCHI_TARGET" -and $_.Name -notlike "Sketchi-server-*" } |
+            Select-Object -First 1
+          $serverStage = Get-ChildItem "$env:GITHUB_WORKSPACE\dist\staging" -Directory |
+            Where-Object { $_.Name -like "Sketchi-server-*-$env:SKETCHI_TARGET" } |
+            Select-Object -First 1
+          if ($null -eq $stage -or $null -eq $serverStage) {
+            throw "Windows staging directories were not found"
+          }
+
+          $files = @(
+            (Join-Path $stage.FullName "Sketchi.exe"),
+            (Join-Path $stage.FullName "Sketchi-server.exe"),
+            (Join-Path $serverStage.FullName "Sketchi-server.exe")
+          ) | Select-Object -Unique
+          foreach ($file in $files) {
+            if (-not (Test-Path $file)) {
+              throw "Cannot sign missing file $file"
+            }
+            & $signtool sign /fd SHA256 /tr $env:WINDOWS_SIGNING_TIMESTAMP_URL /td SHA256 /f $pfx /p $env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD $file
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool failed to sign $file with exit code $LASTEXITCODE"
+            }
+            & $signtool verify /pa /all $file
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool could not verify the signature on $file"
+            }
+          }
+      - name: Build Windows MSI installer
+        if: ${{ runner.os == 'Windows' && !contains(needs.metadata.outputs.version, '-') }}
+        shell: pwsh
+        env:
+          SKETCHI_VERSION: ${{ needs.metadata.outputs.version }}
+          SKETCHI_TARGET: ${{ matrix.target }}
+          WIX_VERSION: 5.0.2
+        run: |
+          $stage = Get-ChildItem "$env:GITHUB_WORKSPACE\dist\staging" -Directory |
+            Where-Object { $_.Name -like "Sketchi-*-$env:SKETCHI_TARGET" -and $_.Name -notlike "Sketchi-server-*" } |
+            Select-Object -First 1
+          if ($null -eq $stage) {
+            throw "Windows client staging directory was not found"
+          }
+
+          $wixDir = Join-Path $env:RUNNER_TEMP "wix"
+          dotnet tool install --tool-path $wixDir wix --version $env:WIX_VERSION
+          $wix = Join-Path $wixDir "wix.exe"
+          & $wix extension add -g "WixToolset.UI.wixext/$env:WIX_VERSION"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $installer = Join-Path $env:GITHUB_WORKSPACE "dist\staging\Sketchi-$env:SKETCHI_VERSION-windows-x86_64-setup.msi"
+          & $wix build "$env:GITHUB_WORKSPACE\packaging\windows\main.wxs" `
+            -arch x64 `
+            -ext WixToolset.UI.wixext `
+            "-dVersion=$env:SKETCHI_VERSION" `
+            "-dClientBinary=$($stage.FullName)\Sketchi.exe" `
+            "-dServerBinary=$($stage.FullName)\Sketchi-server.exe" `
+            "-dLicenseFile=$($stage.FullName)\LICENSE.md" `
+            "-dIconFile=$($stage.FullName)\Sketchi.ico" `
+            "-bindvariable" `
+            "WixUILicenseRtf=$env:GITHUB_WORKSPACE\packaging\windows\license.rtf" `
+            -o $installer
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if (-not (Test-Path $installer)) {
+            throw "WiX did not create $installer"
+          }
+      - name: Sign Windows MSI installer
+        if: ${{ runner.os == 'Windows' && inputs.sign_windows && !contains(needs.metadata.outputs.version, '-') }}
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+          WINDOWS_SIGNING_TIMESTAMP_URL: https://timestamp.digicert.com
+          SKETCHI_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "sketchi-signing.pfx"
+          if (-not (Test-Path $pfx)) {
+            throw "The Windows signing certificate was not created"
+          }
+          $signtool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
+          if ([string]::IsNullOrWhiteSpace($signtool)) {
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if ([string]::IsNullOrWhiteSpace($signtool)) {
+            throw "signtool.exe was not found on the Windows runner"
+          }
+          $installer = Join-Path $env:GITHUB_WORKSPACE "dist\staging\Sketchi-$env:SKETCHI_VERSION-windows-x86_64-setup.msi"
+          & $signtool sign /fd SHA256 /tr $env:WINDOWS_SIGNING_TIMESTAMP_URL /td SHA256 /f $pfx /p $env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD $installer
+          if ($LASTEXITCODE -ne 0) {
+            throw "signtool failed to sign the MSI with exit code $LASTEXITCODE"
+          }
+          & $signtool verify /pa /all $installer
+          if ($LASTEXITCODE -ne 0) {
+            throw "signtool could not verify the MSI signature"
+          }
+      - name: Build Windows setup executable
+        if: ${{ runner.os == 'Windows' && !contains(needs.metadata.outputs.version, '-') }}
+        shell: pwsh
+        env:
+          SKETCHI_VERSION: ${{ needs.metadata.outputs.version }}
+          SKETCHI_TARGET: ${{ matrix.target }}
+          WIX_VERSION: 5.0.2
+        run: |
+          $stage = Get-ChildItem "$env:GITHUB_WORKSPACE\dist\staging" -Directory |
+            Where-Object { $_.Name -like "Sketchi-*-$env:SKETCHI_TARGET" -and $_.Name -notlike "Sketchi-server-*" } |
+            Select-Object -First 1
+          if ($null -eq $stage) {
+            throw "Windows client staging directory was not found"
+          }
+          $msi = Join-Path $env:GITHUB_WORKSPACE "dist\staging\Sketchi-$env:SKETCHI_VERSION-windows-x86_64-setup.msi"
+          if (-not (Test-Path $msi)) {
+            throw "Windows MSI installer was not found"
+          }
+
+          $wixDir = Join-Path $env:RUNNER_TEMP "wix"
+          $wix = Join-Path $wixDir "wix.exe"
+          & $wix extension add -g "WixToolset.BootstrapperApplications.wixext/$env:WIX_VERSION"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $setup = Join-Path $env:GITHUB_WORKSPACE "dist\staging\Sketchi-$env:SKETCHI_VERSION-windows-x86_64-setup.exe"
+          & $wix build "$env:GITHUB_WORKSPACE\packaging\windows\bundle.wxs" `
+            -arch x64 `
+            -ext WixToolset.BootstrapperApplications.wixext `
+            "-dVersion=$env:SKETCHI_VERSION" `
+            "-dIconFile=$($stage.FullName)\Sketchi.ico" `
+            "-dLicenseRtf=$env:GITHUB_WORKSPACE\packaging\windows\license.rtf" `
+            "-dMsiFile=$msi" `
+            -o $setup
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if (-not (Test-Path $setup)) {
+            throw "WiX did not create $setup"
+          }
+      - name: Sign Windows setup executable
+        if: ${{ runner.os == 'Windows' && inputs.sign_windows && !contains(needs.metadata.outputs.version, '-') }}
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+          WINDOWS_SIGNING_TIMESTAMP_URL: https://timestamp.digicert.com
+          SKETCHI_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "sketchi-signing.pfx"
+          $setup = Join-Path $env:GITHUB_WORKSPACE "dist\staging\Sketchi-$env:SKETCHI_VERSION-windows-x86_64-setup.exe"
+          $engine = Join-Path $env:RUNNER_TEMP "sketchi-burn-engine.exe"
+          $signedSetup = Join-Path $env:RUNNER_TEMP "sketchi-setup-signed.exe"
+          $signtool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
+          if ([string]::IsNullOrWhiteSpace($signtool)) {
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if ([string]::IsNullOrWhiteSpace($signtool)) {
+            throw "signtool.exe was not found on the Windows runner"
+          }
+          $wix = Join-Path $env:RUNNER_TEMP "wix\wix.exe"
+          & $wix burn detach $setup -engine $engine
+          if ($LASTEXITCODE -ne 0) {
+            throw "WiX could not detach the Burn engine"
+          }
+          & $signtool sign /fd SHA256 /tr $env:WINDOWS_SIGNING_TIMESTAMP_URL /td SHA256 /f $pfx /p $env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD $engine
+          if ($LASTEXITCODE -ne 0) {
+            throw "signtool failed to sign the Burn engine"
+          }
+          & $wix burn reattach $setup -engine $engine -o $signedSetup
+          if ($LASTEXITCODE -ne 0) {
+            throw "WiX could not reattach the signed Burn engine"
+          }
+          Move-Item -Force $signedSetup $setup
+          & $signtool sign /fd SHA256 /tr $env:WINDOWS_SIGNING_TIMESTAMP_URL /td SHA256 /f $pfx /p $env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD $setup
+          if ($LASTEXITCODE -ne 0) {
+            throw "signtool failed to sign the Windows setup executable"
+          }
+          & $signtool verify /pa /all $setup
+          if ($LASTEXITCODE -ne 0) {
+            throw "signtool could not verify the setup executable signature"
+          }
+      - name: Smoke-test Windows MSI installer
+        if: ${{ runner.os == 'Windows' && !contains(needs.metadata.outputs.version, '-') }}
+        shell: pwsh
+        env:
+          SKETCHI_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          $installer = "$env:GITHUB_WORKSPACE\dist\staging\Sketchi-$env:SKETCHI_VERSION-windows-x86_64-setup.msi"
+          $install = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            "/i", $installer, "/qn", "/norestart"
+          )
+          if ($install.ExitCode -ne 0) {
+            throw "MSI installation failed with exit code $($install.ExitCode)"
+          }
+
+          $installDir = Join-Path ${env:ProgramFiles} "Sketchi"
+          $client = Join-Path $installDir "Sketchi.exe"
+          $server = Join-Path $installDir "Sketchi-server.exe"
+          if (-not (Test-Path $client) -or -not (Test-Path $server)) {
+            throw "Installed Sketchi files were not found in $installDir"
+          }
+          & $server --check-config --insecure-loopback
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed Sketchi server smoke check failed"
+          }
+
+          $uninstall = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            "/x", $installer, "/qn", "/norestart"
+          )
+          if ($uninstall.ExitCode -ne 0) {
+            throw "MSI uninstall failed with exit code $($uninstall.ExitCode)"
+          }
+      - name: Smoke-test Windows setup executable
+        if: ${{ runner.os == 'Windows' && !contains(needs.metadata.outputs.version, '-') }}
+        shell: pwsh
+        env:
+          SKETCHI_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          $setup = "$env:GITHUB_WORKSPACE\dist\staging\Sketchi-$env:SKETCHI_VERSION-windows-x86_64-setup.exe"
+          $install = Start-Process $setup -Wait -PassThru -ArgumentList @(
+            "/quiet", "/norestart"
+          )
+          if ($install.ExitCode -ne 0) {
+            throw "Windows setup installation failed with exit code $($install.ExitCode)"
+          }
+          $installDir = Join-Path ${env:ProgramFiles} "Sketchi"
+          $client = Join-Path $installDir "Sketchi.exe"
+          $server = Join-Path $installDir "Sketchi-server.exe"
+          if (-not (Test-Path $client) -or -not (Test-Path $server)) {
+            throw "Setup did not install Sketchi files in $installDir"
+          }
+          & $server --check-config --insecure-loopback
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed Sketchi server smoke check failed"
+          }
+          $uninstall = Start-Process $setup -Wait -PassThru -ArgumentList @(
+            "/uninstall", "/quiet", "/norestart"
+          )
+          if ($uninstall.ExitCode -ne 0) {
+            throw "Windows setup uninstall failed with exit code $($uninstall.ExitCode)"
+          }
+      - name: Remove Windows signing certificate
+        if: ${{ always() && runner.os == 'Windows' && inputs.sign_windows }}
+        shell: pwsh
+        run: Remove-Item -Force -ErrorAction SilentlyContinue "$env:RUNNER_TEMP\sketchi-signing.pfx"
       - uses: actions/upload-artifact@v4
         with:
           name: sketchi-staging-${{ matrix.target }}

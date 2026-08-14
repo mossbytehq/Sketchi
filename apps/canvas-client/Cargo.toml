@@ -28,6 +28,9 @@ manufacturer = "Sketchi contributors"
 license = "../../LICENSE.md"
 path = "../../packaging/windows/main.wxs"
 
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1.12"
+
 [[bin]]
 name = "sketchi"
 path = "src/main.rs"

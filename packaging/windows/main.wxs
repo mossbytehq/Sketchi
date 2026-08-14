@@ -1,11 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wix">
+<Wix
+    xmlns="http://wixtoolset.org/schemas/v4/wxs"
+    xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Fragment>
     <Icon Id="SketchiIcon" SourceFile="$(var.IconFile)" />
   </Fragment>
-  <Package Name="Sketchi" Manufacturer="Sketchi contributors" Version="$(var.Version)" UpgradeCode="7A4C2B31-8D7D-4C4F-9E04-3B8E2C1B1A10">
+  <Package
+      Name="Sketchi"
+      Manufacturer="Sketchi contributors"
+      Version="$(var.Version)"
+      Scope="perMachine"
+      UpgradeCode="7A4C2B31-8D7D-4C4F-9E04-3B8E2C1B1A10">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Sketchi is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <Property Id="ARPPRODUCTICON" Value="SketchiIcon" />
     <Feature Id="MainFeature" Title="Sketchi" Level="1">
       <ComponentGroupRef Id="SketchiFiles" />
     </Feature>

@@ -47,6 +47,8 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       ref: ${{ needs.version.outputs.sha }}
+      sign_windows: true
+    secrets: inherit
 
   assemble:
     needs: [version, build]
@@ -70,7 +72,35 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
       - name: Keep standalone runtime artifacts only
         run: mkdir -p dist/artifacts
-      - name: Export Windows executable
+      - name: Export Windows setup executable
+        if: ${{ !contains(needs.version.outputs.version, '-') }}
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          setup="dist/staging/Sketchi-${RELEASE_VERSION}-windows-x86_64-setup.exe"
+          test -f "$setup" || {
+            echo "Windows setup executable was not downloaded"
+            exit 1
+          }
+          install -m 0755 "$setup" \
+            "dist/artifacts/Sketchi-${RELEASE_VERSION}-windows-x86_64.exe"
+      - name: Export Windows installer
+        if: ${{ !contains(needs.version.outputs.version, '-') }}
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          installer="dist/staging/Sketchi-${RELEASE_VERSION}-windows-x86_64-setup.msi"
+          test -f "$installer" || {
+            echo "Windows MSI installer was not downloaded"
+            exit 1
+          }
+          install -m 0644 "$installer" \
+            "dist/artifacts/Sketchi-${RELEASE_VERSION}-windows-x86_64-setup.msi"
+      - name: Export Windows portable zip
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.version.outputs.version }}
@@ -83,8 +113,7 @@ jobs:
             echo "Windows client staging directory was not downloaded"
             exit 1
           }
-          install -m 0755 "$windows_stage/Sketchi.exe" \
-            "dist/artifacts/Sketchi-${RELEASE_VERSION}-windows-x86_64.exe"
+          (cd "$windows_stage" && zip -qr "$GITHUB_WORKSPACE/dist/artifacts/Sketchi-${RELEASE_VERSION}-windows-x86_64.zip" .)
       - name: Export Linux executable
         shell: bash
         env:

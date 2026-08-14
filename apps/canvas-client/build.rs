@@ -4,6 +4,8 @@ use std::{env, error::Error, fs, path::PathBuf};
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-env-changed=SKETCHI_EMBED_SERVER");
+    #[cfg(target_os = "windows")]
+    embed_windows_icon()?;
 
     let generated = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?)
         .join("embedded_server.rs");
@@ -31,5 +33,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     fs::write(generated, source)?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn embed_windows_icon() -> Result<(), Box<dyn Error>> {
+    let icon =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or("CARGO_MANIFEST_DIR is not set")?)
+            .join("../../packaging/windows/sketchi.ico");
+    println!("cargo:rerun-if-changed={}", icon.display());
+
+    let icon = icon
+        .to_str()
+        .ok_or("Windows icon path is not valid UTF-8")?;
+    let mut resources = winres::WindowsResource::new();
+    resources.set_icon(icon);
+    resources.compile()?;
     Ok(())
 }
