@@ -1,6 +1,3 @@
-[workspace.package]
-version = "0.1.1"
-
 [build]
 # Reduces persistent incremental artifacts; rebuilds may be slower.
 incremental = false

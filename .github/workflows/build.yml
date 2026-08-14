@@ -3,27 +3,53 @@ name: Build artifacts
 on:
   workflow_call:
     inputs:
-      version:
-        required: false
-        type: string
-        default: 0.1.0
       ref:
         required: false
         type: string
         default: ""
   workflow_dispatch:
     inputs:
-      version:
-        description: Must match the version in Cargo.toml at the selected ref
+      ref:
+        description: Branch or commit to build; defaults to the selected branch
         required: false
-        default: 0.1.0
+        default: ""
         type: string
 
 permissions:
   contents: read
 
 jobs:
+  metadata:
+    name: Read workspace version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - id: version
+        name: Read version from Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo run --locked --package xtask -- version-check | sed -n 's/^Sketchi version //p' | tail -n 1)"
+          test -n "$version" || {
+            echo "Could not read the workspace version from Cargo.toml"
+            exit 1
+          }
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Build versions must have the form X.Y.Z; got $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: metadata
     name: Build (${{ matrix.target }})
     strategy:
       fail-fast: false
@@ -37,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.metadata.outputs.sha }}
       - uses: ./.github/actions/install-linux-deps
         if: runner.os == 'Linux'
       - uses: dtolnay/rust-toolchain@1.97.1
@@ -75,9 +101,8 @@ jobs:
           test -n "$client_stage" || { echo "client staging directory was not created"; exit 1; }
           test -n "$server_stage" || { echo "server staging directory was not created"; exit 1; }
           staged_version="$(tr -d '\r\n' < "$client_stage/VERSION")"
-          if [[ "$staged_version" != "${{ inputs.version }}" ]]; then
-            echo "workflow version ${{ inputs.version }} does not match staged workspace version $staged_version"
-            echo "Update Cargo.toml before running this workflow, or pass the matching version."
+          if [[ "$staged_version" != "${{ needs.metadata.outputs.version }}" ]]; then
+            echo "metadata version ${{ needs.metadata.outputs.version }} does not match staged workspace version $staged_version"
             exit 1
           fi
           cargo xtask artifact-check --path "$client_stage" --target "${{ matrix.target }}" --kind client
@@ -90,12 +115,12 @@ jobs:
 
   arch-package:
     name: Arch package
-    needs: build
+    needs: [metadata, build]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.metadata.outputs.sha }}
       - uses: actions/download-artifact@v4
         with:
           name: sketchi-staging-x86_64-unknown-linux-gnu
@@ -109,8 +134,8 @@ jobs:
           stage="$(realpath "$stage")"
           export SKETCHI_VERSION="$(tr -d '\r\n' < "$stage/VERSION")"
           export SKETCHI_STAGE_NAME="$(basename "$stage")"
-          if [[ "$SKETCHI_VERSION" != "${{ inputs.version }}" ]]; then
-            echo "workflow version ${{ inputs.version }} does not match staged workspace version $SKETCHI_VERSION"
+          if [[ "$SKETCHI_VERSION" != "${{ needs.metadata.outputs.version }}" ]]; then
+            echo "metadata version ${{ needs.metadata.outputs.version }} does not match staged workspace version $SKETCHI_VERSION"
             exit 1
           fi
           mkdir -p dist/artifacts dist/arch-build
@@ -141,18 +166,18 @@ jobs:
             '
       - uses: actions/upload-artifact@v4
         with:
-          name: sketchi-package-arch-${{ inputs.version }}
+          name: sketchi-package-arch-${{ needs.metadata.outputs.version }}
           path: dist/artifacts
           if-no-files-found: error
 
   rpm-package:
     name: RPM package
-    needs: build
+    needs: [metadata, build]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.metadata.outputs.sha }}
       - uses: actions/download-artifact@v4
         with:
           name: sketchi-staging-x86_64-unknown-linux-gnu
@@ -169,8 +194,8 @@ jobs:
           test -n "$stage" || { echo "client staging directory was not downloaded"; exit 1; }
           stage="$(realpath "$stage")"
           export SKETCHI_VERSION="$(tr -d '\r\n' < "$stage/VERSION")"
-          if [[ "$SKETCHI_VERSION" != "${{ inputs.version }}" ]]; then
-            echo "workflow version ${{ inputs.version }} does not match staged workspace version $SKETCHI_VERSION"
+          if [[ "$SKETCHI_VERSION" != "${{ needs.metadata.outputs.version }}" ]]; then
+            echo "metadata version ${{ needs.metadata.outputs.version }} does not match staged workspace version $SKETCHI_VERSION"
             exit 1
           fi
           rpm_top="$PWD/dist/rpmbuild"
@@ -188,6 +213,6 @@ jobs:
           rpm -qpl "dist/artifacts/$(basename "${packages[0]}")" | grep -Fx /usr/share/applications/sketchi.desktop
       - uses: actions/upload-artifact@v4
         with:
-          name: sketchi-package-rpm-${{ inputs.version }}
+          name: sketchi-package-rpm-${{ needs.metadata.outputs.version }}
           path: dist/artifacts
           if-no-files-found: error
