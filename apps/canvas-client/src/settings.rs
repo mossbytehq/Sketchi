@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[allow(unused_imports)]
-use crate::theme::ThemeTokens;
+use crate::{
+    theme::ThemeTokens,
+    update::{UpdateCache, UpdateChannel},
+};
 
 const SETTINGS_VERSION: u32 = 2;
 
@@ -91,6 +94,10 @@ pub(crate) struct Settings {
     pub(crate) drawing_style: Option<Style>,
     /// Shortcuts keyed by their stable action label.
     pub(crate) keybinds: BTreeMap<String, KeyBinding>,
+    /// Release stream used by the update checker.
+    pub(crate) update_channel: UpdateChannel,
+    /// Last successful update lookup.
+    pub(crate) update_cache: UpdateCache,
 }
 
 impl Default for Settings {
@@ -129,6 +136,8 @@ impl Default for Settings {
             remember_drawing_style: true,
             drawing_style: None,
             keybinds: BTreeMap::new(),
+            update_channel: UpdateChannel::default(),
+            update_cache: UpdateCache::default(),
         }
     }
 }
@@ -208,6 +217,7 @@ pub(crate) fn save(settings: &Settings) -> Result<(), SettingsError> {
 #[cfg(test)]
 mod tests {
     use super::{Appearance, AutosaveInterval, Settings};
+    use crate::update::UpdateChannel;
 
     #[test]
     fn defaults_are_complete_and_round_trip() {
@@ -216,6 +226,8 @@ mod tests {
         assert_eq!(settings.autosave_interval, AutosaveInterval::OneMinute);
         assert!(settings.remember_drawing_style);
         assert!(settings.drawing_style.is_none());
+        assert_eq!(settings.update_channel, UpdateChannel::Stable);
+        assert!(settings.update_cache.checked_at_epoch.is_none());
         assert_eq!(settings.light_palette.len(), 7);
         assert_eq!(settings.dark_palette.len(), 7);
 

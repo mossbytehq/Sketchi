@@ -411,16 +411,37 @@ impl ApplicationHandler for DesktopApplication {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.ui.poll_update_check() {
+            if let Some(window) = &self.settings_window {
+                window.request_redraw();
+            }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
         self.save_window_state(false);
         self.save_settings(false);
         self.maybe_autosave();
-        if let Some(duration) = self.settings_state.autosave_interval.duration() {
-            let next_autosave = self
-                .autosave_retry_at
-                .unwrap_or(self.last_autosave + duration);
-            event_loop.set_control_flow(ControlFlow::WaitUntil(next_autosave));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+        let next_autosave = self
+            .settings_state
+            .autosave_interval
+            .duration()
+            .map(|duration| {
+                self.autosave_retry_at
+                    .unwrap_or(self.last_autosave + duration)
+            });
+        let next_update_poll = self
+            .ui
+            .update_checking()
+            .then(|| Instant::now() + Duration::from_millis(100));
+        match (next_autosave, next_update_poll) {
+            (Some(autosave), Some(update)) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(autosave.min(update)));
+            }
+            (Some(next), None) | (None, Some(next)) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+            }
+            (None, None) => event_loop.set_control_flow(ControlFlow::Wait),
         }
         let _ = &self.local_server;
     }

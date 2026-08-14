@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -21,6 +24,9 @@ pub const DEFAULT_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250)
 
 /// Default maximum reconnect delay.
 pub const DEFAULT_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(8);
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Readiness payload emitted by a supervised `sketchi-server` process.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -141,6 +147,9 @@ impl LocalServer {
     /// Returns [`SupervisorError`] when the child cannot start, exits early,
     /// or emits malformed readiness data. A failed startup is terminated.
     pub fn spawn(mut command: Command) -> Result<Self, SupervisorError> {
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

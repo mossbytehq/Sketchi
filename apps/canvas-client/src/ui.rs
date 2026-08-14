@@ -41,6 +41,7 @@ use crate::{
     settings,
     theme::CONTROL_CORNER_RADIUS,
     tools::{Tool, ToolController, ToolOutput},
+    update::{self, UpdateCache, UpdateChannel},
 };
 
 const DARK_CANVAS: Color32 = Color32::from_rgb(26, 27, 30);
@@ -129,6 +130,12 @@ pub(crate) struct WorkspaceUi {
     pressure_sensitivity: f32,
     remember_drawing_style: bool,
     keybinds: Keybinds,
+    update_channel: UpdateChannel,
+    update_cache: UpdateCache,
+    update_checking: bool,
+    update_checked_in_session: bool,
+    update_error: Option<String>,
+    update_receiver: Option<Receiver<Result<UpdateCache, String>>>,
     capturing_keybind: Option<KeybindAction>,
     status: String,
     selected: BTreeSet<ElementId>,
@@ -737,6 +744,12 @@ impl Default for WorkspaceUi {
             pressure_sensitivity: 0.5,
             remember_drawing_style: true,
             keybinds: Keybinds::default(),
+            update_channel: UpdateChannel::default(),
+            update_cache: UpdateCache::default(),
+            update_checking: false,
+            update_checked_in_session: false,
+            update_error: None,
+            update_receiver: None,
             capturing_keybind: None,
             status: String::from("Select a tool to start drawing"),
             selected: BTreeSet::new(),
@@ -829,11 +842,16 @@ impl WorkspaceUi {
             remember_drawing_style: self.remember_drawing_style,
             drawing_style: self.remember_drawing_style.then_some(self.new_object_style),
             keybinds,
+            update_channel: self.update_channel,
+            update_cache: self.update_cache.clone(),
         }
     }
 
     /// Applies persisted preferences with bounds and malformed-shortcut recovery.
     pub(crate) fn apply_settings(&mut self, persisted: &settings::Settings) {
+        self.update_channel = persisted.update_channel;
+        self.update_cache = persisted.update_cache.clone();
+        self.update_error = None;
         self.appearance = match persisted.appearance {
             settings::Appearance::System => AppearanceMode::System,
             settings::Appearance::Light => AppearanceMode::Light,
@@ -908,6 +926,77 @@ impl WorkspaceUi {
         self.sync_draft_palette();
     }
 
+    /// Polls the background update check without blocking the UI thread.
+    pub(crate) fn poll_update_check(&mut self) -> bool {
+        let Some(receiver) = self.update_receiver.as_ref() else {
+            return false;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(cache)) => {
+                self.update_cache = cache;
+                self.update_error = None;
+                self.update_checking = false;
+                self.update_receiver = None;
+                true
+            }
+            Ok(Err(error)) => {
+                self.update_error = Some(error);
+                self.update_checking = false;
+                self.update_receiver = None;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.update_error = Some(String::from("The update check stopped unexpectedly"));
+                self.update_checking = false;
+                self.update_receiver = None;
+                true
+            }
+        }
+    }
+
+    /// Starts a release lookup on a worker thread.
+    pub(crate) fn start_update_check(&mut self) {
+        if self.update_checking {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.update_checking = true;
+        self.update_checked_in_session = true;
+        self.update_error = None;
+        self.update_receiver = Some(receiver);
+        let worker = std::thread::Builder::new()
+            .name(String::from("sketchi-update-check"))
+            .spawn(move || {
+                let result = update::check().map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            });
+        if let Err(error) = worker {
+            self.update_checking = false;
+            self.update_receiver = None;
+            self.update_error = Some(format!("Could not start the update check: {error}"));
+        }
+    }
+
+    /// Returns whether the update checker is currently running.
+    pub(crate) const fn update_checking(&self) -> bool {
+        self.update_checking
+    }
+
+    /// Returns the current status derived from the cached release data.
+    pub(crate) fn update_status(&self) -> update::UpdateStatus {
+        update::status(&self.update_cache, self.update_channel)
+    }
+
+    fn open_update_release(&mut self) {
+        let Some(url) = self.update_status().target_url else {
+            return;
+        };
+        if let Err(error) = update::open_release_url(&url) {
+            self.update_error = Some(error.to_string());
+        }
+    }
+
     /// Sets whether the last native-window geometry should be restored.
     pub(crate) fn set_restore_session(&mut self, restore_session: bool) {
         self.restore_session = restore_session;
@@ -975,6 +1064,9 @@ impl WorkspaceUi {
         self.pressure_sensitivity = defaults.pressure_sensitivity;
         self.remember_drawing_style = defaults.remember_drawing_style;
         self.keybinds = defaults.keybinds;
+        self.update_channel = defaults.update_channel;
+        self.update_cache = defaults.update_cache;
+        self.update_error = None;
         self.new_object_style = defaults.new_object_style;
         self.drawing_style_loaded = false;
         self.draft_style = self.new_object_style;
@@ -2832,10 +2924,21 @@ impl WorkspaceUi {
             return;
         }
 
+        if self.poll_update_check() {
+            context.request_repaint();
+        }
+
         if self.appearance == AppearanceMode::System {
             self.dark_mode = self.system_dark_mode.unwrap_or(false);
         }
         let mut selected_page = self.settings_page;
+        if selected_page == SettingsPage::About && !self.update_checked_in_session {
+            self.update_checked_in_session = true;
+            if update::is_check_due(self.update_cache.checked_at_epoch) {
+                self.start_update_check();
+                context.request_repaint();
+            }
+        }
         let pages = [
             (SettingsPage::General, "General", Icon::ListSettings),
             (SettingsPage::Keybinds, "Keybinds", Icon::Keyboard),
@@ -3283,6 +3386,193 @@ impl WorkspaceUi {
                                     )
                                     .color(muted_color(self.dark_mode)),
                                 );
+                            });
+                            ui.add_space(12.0);
+                            let update_status = self.update_status();
+                            settings_group_frame(self.dark_mode).show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("Updates")
+                                        .strong()
+                                        .color(text_color(self.dark_mode)),
+                                );
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Keep Sketchi up to date. Choose a release channel and check for new versions.",
+                                    )
+                                    .color(muted_color(self.dark_mode)),
+                                );
+                                ui.add_space(12.0);
+                                ui.separator();
+                                ui.add_space(10.0);
+                                let mut channel = self.update_channel;
+                                let previous_channel = self.update_channel;
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 12.0;
+                                    let row_width = ui.available_width();
+                                    let control_width = row_width.min(250.0);
+                                    let label_width =
+                                        (row_width - control_width - 12.0).max(160.0);
+                                    ui.allocate_ui_with_layout(
+                                        Vec2::new(label_width, STANDARD_CONTROL_SIZE.y * 2.0),
+                                        egui::Layout::top_down(egui::Align::Min),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new("Release channel")
+                                                    .color(text_color(self.dark_mode)),
+                                            );
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(
+                                                        "Stable tracks final releases; Edge includes pre-releases and release candidates.",
+                                                    )
+                                                    .small()
+                                                    .color(muted_color(self.dark_mode)),
+                                                )
+                                                .wrap(),
+                                            );
+                                        },
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if dropdown_field_sized(
+                                                ui,
+                                                "sketchi.update_channel",
+                                                channel.label(),
+                                                control_width,
+                                                |ui| {
+                                                    for option in
+                                                        [UpdateChannel::Stable, UpdateChannel::Edge]
+                                                    {
+                                                        ui.selectable_value(
+                                                            &mut channel,
+                                                            option,
+                                                            option.label(),
+                                                        );
+                                                    }
+                                                },
+                                            )
+                                            .inner
+                                            .is_some()
+                                                && channel != previous_channel
+                                            {
+                                                self.update_channel = channel;
+                                                self.update_error = None;
+                                                self.start_update_check();
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.add_space(12.0);
+                                let summary = if self.update_checking {
+                                    "Checking for updates…"
+                                } else if update_status.target.is_some() {
+                                    if update_status.channel == UpdateChannel::Edge {
+                                        "Edge update available"
+                                    } else {
+                                        "Update available"
+                                    }
+                                } else if update_status.ahead_of_stable {
+                                    "You are using a pre-release"
+                                } else if update_status.has_result {
+                                    "Up to date"
+                                } else {
+                                    "No update check yet"
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 12.0;
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(summary)
+                                                .color(text_color(self.dark_mode))
+                                                .strong(),
+                                        );
+                                        let stable = update_status
+                                            .latest_stable
+                                            .as_ref()
+                                            .map_or_else(|| "—".to_owned(), ToString::to_string);
+                                        let edge = update_status
+                                            .latest_edge
+                                            .as_ref()
+                                            .map_or_else(|| "—".to_owned(), ToString::to_string);
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Current {} · stable {stable} · edge {edge}",
+                                                update_status.current
+                                            ))
+                                            .small()
+                                            .color(muted_color(self.dark_mode)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(update::format_last_checked(
+                                                self.update_cache.checked_at_epoch,
+                                            ))
+                                            .small()
+                                            .color(muted_color(self.dark_mode)),
+                                        );
+                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Min),
+                                        |ui| {
+                                            if button(
+                                                ui,
+                                                if self.update_checking {
+                                                    "Checking…"
+                                                } else {
+                                                    "Check now"
+                                                },
+                                                Vec2::new(110.0, STANDARD_CONTROL_SIZE.y),
+                                                if self.dark_mode {
+                                                    SETTINGS_CONTROL_DARK
+                                                } else {
+                                                    Color32::from_rgb(245, 246, 249)
+                                                },
+                                            )
+                                            .clicked()
+                                            {
+                                                self.start_update_check();
+                                            }
+                                        },
+                                    );
+                                });
+                                if let Some(error) = self.update_error.as_deref() {
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("Update check failed: {error}"))
+                                            .small()
+                                            .color(Color32::from_rgb(220, 80, 80)),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                                if let Some(target) = update_status.target.as_ref() {
+                                    ui.add_space(10.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Sketchi {target} is available."
+                                            ))
+                                            .color(Color32::from_rgb(82, 170, 100)),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if button(
+                                                    ui,
+                                                    "Open release",
+                                                    Vec2::new(120.0, STANDARD_CONTROL_SIZE.y),
+                                                    Color32::from_rgb(54, 125, 75),
+                                                )
+                                                .clicked()
+                                                {
+                                                    self.open_update_release();
+                                                }
+                                            },
+                                        );
+                                    });
+                                }
                             });
                         }
                         }
@@ -4715,6 +5005,7 @@ fn sketchi_visuals(dark_mode: bool) -> egui::Visuals {
 const SETTINGS_LABEL_WIDTH: f32 = 220.0;
 const INPUT_VALUE_WIDTH: f32 = 96.0;
 const INPUT_CONTROL_GAP: f32 = 8.0;
+const SETTINGS_COLOR_LABEL_WIDTH: f32 = 145.0;
 const SETTINGS_PALETTE_LABEL_WIDTH: f32 = 72.0;
 const SETTINGS_PALETTE_GAP: f32 = 12.0;
 
@@ -4865,8 +5156,10 @@ fn settings_color_row(
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 12.0;
         ui.add_sized(
-            Vec2::new(133.0, STANDARD_CONTROL_SIZE.y),
-            egui::Label::new(egui::RichText::new(label).color(text_color(dark_mode))),
+            Vec2::new(SETTINGS_COLOR_LABEL_WIDTH, STANDARD_CONTROL_SIZE.y),
+            egui::Label::new(egui::RichText::new(label).color(text_color(dark_mode)))
+                .truncate()
+                .halign(egui::Align::LEFT),
         );
         color_swatch(ui, Some(color), false, dark_mode)
     })

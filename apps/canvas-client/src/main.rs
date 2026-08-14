@@ -1,5 +1,10 @@
 //! Sketchi desktop client entry point.
 
+// Release builds are launched by the Windows shell as a GUI application, so
+// Windows does not allocate a console window for the client's diagnostics.
+// Keep debug builds attached to a console to preserve `cargo run` logging.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use clap::Parser;
 
 #[derive(Debug, Parser)]

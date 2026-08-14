@@ -35,8 +35,8 @@ jobs:
             echo "Could not read the workspace version from Cargo.toml"
             exit 1
           }
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Release versions must have the form X.Y.Z; got $version"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release versions must have the form X.Y.Z or X.Y.Z-prerelease; got $version"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -62,6 +62,7 @@ jobs:
           path: dist/staging
           merge-multiple: true
       - uses: actions/download-artifact@v4
+        if: ${{ !contains(needs.version.outputs.version, '-') }}
         with:
           pattern: sketchi-package-*
           path: dist/artifacts
@@ -154,6 +155,7 @@ jobs:
           tag_name: v${{ needs.version.outputs.version }}
           target_commitish: ${{ needs.version.outputs.sha }}
           draft: true
+          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
           generate_release_notes: true
           files: |
             dist/artifacts/*

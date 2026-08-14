@@ -19,4 +19,5 @@ pub mod supervisor;
 mod theme;
 pub mod tools;
 mod ui;
+mod update;
 mod window_state;

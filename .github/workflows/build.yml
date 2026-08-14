@@ -41,8 +41,8 @@ jobs:
             echo "Could not read the workspace version from Cargo.toml"
             exit 1
           }
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Build versions must have the form X.Y.Z; got $version"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Build versions must have the form X.Y.Z or X.Y.Z-prerelease; got $version"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -116,6 +116,7 @@ jobs:
   arch-package:
     name: Arch package
     needs: [metadata, build]
+    if: ${{ !contains(needs.metadata.outputs.version, '-') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -176,6 +177,7 @@ jobs:
   rpm-package:
     name: RPM package
     needs: [metadata, build]
+    if: ${{ !contains(needs.metadata.outputs.version, '-') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
