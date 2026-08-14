@@ -71,6 +71,8 @@ jobs:
         run: mkdir -p dist/artifacts
       - name: Export Windows executable
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           windows_stage="$(find dist/staging -mindepth 1 -maxdepth 1 \
@@ -81,9 +83,11 @@ jobs:
             exit 1
           }
           install -m 0755 "$windows_stage/Sketchi.exe" \
-            dist/artifacts/Sketchi.exe
+            "dist/artifacts/Sketchi-${RELEASE_VERSION}-windows-x86_64.exe"
       - name: Export Linux executable
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
           linux_stage="$(find dist/staging -mindepth 1 -maxdepth 1 \
@@ -93,10 +97,11 @@ jobs:
             echo "Linux client staging directory was not downloaded"
             exit 1
           }
-          install -m 0755 "$linux_stage/Sketchi" dist/artifacts/Sketchi
+          install -m 0755 "$linux_stage/Sketchi" \
+            "dist/artifacts/Sketchi-${RELEASE_VERSION}-linux-x86_64"
       - name: Generate checksums
-        run: cargo xtask checksums --input-dir dist/artifacts --output dist/SHA256SUMS
-      - name: Remove obsolete Windows archives
+        run: cargo run --locked --package xtask -- checksums --input-dir dist/artifacts --output dist/SHA256SUMS
+      - name: Remove stale release assets
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: v${{ needs.version.outputs.version }}
@@ -104,13 +109,16 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            expected_assets="$(mktemp)"
+            find dist/artifacts -mindepth 1 -maxdepth 1 -type f -printf '%f\n' \
+              | sort > "$expected_assets"
+            printf '%s\n' SHA256SUMS >> "$expected_assets"
             while IFS= read -r asset; do
-              case "$asset" in
-                *x86_64-pc-windows-msvc.zip)
-                  gh release delete-asset "$RELEASE_TAG" "$asset" --yes
-                  ;;
-              esac
+              if ! grep -Fqx "$asset" "$expected_assets"; then
+                gh release delete-asset "$RELEASE_TAG" "$asset" --yes
+              fi
             done < <(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+            rm -f "$expected_assets"
           fi
       - uses: actions/upload-artifact@v4
         with:

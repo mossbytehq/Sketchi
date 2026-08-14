@@ -88,10 +88,10 @@ jobs:
           cargo build --locked --release --target ${{ matrix.target }} --bin sketchi
       - name: Stage client package
         shell: bash
-        run: cargo xtask package --target "${{ matrix.target }}" --format portable --target-dir target --out-dir dist/staging
+        run: cargo run --locked --package xtask -- package --target "${{ matrix.target }}" --format portable --target-dir target --out-dir dist/staging
       - name: Stage server package
         shell: bash
-        run: cargo xtask package-server --target "${{ matrix.target }}" --target-dir target --out-dir dist/staging
+        run: cargo run --locked --package xtask -- package-server --target "${{ matrix.target }}" --target-dir target --out-dir dist/staging
       - name: Verify staged contents
         shell: bash
         run: |
@@ -105,8 +105,8 @@ jobs:
             echo "metadata version ${{ needs.metadata.outputs.version }} does not match staged workspace version $staged_version"
             exit 1
           fi
-          cargo xtask artifact-check --path "$client_stage" --target "${{ matrix.target }}" --kind client
-          cargo xtask artifact-check --path "$server_stage" --target "${{ matrix.target }}" --kind server
+          cargo run --locked --package xtask -- artifact-check --path "$client_stage" --target "${{ matrix.target }}" --kind client
+          cargo run --locked --package xtask -- artifact-check --path "$server_stage" --target "${{ matrix.target }}" --kind server
       - uses: actions/upload-artifact@v4
         with:
           name: sketchi-staging-${{ matrix.target }}
@@ -156,12 +156,15 @@ jobs:
                 export BUILDDIR=/workspace/dist/arch-build
                 makepkg --cleanbuild --force --nodeps --skipinteg \
                   -D packaging/arch -p PKGBUILD
-                package=\$(find /workspace/dist/artifacts -maxdepth 1 -type f -name \"*.pkg.tar.*\" -print -quit)
+                package=\$(find /workspace/dist/artifacts -maxdepth 1 -type f \
+                  -name \"sketchi-${SKETCHI_VERSION}-*.pkg.tar.*\" \
+                  ! -name \"*-debug-*\" -print -quit)
                 test -n \"\$package\"
                 pacman -Qp \"\$package\"
                 tar --zstd -tf \"\$package\" | grep -Fx usr/bin/sketchi
                 tar --zstd -tf \"\$package\" | grep -Fx usr/bin/sketchi-server
                 tar --zstd -tf \"\$package\" | grep -Fx usr/share/applications/sketchi.desktop
+                rm -f /workspace/dist/artifacts/*-debug-*.pkg.tar.*
               "
             '
       - uses: actions/upload-artifact@v4
