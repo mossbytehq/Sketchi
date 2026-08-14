@@ -218,11 +218,11 @@ jobs:
           & $wix build "$env:GITHUB_WORKSPACE\packaging\windows\main.wxs" `
             -arch x64 `
             -ext WixToolset.UI.wixext `
-            "-dVersion=$env:SKETCHI_VERSION" `
-            "-dClientBinary=$($stage.FullName)\Sketchi.exe" `
-            "-dServerBinary=$($stage.FullName)\Sketchi-server.exe" `
-            "-dLicenseFile=$($stage.FullName)\LICENSE.md" `
-            "-dIconFile=$($stage.FullName)\Sketchi.ico" `
+            -d "Version=$env:SKETCHI_VERSION" `
+            -d "ClientBinary=$($stage.FullName)\Sketchi.exe" `
+            -d "ServerBinary=$($stage.FullName)\Sketchi-server.exe" `
+            -d "LicenseFile=$($stage.FullName)\LICENSE.md" `
+            -d "IconFile=$($stage.FullName)\Sketchi.ico" `
             "-bindvariable" `
             "WixUILicenseRtf=$env:GITHUB_WORKSPACE\packaging\windows\license.rtf" `
             -o $installer
@@ -291,10 +291,10 @@ jobs:
           & $wix build "$env:GITHUB_WORKSPACE\packaging\windows\bundle.wxs" `
             -arch x64 `
             -ext WixToolset.BootstrapperApplications.wixext `
-            "-dVersion=$env:SKETCHI_VERSION" `
-            "-dIconFile=$($stage.FullName)\Sketchi.ico" `
-            "-dLicenseRtf=$env:GITHUB_WORKSPACE\packaging\windows\license.rtf" `
-            "-dMsiFile=$msi" `
+            -d "Version=$env:SKETCHI_VERSION" `
+            -d "IconFile=$($stage.FullName)\Sketchi.ico" `
+            -d "LicenseRtf=$env:GITHUB_WORKSPACE\packaging\windows\license.rtf" `
+            -d "MsiFile=$msi" `
             -o $setup
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
