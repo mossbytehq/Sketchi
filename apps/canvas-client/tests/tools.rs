@@ -73,6 +73,21 @@ fn triangle_tool_commits_a_triangle_element() {
 }
 
 #[test]
+fn triangle_tool_keeps_a_flat_drag_renderable() {
+    let element_id = ElementId::from_u128(13);
+    let mut tools = ToolController::new(Tool::Triangle);
+    tools.pointer_down(element_id, Point::new(100.0, 100.0));
+    tools.pointer_move(Point::new(40.0, 100.0));
+    let output = tools.pointer_up(Point::new(40.0, 100.0)).unwrap();
+    let ToolOutput::Command(EditorCommand::Create(element)) = output else {
+        panic!("triangle tool did not create an element");
+    };
+
+    assert_eq!(element.transform.size.width, 60.0);
+    assert_eq!(element.transform.size.height, 4.0);
+}
+
+#[test]
 fn freehand_tool_commits_one_bounded_command_on_release() {
     let element_id = ElementId::from_u128(5);
     let mut tools = ToolController::new(Tool::Freehand);

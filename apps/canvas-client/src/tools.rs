@@ -315,7 +315,19 @@ impl ToolController {
 
 fn shape_from_drag(id: ElementId, kind: ElementKind, start: Point, end: Point) -> Element {
     let position = Point::new(start.x.min(end.x), start.y.min(end.y));
-    let size = Size::new((start.x - end.x).abs(), (start.y - end.y).abs());
+    let width = (start.x - end.x).abs();
+    let height = (start.y - end.y).abs();
+    let size = if matches!(
+        kind,
+        ElementKind::Rectangle
+            | ElementKind::Diamond
+            | ElementKind::Triangle
+            | ElementKind::Ellipse
+    ) {
+        Size::new(width.max(MIN_SHAPE_SIZE), height.max(MIN_SHAPE_SIZE))
+    } else {
+        Size::new(width, height)
+    };
     let transform = Transform::new(position, size);
     match kind {
         ElementKind::Diamond => Element::diamond(id, transform),
@@ -323,6 +335,8 @@ fn shape_from_drag(id: ElementId, kind: ElementKind, start: Point, end: Point) -
         _ => Element::new(id, kind, transform),
     }
 }
+
+const MIN_SHAPE_SIZE: f32 = 4.0;
 
 fn line_from_drag(id: ElementId, kind: ElementKind, start: Point, end: Point) -> Element {
     Element::with_points(

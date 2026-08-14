@@ -213,6 +213,34 @@ fn renderer_extracts_and_hits_a_triangle() {
 }
 
 #[test]
+fn flat_triangle_hit_testing_stays_on_the_degenerate_edges() {
+    let element_id = ElementId::from_u128(23);
+    let mut document = CrdtDocument::new();
+    document
+        .apply(&Operation::new(
+            OperationId::new(canvas_core::ClientId::from_u128(1), 1),
+            LamportTimestamp::new(1),
+            VersionVector::default(),
+            OperationKind::Create {
+                element: Element::triangle(
+                    element_id,
+                    Transform::new(Point::new(10.0, 20.0), Size::new(100.0, 0.0)),
+                ),
+            },
+        ))
+        .unwrap();
+
+    assert_eq!(
+        hit_test(&document.document(), Point::new(60.0, 20.0), 0.0),
+        Some(element_id)
+    );
+    assert_eq!(
+        hit_test(&document.document(), Point::new(60.0, 80.0), 0.0),
+        None
+    );
+}
+
+#[test]
 fn rotated_diamond_hit_testing_uses_the_element_rotation() {
     let element_id = ElementId::from_u128(20);
     let mut element = Element::diamond(

@@ -13,6 +13,7 @@ use std::{
 
 use crate::images::{ImageImportError, embedded_image_with_rgba};
 use canvas_core::MAX_IMAGE_BYTES;
+use egui::Context;
 
 /// Result of decoding one hovered image.
 pub(crate) struct DropPreviewDecode {
@@ -53,6 +54,7 @@ struct PreviewJob {
 
 struct PreviewWorkerInner {
     pending: Mutex<Option<PreviewJob>>,
+    repaint_context: Mutex<Option<Context>>,
     wake: Condvar,
     stopping: AtomicBool,
 }
@@ -67,6 +69,7 @@ impl PreviewWorker {
     pub(crate) fn new() -> Self {
         let inner = Arc::new(PreviewWorkerInner {
             pending: Mutex::new(None),
+            repaint_context: Mutex::new(None),
             wake: Condvar::new(),
             stopping: AtomicBool::new(false),
         });
@@ -76,6 +79,15 @@ impl PreviewWorker {
             .spawn(move || run_worker(&worker_inner))
             .ok();
         Self { inner, thread }
+    }
+
+    /// Registers the UI context used to wake the next frame after decoding.
+    pub(crate) fn set_repaint_context(&self, context: &Context) {
+        let mut repaint_context = match self.inner.repaint_context.lock() {
+            Ok(repaint_context) => repaint_context,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *repaint_context = Some(context.clone());
     }
 
     pub(crate) fn queue(
@@ -162,6 +174,13 @@ fn run_worker(inner: &PreviewWorkerInner) {
                 path: job.path,
                 result,
             });
+            let repaint_context = match inner.repaint_context.lock() {
+                Ok(repaint_context) => repaint_context.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            if let Some(context) = repaint_context {
+                context.request_repaint();
+            }
         }
     }
 }

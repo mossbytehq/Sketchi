@@ -10,7 +10,7 @@ use egui::{
 
 use crate::remix_icons::{self, RemixIcon};
 #[allow(unused_imports)]
-use crate::theme::ThemeTokens;
+use crate::theme::{CONTROL_CORNER_RADIUS, ThemeTokens};
 
 pub(crate) const STANDARD_CONTROL_SIZE: Vec2 = Vec2::new(190.0, 30.0);
 pub(crate) const BUTTON_PADDING: Vec2 = Vec2::new(10.0, 5.0);
@@ -18,7 +18,6 @@ const DROPDOWN_POPUP_HORIZONTAL_PADDING: i8 = 6;
 const DROPDOWN_POPUP_VERTICAL_PADDING: i8 = 10;
 const DROPDOWN_POPUP_ITEM_SPACING: f32 = 4.0;
 const DROPDOWN_OPTION_PADDING: Vec2 = Vec2::new(6.0, 3.0);
-const DROPDOWN_POPUP_RADIUS: u8 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DropdownPopupStyle {
@@ -49,10 +48,11 @@ fn dropdown_popup_style_modifier() -> egui::style::StyleModifier {
         style.spacing.menu_margin = popup.menu_margin;
         style.spacing.item_spacing.y = popup.item_spacing_y;
         style.spacing.button_padding = popup.button_padding;
-        style.visuals.menu_corner_radius = CornerRadius::same(DROPDOWN_POPUP_RADIUS);
-        style.visuals.widgets.hovered.corner_radius = CornerRadius::same(DROPDOWN_POPUP_RADIUS);
-        style.visuals.widgets.active.corner_radius = CornerRadius::same(DROPDOWN_POPUP_RADIUS);
-        style.visuals.widgets.open.corner_radius = CornerRadius::same(DROPDOWN_POPUP_RADIUS);
+        style.visuals.menu_corner_radius = CornerRadius::same(CONTROL_CORNER_RADIUS);
+        style.visuals.widgets.inactive.corner_radius = CornerRadius::same(CONTROL_CORNER_RADIUS);
+        style.visuals.widgets.hovered.corner_radius = CornerRadius::same(CONTROL_CORNER_RADIUS);
+        style.visuals.widgets.active.corner_radius = CornerRadius::same(CONTROL_CORNER_RADIUS);
+        style.visuals.widgets.open.corner_radius = CornerRadius::same(CONTROL_CORNER_RADIUS);
         style.visuals.widgets.hovered.bg_fill = highlight_fill;
         style.visuals.widgets.hovered.weak_bg_fill = highlight_fill;
         style.visuals.widgets.active.bg_fill = highlight_fill;
@@ -1019,7 +1019,12 @@ pub(crate) fn button(
 ) -> Response {
     ui.scope(|ui| {
         ui.spacing_mut().button_padding = BUTTON_PADDING;
-        ui.add_sized(size, egui::Button::new(label).fill(fill))
+        ui.add_sized(
+            size,
+            egui::Button::new(label)
+                .fill(fill)
+                .corner_radius(CornerRadius::same(CONTROL_CORNER_RADIUS)),
+        )
     })
     .inner
 }
@@ -1558,7 +1563,7 @@ mod tests {
         let item_spacing = popup.item_spacing_y;
         assert!(padding >= 8.0);
         assert!(item_spacing >= 4.0);
-        assert_eq!(DROPDOWN_POPUP_RADIUS, 8);
+        assert_eq!(CONTROL_CORNER_RADIUS, 5);
     }
 
     #[test]

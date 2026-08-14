@@ -43,6 +43,8 @@ const RADIUS: RadiusScale = RadiusScale {
     xl: 10,
 };
 
+pub(crate) const CONTROL_CORNER_RADIUS: u8 = RADIUS.md;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RadiusScale {
     pub(crate) sm: u8,

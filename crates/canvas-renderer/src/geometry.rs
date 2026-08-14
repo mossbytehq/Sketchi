@@ -367,6 +367,11 @@ fn triangle_points(rect: Rect) -> [Point; 3] {
 
 fn point_in_triangle_or_near(point: Point, points: [Point; 3], tolerance: f32) -> bool {
     let [a, b, c] = points;
+    if cross(a, b, c).abs() <= f32::EPSILON {
+        return distance_to_segment(point, a, b) <= tolerance
+            || distance_to_segment(point, b, c) <= tolerance
+            || distance_to_segment(point, c, a) <= tolerance;
+    }
     let first = cross(b, a, point);
     let second = cross(c, b, point);
     let third = cross(a, c, point);

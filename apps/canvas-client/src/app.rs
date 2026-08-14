@@ -226,6 +226,10 @@ impl ApplicationHandler for DesktopApplication {
             match event_loop.create_window(attributes) {
                 Ok(window) => {
                     let window = Arc::new(window);
+                    let repaint_window = Arc::clone(&window);
+                    self.egui.set_request_repaint_callback(move |_info| {
+                        repaint_window.request_redraw();
+                    });
                     let size = window.inner_size();
                     self.ui
                         .set_system_dark_mode(window.theme() == Some(Theme::Dark));
@@ -305,7 +309,7 @@ impl ApplicationHandler for DesktopApplication {
             && let Some(egui_state) = &mut self.egui_state
         {
             let response = egui_state.on_window_event(window.as_ref(), &event);
-            if response.repaint || paste_requested || drop_event {
+            if should_request_redraw(&event, response.repaint, paste_requested, drop_event) {
                 window.request_redraw();
             }
         }
@@ -826,13 +830,47 @@ fn is_clipboard_paste(event: &KeyEvent, modifiers: ModifiersState) -> bool {
     is_v && (modifiers.control_key() || modifiers.super_key())
 }
 
+fn should_request_redraw(
+    event: &WindowEvent,
+    egui_repaint: bool,
+    paste_requested: bool,
+    drop_event: bool,
+) -> bool {
+    (egui_repaint && !matches!(event, WindowEvent::RedrawRequested))
+        || paste_requested
+        || drop_event
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{WindowButtons, remix_icons, settings_window_buttons};
+    use super::{WindowButtons, remix_icons, settings_window_buttons, should_request_redraw};
+    use winit::event::WindowEvent;
 
     #[test]
     fn settings_window_keeps_only_the_native_close_button() {
         assert_eq!(settings_window_buttons(), WindowButtons::CLOSE);
+    }
+
+    #[test]
+    fn redraw_requested_does_not_schedule_another_redraw() {
+        assert!(!should_request_redraw(
+            &WindowEvent::RedrawRequested,
+            true,
+            false,
+            false,
+        ));
+        assert!(should_request_redraw(
+            &WindowEvent::RedrawRequested,
+            false,
+            true,
+            false,
+        ));
+        assert!(should_request_redraw(
+            &WindowEvent::RedrawRequested,
+            false,
+            false,
+            true,
+        ));
     }
 
     #[test]

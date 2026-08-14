@@ -2,9 +2,8 @@ use std::fmt::Write as _;
 use std::{
     collections::{BTreeSet, HashMap},
     env, fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{Receiver, TryRecvError},
-    time::Duration,
 };
 
 use canvas_core::{
@@ -40,6 +39,7 @@ use crate::{
         selection_handle_position, translated_element,
     },
     settings,
+    theme::CONTROL_CORNER_RADIUS,
     tools::{Tool, ToolController, ToolOutput},
 };
 
@@ -58,7 +58,7 @@ const SELECTION_STROKE_WIDTH: f32 = 2.0;
 const SETTINGS_NAV_WIDTH: f32 = 152.0;
 const SETTINGS_NAV_ITEM_WIDTH: f32 = 136.0;
 const SETTINGS_NAV_ITEM_HEIGHT: f32 = 40.0;
-const SETTINGS_CONTROL_RADIUS: u8 = 8;
+const SETTINGS_CONTROL_RADIUS: u8 = CONTROL_CORNER_RADIUS;
 const SETTINGS_ROOT_RADIUS: u8 = 10;
 const SETTINGS_DIVIDER_INSET: f32 = 12.0;
 const SETTINGS_ROOT_DARK: Color32 = Color32::from_rgb(31, 32, 37);
@@ -147,7 +147,7 @@ pub(crate) struct WorkspaceUi {
     egui_hovered_path: Option<PathBuf>,
     egui_hovered_file_count: usize,
     egui_dropped_file_count: usize,
-    pending_dropped_files: Vec<PathBuf>,
+    pending_dropped_files: Vec<PendingDroppedFile>,
     drop_preview: Option<DropPreview>,
     drop_preview_decode: Option<Receiver<DropPreviewDecode>>,
     drop_preview_cancel: Option<PreviewCancellation>,
@@ -199,8 +199,19 @@ struct TextEditState {
 
 struct DropPreview {
     path: PathBuf,
-    image: Option<EmbeddedImage>,
+    prepared: Option<PreparedImage>,
     texture: Option<egui::TextureHandle>,
+}
+
+struct PreparedImage {
+    image: EmbeddedImage,
+    rgba: Vec<u8>,
+}
+
+struct PendingDroppedFile {
+    path: PathBuf,
+    prepared: Option<PreparedImage>,
+    position: Option<Pos2>,
 }
 
 #[derive(Clone, Debug)]
@@ -999,9 +1010,9 @@ impl WorkspaceUi {
         }
     }
 
-    /// Stores the latest native drag position in egui points. Wayland sends
-    /// external-drag motion separately from regular pointer motion, so this
-    /// position is kept independently of egui's pointer state.
+    /// Stores the latest native drag position in egui points when the window
+    /// backend provides it. The preview also falls back to egui's pointer
+    /// position for external drags that do not emit native motion updates.
     pub(crate) fn set_drop_position(&mut self, position: Pos2) -> bool {
         self.drop_screen_position = Some(position);
         self.drop_hovered.is_some()
@@ -1022,7 +1033,7 @@ impl WorkspaceUi {
             self.drop_preview_cancel = Some(cancel);
             self.drop_preview = Some(DropPreview {
                 path,
-                image: None,
+                prepared: None,
                 texture: None,
             });
         }
@@ -1030,7 +1041,16 @@ impl WorkspaceUi {
 
     /// Queues a native file drop for import on the next canvas frame.
     pub(crate) fn queue_dropped_file(&mut self, path: PathBuf) {
-        self.pending_dropped_files.push(path);
+        let position = self.drop_screen_position;
+        let prepared = self
+            .drop_preview
+            .take()
+            .and_then(|preview| (preview.path == path).then_some(preview.prepared).flatten());
+        self.pending_dropped_files.push(PendingDroppedFile {
+            path,
+            prepared,
+            position,
+        });
         self.egui_hovered_path = None;
         self.drop_hovered = None;
         self.drop_preview = None;
@@ -1055,6 +1075,7 @@ impl WorkspaceUi {
         tools: &mut ToolController,
         camera: &mut Camera,
     ) {
+        self.preview_worker.set_repaint_context(context);
         tools.set_input_settings(self.stabilization, self.pressure_sensitivity);
         if self.appearance == AppearanceMode::System {
             self.dark_mode = self.system_dark_mode.unwrap_or(false);
@@ -1254,7 +1275,7 @@ impl WorkspaceUi {
                     egui::TextureOptions::LINEAR,
                 );
                 if let Some(preview) = self.drop_preview.as_mut() {
-                    preview.image = Some(image);
+                    preview.prepared = Some(PreparedImage { image, rgba });
                     preview.texture = Some(texture);
                 }
                 tracing::info!(
@@ -1264,9 +1285,7 @@ impl WorkspaceUi {
                     "hovered image preview texture ready"
                 );
             }
-            Err(TryRecvError::Empty) => {
-                context.request_repaint_after(Duration::from_millis(16));
-            }
+            Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.drop_preview_decode = None;
                 self.drop_preview_cancel = None;
@@ -1384,23 +1403,17 @@ impl WorkspaceUi {
         let Some(preview) = self.drop_preview.as_ref() else {
             return;
         };
-        let Some(image) = preview.image.as_ref() else {
+        let Some(prepared) = preview.prepared.as_ref() else {
             return;
         };
         let Some(texture) = preview.texture.as_ref() else {
             return;
         };
-        let screen_position = self
-            .drop_screen_position
-            .filter(|position| canvas.contains(*position))
-            .or_else(|| {
-                context
-                    .input(|input| input.pointer.latest_pos())
-                    .filter(|position| canvas.contains(*position))
-            })
-            .unwrap_or_else(|| canvas.center());
+        let pointer_position = context.input(|input| input.pointer.latest_pos());
+        let screen_position =
+            resolve_drop_screen_position(self.drop_screen_position, pointer_position, canvas);
         let world_position = screen_to_world(camera, screen_position);
-        let size = image_display_size(image.width, image.height);
+        let size = image_display_size(prepared.image.width, prepared.image.height);
         let min = camera.world_to_screen(world_position);
         let rect = Rect::from_min_size(
             Pos2::new(min.x, min.y),
@@ -1420,6 +1433,42 @@ impl WorkspaceUi {
         );
     }
 
+    fn decode_dropped_image(
+        path: &Path,
+        name: &str,
+        prepared: Option<PreparedImage>,
+    ) -> Result<(EmbeddedImage, Vec<u8>), String> {
+        if let Some(prepared) = prepared {
+            tracing::info!(
+                path = %path.display(),
+                "reusing prepared hovered image for drop"
+            );
+            return Ok((prepared.image, prepared.rgba));
+        }
+
+        let bytes = fs::read(path).map_err(|error| {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "dropped image read failed"
+            );
+            format!("Could not read {name}: {error}")
+        })?;
+        tracing::info!(
+            path = %path.display(),
+            bytes = bytes.len(),
+            "dropped image bytes read"
+        );
+        embedded_image_with_rgba(bytes).map_err(|error| {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "dropped image decode failed"
+            );
+            format!("Could not import {name}: {error}")
+        })
+    }
+
     fn handle_dropped_images(
         &mut self,
         context: &egui::Context,
@@ -1432,45 +1481,26 @@ impl WorkspaceUi {
             return;
         }
         tracing::info!(count = dropped_files.len(), "processing queued image drops");
-        let screen_position = context
-            .input(|input| input.pointer.latest_pos())
-            .filter(|position| canvas.contains(*position))
-            .unwrap_or_else(|| canvas.center());
+        let pointer_position = context.input(|input| input.pointer.latest_pos());
+        let screen_position = resolve_drop_screen_position(
+            dropped_files.first().and_then(|dropped| dropped.position),
+            pointer_position,
+            canvas,
+        );
         let world_position = screen_to_world(*camera, screen_position);
         let mut imported = 0_usize;
         let mut last_error = None;
 
-        for (index, path) in dropped_files.iter().enumerate() {
+        for (index, dropped) in dropped_files.into_iter().enumerate() {
+            let PendingDroppedFile { path, prepared, .. } = dropped;
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("dropped file");
-            let bytes = match fs::read(path) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %error,
-                        "dropped image read failed"
-                    );
-                    last_error = Some(format!("Could not read {name}: {error}"));
-                    continue;
-                }
-            };
-            tracing::info!(
-                path = %path.display(),
-                bytes = bytes.len(),
-                "dropped image bytes read"
-            );
-            let (image, rgba) = match embedded_image_with_rgba(bytes) {
+            let (image, rgba) = match Self::decode_dropped_image(&path, name, prepared) {
                 Ok(decoded) => decoded,
                 Err(error) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %error,
-                        "dropped image decode failed"
-                    );
-                    last_error = Some(format!("Could not import {name}: {error}"));
+                    last_error = Some(error);
                     continue;
                 }
             };
@@ -1891,10 +1921,18 @@ impl WorkspaceUi {
             rotation: 0.0,
             text: String::new(),
             cursor: 0,
-            style: self.new_object_style,
+            style: self.text_creation_style(),
             just_started: true,
         });
         self.status = String::from("Type text, then click outside to place it");
+    }
+
+    fn text_creation_style(&self) -> Style {
+        let mut style = self.new_object_style;
+        if style.stroke.alpha == 0 {
+            style.stroke = to_core_color(self.active_palette()[0]);
+        }
+        style
     }
 
     fn begin_text_edit(&mut self, element: Option<&Element>) {
@@ -2901,7 +2939,7 @@ impl WorkspaceUi {
                                     &mut self.restore_session,
                                     "Restore previous session on start",
                                 );
-                                ui.add_space(8.0);
+                                ui.add_space(12.0);
                                 settings_stacked_field(
                                     ui,
                                     "Time interval for automatic saving",
@@ -5741,15 +5779,8 @@ fn paint_element(
                     rect.center(),
                     element.transform.rotation,
                 );
-                let points = sloppy_polyline(
-                    &base_points,
-                    element.style.sloppiness,
-                    element.id.as_uuid().as_u128(),
-                    stroke.width,
-                    true,
-                );
                 painter.add(egui::Shape::convex_polygon(
-                    points.clone(),
+                    base_points.clone(),
                     fill,
                     Stroke::NONE,
                 ));
@@ -5764,14 +5795,11 @@ fn paint_element(
                 );
             } else if element.style.sloppiness != Sloppiness::Architect {
                 let base_points = rounded_rect_points(rect, corner_radius);
-                let points = sloppy_polyline(
-                    &base_points,
-                    element.style.sloppiness,
-                    element.id.as_uuid().as_u128(),
-                    stroke.width,
-                    true,
-                );
-                painter.add(egui::Shape::convex_polygon(points, fill, Stroke::NONE));
+                painter.add(egui::Shape::convex_polygon(
+                    base_points.clone(),
+                    fill,
+                    Stroke::NONE,
+                ));
                 paint_sloppiness_outline(
                     painter,
                     &base_points,
@@ -5804,15 +5832,8 @@ fn paint_element(
         }
         ElementKind::Diamond => {
             let base_points = diamond_points(rect, element.transform.rotation);
-            let points = sloppy_polyline(
-                &base_points,
-                element.style.sloppiness,
-                element.id.as_uuid().as_u128(),
-                stroke.width,
-                true,
-            );
             painter.add(egui::Shape::convex_polygon(
-                points.clone(),
+                base_points.clone(),
                 fill,
                 Stroke::NONE,
             ));
@@ -5828,15 +5849,8 @@ fn paint_element(
         }
         ElementKind::Triangle => {
             let base_points = triangle_points(rect, element.transform.rotation);
-            let points = sloppy_polyline(
-                &base_points,
-                element.style.sloppiness,
-                element.id.as_uuid().as_u128(),
-                stroke.width,
-                true,
-            );
             painter.add(egui::Shape::convex_polygon(
-                points.clone(),
+                base_points.clone(),
                 fill,
                 Stroke::NONE,
             ));
@@ -5857,15 +5871,8 @@ fn paint_element(
                     rect.center(),
                     element.transform.rotation,
                 );
-                let points = sloppy_polyline(
-                    &base_points,
-                    element.style.sloppiness,
-                    element.id.as_uuid().as_u128(),
-                    stroke.width,
-                    true,
-                );
                 painter.add(egui::Shape::convex_polygon(
-                    points.clone(),
+                    base_points.clone(),
                     fill,
                     Stroke::NONE,
                 ));
@@ -5880,14 +5887,11 @@ fn paint_element(
                 );
             } else if element.style.sloppiness != Sloppiness::Architect {
                 let base_points = ellipse_points(rect);
-                let points = sloppy_polyline(
-                    &base_points,
-                    element.style.sloppiness,
-                    element.id.as_uuid().as_u128(),
-                    stroke.width,
-                    true,
-                );
-                painter.add(egui::Shape::convex_polygon(points, fill, Stroke::NONE));
+                painter.add(egui::Shape::convex_polygon(
+                    base_points.clone(),
+                    fill,
+                    Stroke::NONE,
+                ));
                 paint_sloppiness_outline(
                     painter,
                     &base_points,
@@ -6246,6 +6250,10 @@ fn paint_sloppiness_outline(
     seed: u128,
     close: bool,
 ) {
+    if close && closed_path_is_degenerate(points, stroke.width) {
+        paint_styled_polyline(painter, points, stroke, stroke_style, close);
+        return;
+    }
     let primary = sloppy_polyline(points, sloppiness, seed, stroke.width, close);
     paint_styled_polyline(painter, &primary, stroke, stroke_style, close);
     if sloppiness != Sloppiness::Architect {
@@ -6294,7 +6302,10 @@ fn sloppy_polyline_scaled(
     close: bool,
     deformation_scale: f32,
 ) -> Vec<Pos2> {
-    if sloppiness == Sloppiness::Architect || points.len() < 2 {
+    if sloppiness == Sloppiness::Architect
+        || points.len() < 2
+        || (close && closed_path_is_degenerate(points, stroke_width))
+    {
         return points.to_vec();
     }
     if close && points.len() > 16 {
@@ -6507,6 +6518,27 @@ fn triangle_points(rect: Rect, rotation: f32) -> Vec<Pos2> {
         rect.left_bottom(),
     ];
     rotated_screen_points(points, center, rotation)
+}
+
+fn closed_path_is_degenerate(points: &[Pos2], stroke_width: f32) -> bool {
+    if points.len() < 3
+        || points
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+    {
+        return true;
+    }
+    let mut twice_area = 0.0_f32;
+    let mut perimeter = 0.0_f32;
+    for (current, next) in points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+    {
+        twice_area += current.x * next.y - next.x * current.y;
+        perimeter += current.distance(*next);
+    }
+    twice_area.abs() <= stroke_width.max(1.0) * perimeter * 2.0
 }
 
 fn rotated_screen_points(points: Vec<Pos2>, center: Pos2, angle: f32) -> Vec<Pos2> {
@@ -7000,6 +7032,17 @@ fn image_display_size(width: u32, height: u32) -> Size {
     Size::new(width * scale, height * scale)
 }
 
+fn resolve_drop_screen_position(
+    native_position: Option<Pos2>,
+    pointer_position: Option<Pos2>,
+    canvas: Rect,
+) -> Pos2 {
+    native_position
+        .filter(|position| canvas.contains(*position))
+        .or_else(|| pointer_position.filter(|position| canvas.contains(*position)))
+        .unwrap_or_else(|| canvas.center())
+}
+
 fn zoom_percent(zoom: f32) -> String {
     let zoom = if zoom.is_finite() {
         zoom.clamp(0.05, 64.0)
@@ -7016,27 +7059,28 @@ fn zoom_delta_for_scroll(scroll_y: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use canvas_core::{
-        ClientId, Color, EditorCommand, Element, ElementId, ElementKind, Point, Size, Style,
-        StylePatch, Transform,
+        ClientId, Color, EditorCommand, Element, ElementId, ElementKind, EmbeddedImage, Point,
+        Size, Style, StylePatch, Transform,
     };
     use egui::{Color32, CornerRadius, Key, Margin, Modifiers, Pos2, Rect, Stroke, Vec2};
 
     use crate::editor::Editor;
 
     use super::{
-        ColorPickerTarget, CustomFontSizeState, DARK_BORDER, ElementAction, KeyBinding,
-        KeybindAction, Keybinds, LIGHT_BORDER, LIGHT_CANVAS, LIGHT_MUTED, LayerAction,
-        SETTINGS_CARD_BORDER_DARK, SETTINGS_CARD_DARK, SETTINGS_CONTROL_DARK,
-        SETTINGS_CONTROL_RADIUS, SETTINGS_ROOT_DARK, SETTINGS_ROOT_RADIUS, WorkspaceUi,
-        apply_text_resize_font_size, char_cursor_to_byte_index, color_picker_patch,
+        CONTROL_CORNER_RADIUS, ColorPickerTarget, CustomFontSizeState, DARK_BORDER, ElementAction,
+        KeyBinding, KeybindAction, Keybinds, LIGHT_BORDER, LIGHT_CANVAS, LIGHT_MUTED, LayerAction,
+        PreparedImage, SETTINGS_CARD_BORDER_DARK, SETTINGS_CARD_DARK, SETTINGS_CONTROL_DARK,
+        SETTINGS_CONTROL_RADIUS, SETTINGS_ROOT_DARK, SETTINGS_ROOT_RADIUS, STROKE_COLORS,
+        WorkspaceUi, apply_text_resize_font_size, char_cursor_to_byte_index, color_picker_patch,
         confirmation_frame, custom_font_size_selected, delete_previous_word, fill_choice_patch,
         grid_step_for_zoom, insert_text_at_cursor, key_binding_label, next_char_cursor,
         next_word_cursor, next_z_index, padded_selection_bounds, platform_label,
         preset_font_size_selected, previous_char_cursor, previous_word_cursor, reordered_layer_ids,
-        rotated_text_origin, selection_drag_position, selection_handle_cursor_tolerance,
-        selection_handle_drag_tolerance, settings_group_frame, settings_keybind_card_frame,
-        settings_visuals, settings_window_frame, sloppiness_amplitude, sloppy_polyline,
-        text_create_command, text_update_command, zoom_delta_for_scroll, zoom_percent,
+        resolve_drop_screen_position, rotated_text_origin, selection_drag_position,
+        selection_handle_cursor_tolerance, selection_handle_drag_tolerance, settings_group_frame,
+        settings_keybind_card_frame, settings_visuals, settings_window_frame, sloppiness_amplitude,
+        sloppy_polyline, text_create_command, text_update_command, to_core_color,
+        zoom_delta_for_scroll, zoom_percent,
     };
 
     use crate::selection::SelectionHandle;
@@ -7048,6 +7092,30 @@ mod tests {
 
         assert!((rotated.x - 70.0).abs() < 1e-5);
         assert!((rotated.y + 20.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn drop_position_prefers_native_coordinates_and_falls_back_to_pointer() {
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0));
+        let native = Pos2::new(100.0, 80.0);
+        let pointer = Pos2::new(250.0, 180.0);
+
+        assert_eq!(
+            resolve_drop_screen_position(Some(native), Some(pointer), canvas),
+            native
+        );
+        assert_eq!(
+            resolve_drop_screen_position(None, Some(pointer), canvas),
+            pointer
+        );
+        assert_eq!(
+            resolve_drop_screen_position(Some(Pos2::new(500.0, 500.0)), Some(pointer), canvas),
+            pointer
+        );
+        assert_eq!(
+            resolve_drop_screen_position(None, None, canvas),
+            canvas.center()
+        );
     }
 
     #[test]
@@ -7229,7 +7297,7 @@ mod tests {
     fn settings_navigation_highlight_keeps_its_rounding() {
         assert_eq!(
             CornerRadius::same(SETTINGS_CONTROL_RADIUS),
-            CornerRadius::same(8)
+            CornerRadius::same(CONTROL_CORNER_RADIUS)
         );
     }
 
@@ -7753,6 +7821,23 @@ mod tests {
     }
 
     #[test]
+    fn new_text_uses_a_visible_theme_stroke_when_remembered_stroke_is_transparent() {
+        let mut workspace = WorkspaceUi::default();
+        workspace.new_object_style.stroke = Color::rgba(0, 0, 0, 0);
+
+        assert_eq!(
+            workspace.text_creation_style().stroke,
+            to_core_color(STROKE_COLORS[0])
+        );
+
+        workspace.dark_mode = true;
+        assert_eq!(
+            workspace.text_creation_style().stroke,
+            to_core_color(workspace.dark_palette[0])
+        );
+    }
+
+    #[test]
     fn text_editor_updates_existing_text_with_a_set_text_command() {
         let command = text_update_command(ElementId::from_u128(44), "Updated text");
         assert!(matches!(
@@ -7855,11 +7940,51 @@ mod tests {
 
         assert!(ui.drop_hovered.is_none());
         assert_eq!(
-            ui.pending_dropped_files,
+            ui.pending_dropped_files
+                .iter()
+                .map(|dropped| dropped.path.clone())
+                .collect::<Vec<_>>(),
             vec![
                 std::path::PathBuf::from("first.png"),
                 std::path::PathBuf::from("second.jpg")
             ]
+        );
+    }
+
+    #[test]
+    fn queued_drop_reuses_preview_and_native_position() {
+        let mut ui = WorkspaceUi::default();
+        let path = std::path::PathBuf::from("preview.png");
+        let position = Pos2::new(120.0, 80.0);
+        ui.set_drop_position(position);
+        ui.set_drop_preview(path.clone());
+        if let Some(preview) = ui.drop_preview.as_mut() {
+            preview.prepared = Some(PreparedImage {
+                image: EmbeddedImage::new("image/png", 1, 1, vec![1, 2, 3]),
+                rgba: vec![255, 255, 255, 255],
+            });
+        }
+
+        ui.queue_dropped_file(path.clone());
+
+        assert!(ui.drop_preview.is_none());
+        assert_eq!(ui.pending_dropped_files.len(), 1);
+        assert_eq!(
+            ui.pending_dropped_files
+                .first()
+                .map(|dropped| dropped.path.clone()),
+            Some(path)
+        );
+        assert_eq!(
+            ui.pending_dropped_files
+                .first()
+                .and_then(|dropped| dropped.position),
+            Some(position)
+        );
+        assert!(
+            ui.pending_dropped_files
+                .first()
+                .is_some_and(|dropped| dropped.prepared.is_some())
         );
     }
 

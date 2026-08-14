@@ -117,14 +117,19 @@ impl RemixIcon {
 }
 
 pub(crate) const FONT_FAMILY: &str = "sketchi-remix-icons";
+pub(crate) const UI_FONT_FAMILY: &str = "sketchi-ui";
 pub(crate) const HANDWRITTEN_FONT_FAMILY: &str = "sketchi-handwritten";
 
-/// Installs the bundled Remix Icon font into egui's named font families.
+/// Installs Sketchi's bundled UI, icon, and handwritten font families.
 pub(crate) fn install(context: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         FONT_FAMILY.to_owned(),
         egui::FontData::from_static(include_bytes!("../assets/remixicon.ttf")).into(),
+    );
+    fonts.font_data.insert(
+        UI_FONT_FAMILY.to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/Inter.ttf")).into(),
     );
     fonts.font_data.insert(
         HANDWRITTEN_FONT_FAMILY.to_owned(),
@@ -135,6 +140,11 @@ pub(crate) fn install(context: &egui::Context) {
         .entry(egui::FontFamily::Name(FONT_FAMILY.into()))
         .or_default()
         .insert(0, FONT_FAMILY.to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, UI_FONT_FAMILY.to_owned());
     fonts
         .families
         .entry(egui::FontFamily::Name(HANDWRITTEN_FONT_FAMILY.into()))
