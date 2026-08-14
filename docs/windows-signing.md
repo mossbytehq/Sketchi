@@ -11,6 +11,11 @@ Configure these GitHub Actions secrets before creating a release:
   containing the private key and certificate chain.
 - `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`: the password for the `.pfx` file.
 
+If the release requests signing but either secret is missing, the Windows build
+continues unsigned and emits a warning. Public releases should only be
+published after these secrets are configured; otherwise SmartScreen may still
+show an unknown-publisher warning.
+
 For example, create the base64 value locally with PowerShell:
 
 ```powershell

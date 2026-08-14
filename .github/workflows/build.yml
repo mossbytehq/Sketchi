@@ -111,8 +111,27 @@ jobs:
           fi
           cargo run --locked --package xtask -- artifact-check --path "$client_stage" --target "${{ matrix.target }}" --kind client
           cargo run --locked --package xtask -- artifact-check --path "$server_stage" --target "${{ matrix.target }}" --kind server
+      - name: Configure Windows signing
+        id: configure_windows_signing
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+          SIGN_WINDOWS: ${{ inputs.sign_windows }}
+        run: |
+          $requested = $env:SIGN_WINDOWS -eq "true"
+          $configured = $requested -and
+            -not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERTIFICATE_BASE64) -and
+            -not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD)
+
+          if ($requested -and -not $configured) {
+            Write-Warning "Windows signing was requested, but signing certificate secrets are not configured; continuing unsigned."
+          }
+
+          "enabled=$($configured.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
       - name: Sign Windows binaries
-        if: ${{ runner.os == 'Windows' && inputs.sign_windows }}
+        if: ${{ runner.os == 'Windows' && steps.configure_windows_signing.outputs.enabled == 'true' }}
         shell: pwsh
         env:
           WINDOWS_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
@@ -214,7 +233,7 @@ jobs:
             throw "WiX did not create $installer"
           }
       - name: Sign Windows MSI installer
-        if: ${{ runner.os == 'Windows' && inputs.sign_windows && !contains(needs.metadata.outputs.version, '-') }}
+        if: ${{ runner.os == 'Windows' && steps.configure_windows_signing.outputs.enabled == 'true' && !contains(needs.metadata.outputs.version, '-') }}
         shell: pwsh
         env:
           WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
@@ -284,7 +303,7 @@ jobs:
             throw "WiX did not create $setup"
           }
       - name: Sign Windows setup executable
-        if: ${{ runner.os == 'Windows' && inputs.sign_windows && !contains(needs.metadata.outputs.version, '-') }}
+        if: ${{ runner.os == 'Windows' && steps.configure_windows_signing.outputs.enabled == 'true' && !contains(needs.metadata.outputs.version, '-') }}
         shell: pwsh
         env:
           WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
