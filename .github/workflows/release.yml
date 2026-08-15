@@ -85,7 +85,7 @@ jobs:
             exit 1
           }
           install -m 0755 "$setup" \
-            "dist/artifacts/Sketchi-${RELEASE_VERSION}-windows-x86_64.exe"
+            "dist/artifacts/Sketchi-${RELEASE_VERSION}-windows-x86_64-setup.exe"
       - name: Export Windows installer
         if: ${{ !contains(needs.version.outputs.version, '-') }}
         shell: bash
