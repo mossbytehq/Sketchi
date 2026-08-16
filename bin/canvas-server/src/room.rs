@@ -180,10 +180,8 @@ impl Room {
             let mut store = self.store.lock().map_err(|_| RoomError::StoreLock)?;
             store.append_operations(self.room_id, &applied)?;
             for operation in &applied {
-                debug_assert_eq!(
-                    self.document.apply(operation)?,
-                    canvas_core::ApplyResult::Applied
-                );
+                let result = self.document.apply(operation)?;
+                debug_assert_eq!(result, canvas_core::ApplyResult::Applied);
             }
             self.operations.extend(applied.iter().cloned());
             self.operations_since_snapshot += applied.len();

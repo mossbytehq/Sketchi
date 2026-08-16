@@ -486,7 +486,6 @@ impl SyncController {
             }
             ServerMessage::Operations { operations, .. } => {
                 for operation in operations {
-                    self.known_version.merge(&operation.deps);
                     self.known_version.observe(operation.id);
                 }
                 Ok(SyncUpdate::Operations)

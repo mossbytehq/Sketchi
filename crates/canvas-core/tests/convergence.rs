@@ -101,3 +101,28 @@ fn every_delivery_order_produces_the_same_snapshot() {
         assert_eq!(document.snapshot(), expected);
     }
 }
+
+#[test]
+fn dependency_metadata_does_not_advance_received_version() {
+    let dependency_client = ClientId::from_u128(2);
+    let operation_client = ClientId::from_u128(3);
+    let mut dependencies = VersionVector::default();
+    dependencies.observe(OperationId::new(dependency_client, 1));
+    let operation = Operation::new(
+        OperationId::new(operation_client, 1),
+        LamportTimestamp::new(1),
+        dependencies,
+        OperationKind::Create {
+            element: Element::rectangle(
+                ElementId::from_u128(100),
+                Transform::new(Point::default(), Size::new(10.0, 10.0)),
+            ),
+        },
+    );
+
+    let mut document = CrdtDocument::new();
+    document.apply(&operation).unwrap();
+
+    assert_eq!(document.version_vector().get(dependency_client), 0);
+    assert_eq!(document.version_vector().get(operation_client), 1);
+}

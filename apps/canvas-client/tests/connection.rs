@@ -19,10 +19,14 @@ use canvas_core::{
 use canvas_protocol::{ClientMessage, RoomId, ServerMessage, ToolKind};
 
 fn operation(sequence: u64) -> Operation {
+    operation_with_deps(sequence, VersionVector::default())
+}
+
+fn operation_with_deps(sequence: u64, deps: VersionVector) -> Operation {
     Operation::new(
         OperationId::new(ClientId::from_u128(1), sequence),
         LamportTimestamp::new(sequence),
-        VersionVector::default(),
+        deps,
         OperationKind::Create {
             element: Element::rectangle(
                 ElementId::from_u128(u128::from(sequence) + 20),
@@ -129,6 +133,26 @@ fn sync_metadata_tracks_snapshot_delta_and_builds_join_request() {
             known_version: controller.known_version().clone(),
         }
     );
+}
+
+#[test]
+fn incoming_operation_dependencies_are_not_marked_as_received() {
+    let room_id = RoomId::from_u128(12);
+    let dependency_client = ClientId::from_u128(2);
+    let mut dependencies = VersionVector::default();
+    dependencies.observe(OperationId::new(dependency_client, 1));
+    let operation = operation_with_deps(1, dependencies);
+    let mut controller = SyncController::new(Journal::open_in_memory().unwrap());
+
+    controller
+        .apply_server_message(&ServerMessage::Operations {
+            room_id,
+            operations: vec![operation],
+        })
+        .unwrap();
+
+    assert_eq!(controller.known_version().get(dependency_client), 0);
+    assert_eq!(controller.known_version().get(ClientId::from_u128(1)), 1);
 }
 
 #[test]

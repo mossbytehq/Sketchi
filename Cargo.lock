@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "canvas-client"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "arboard",
  "canvas-core",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "canvas-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64",
  "glam",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "canvas-protocol"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "canvas-core",
  "serde",
@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "canvas-renderer"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "canvas-core",
  "glam",
@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "canvas-server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -5225,7 +5225,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "clap",

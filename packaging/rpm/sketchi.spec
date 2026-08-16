@@ -3,7 +3,7 @@ Version:        %{_sketchi_version}
 Release:        1%{?dist}
 Summary:        Collaborative Rust whiteboard
 License:        MIT
-URL:            https://github.com/SantanuDatta/Sketchi
+URL:            https://github.com/mossbytehq/Sketchi
 BuildArch:      x86_64
 
 Requires:       wayland

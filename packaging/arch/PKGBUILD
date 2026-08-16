@@ -7,7 +7,7 @@ pkgver="${SKETCHI_VERSION}"
 pkgrel=1
 pkgdesc="Collaborative Rust whiteboard"
 arch=('x86_64')
-url="https://github.com/SantanuDatta/Sketchi"
+url="https://github.com/mossbytehq/Sketchi"
 license=('MIT')
 depends=(
   'wayland'

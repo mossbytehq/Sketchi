@@ -394,7 +394,6 @@ impl CrdtDocument {
         self.operation_fingerprints
             .insert(operation.id, fingerprint);
         self.version_vector.observe(operation.id);
-        self.version_vector.merge(&operation.deps);
         self.clock.observe(operation.timestamp);
         Ok(ApplyResult::Applied)
     }

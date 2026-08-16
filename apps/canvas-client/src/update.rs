@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const RELEASES_API_URL: &str =
-    "https://api.github.com/repos/SantanuDatta/Sketchi/releases?per_page=30";
-const RELEASE_PAGE_PREFIX: &str = "https://github.com/SantanuDatta/Sketchi/releases/";
+    "https://api.github.com/repos/mossbytehq/Sketchi/releases?per_page=100";
+const RELEASE_PAGE_PREFIX: &str = "https://github.com/mossbytehq/Sketchi/releases/";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const AUTOMATIC_CHECK_INTERVAL_SECS: u64 = 4 * 60 * 60;
 
@@ -282,10 +282,10 @@ mod tests {
             latest_stable: Some("0.1.2".to_owned()),
             latest_edge: Some("0.2.0-rc.1".to_owned()),
             latest_stable_url: Some(
-                "https://github.com/SantanuDatta/Sketchi/releases/tag/v0.1.2".to_owned(),
+                "https://github.com/mossbytehq/Sketchi/releases/tag/v0.1.2".to_owned(),
             ),
             latest_edge_url: Some(
-                "https://github.com/SantanuDatta/Sketchi/releases/tag/v0.2.0-rc.1".to_owned(),
+                "https://github.com/mossbytehq/Sketchi/releases/tag/v0.2.0-rc.1".to_owned(),
             ),
         };
         let stable = status(&cache, UpdateChannel::Stable);
@@ -304,7 +304,7 @@ mod tests {
             latest_edge: Some("0.2.0-rc.1".to_owned()),
             latest_stable_url: None,
             latest_edge_url: Some(
-                "https://github.com/SantanuDatta/Sketchi/releases/tag/v0.2.0-rc.1".to_owned(),
+                "https://github.com/mossbytehq/Sketchi/releases/tag/v0.2.0-rc.1".to_owned(),
             ),
         };
         let edge = status(&cache, UpdateChannel::Edge);

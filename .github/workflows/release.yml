@@ -189,3 +189,9 @@ jobs:
           files: |
             dist/artifacts/*
             dist/SHA256SUMS
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v${{ needs.version.outputs.version }}
+        shell: bash
+        run: gh release edit "$RELEASE_TAG" --draft=false

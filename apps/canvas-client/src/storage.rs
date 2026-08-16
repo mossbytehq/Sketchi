@@ -42,6 +42,11 @@ fn document_path(directory: &str) -> PathBuf {
     .join(DOCUMENT_FILE_NAME)
 }
 
+#[cfg(windows)]
+fn document_backup_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(".{DOCUMENT_FILE_NAME}.bak"))
+}
+
 /// Loads the last locally saved materialized document, when present.
 ///
 /// # Errors
@@ -49,6 +54,12 @@ fn document_path(directory: &str) -> PathBuf {
 /// Returns [`StorageError`] when the file cannot be read or decoded.
 pub fn load_document(directory: &str) -> Result<Option<Document>, StorageError> {
     let path = document_path(directory);
+    #[cfg(windows)]
+    let path = if path.exists() {
+        path
+    } else {
+        document_backup_path(&path)
+    };
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -77,7 +88,21 @@ pub fn save_document(directory: &str, document: &Document) -> Result<PathBuf, St
     fs::write(&temporary_path, bytes).map_err(StorageError::DocumentIo)?;
     #[cfg(windows)]
     if path.exists() {
-        fs::remove_file(&path).map_err(StorageError::DocumentIo)?;
+        let backup_path = document_backup_path(&path);
+        if backup_path.exists() {
+            fs::remove_file(&backup_path).map_err(StorageError::DocumentIo)?;
+        }
+        if let Err(error) = fs::rename(&path, &backup_path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(StorageError::DocumentIo(error));
+        }
+        if let Err(error) = fs::rename(&temporary_path, &path) {
+            let _ = fs::rename(&backup_path, &path);
+            let _ = fs::remove_file(&temporary_path);
+            return Err(StorageError::DocumentIo(error));
+        }
+        let _ = fs::remove_file(&backup_path);
+        return Ok(path);
     }
     if let Err(error) = fs::rename(&temporary_path, &path) {
         let _ = fs::remove_file(&temporary_path);
