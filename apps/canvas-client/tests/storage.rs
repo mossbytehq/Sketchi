@@ -178,6 +178,7 @@ fn durable_journal_creates_and_reopens_below_configured_directory() {
     assert!(journal_path(&directory_string).is_file());
     let reopened = Journal::open(journal_path(&directory_string)).unwrap();
     assert_eq!(reopened.load().unwrap(), vec![operation]);
+    drop(reopened);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
