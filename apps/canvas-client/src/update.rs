@@ -273,6 +273,8 @@ fn now_epoch() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use semver::Version;
+
     use super::{UpdateCache, UpdateChannel, format_last_checked, is_check_due, now_epoch, status};
 
     #[test]
@@ -298,19 +300,30 @@ mod tests {
 
     #[test]
     fn edge_channel_selects_a_newer_prerelease() {
+        let current = Version::parse(env!("CARGO_PKG_VERSION")).ok();
+        assert!(current.is_some(), "package version must be valid SemVer");
+        let Some(current) = current else {
+            return;
+        };
+        let newer_edge = format!(
+            "{}.{}.{}-rc.1",
+            current.major,
+            current.minor,
+            current.patch + 1
+        );
         let cache = UpdateCache {
             checked_at_epoch: Some(1),
             latest_stable: Some("0.1.2".to_owned()),
-            latest_edge: Some("0.2.0-rc.1".to_owned()),
+            latest_edge: Some(newer_edge.clone()),
             latest_stable_url: None,
-            latest_edge_url: Some(
-                "https://github.com/mossbytehq/Sketchi/releases/tag/v0.2.0-rc.1".to_owned(),
-            ),
+            latest_edge_url: Some(format!(
+                "https://github.com/mossbytehq/Sketchi/releases/tag/v{newer_edge}"
+            )),
         };
         let edge = status(&cache, UpdateChannel::Edge);
         assert_eq!(
             edge.target.as_ref().map(ToString::to_string),
-            Some("0.2.0-rc.1".to_owned())
+            Some(newer_edge)
         );
         assert!(edge.target_url.is_some());
     }
