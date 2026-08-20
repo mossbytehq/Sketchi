@@ -11,7 +11,10 @@ use uuid::Uuid;
 use crate::{
     MAX_CLIENT_NAME_BYTES, MAX_SELECTION, MAX_STROKE_CHUNK_POINTS, PROTOCOL_VERSION,
     error::ProtocolError,
-    validation::{validate_operation_batch, validate_room_id, validate_text, validate_token},
+    validation::{
+        validate_operation_batch, validate_operation_id, validate_room_id, validate_text,
+        validate_token,
+    },
 };
 
 /// Stable room identity.
@@ -62,6 +65,12 @@ impl SessionId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Returns whether this is the nil UUID.
+    #[must_use]
+    pub const fn is_nil(self) -> bool {
+        self.0.is_nil()
+    }
 }
 
 impl Default for SessionId {
@@ -86,6 +95,12 @@ impl StrokeId {
     #[must_use]
     pub const fn from_u128(value: u128) -> Self {
         Self(Uuid::from_u128(value))
+    }
+
+    /// Returns whether this is the nil UUID.
+    #[must_use]
+    pub const fn is_nil(self) -> bool {
+        self.0.is_nil()
     }
 }
 
@@ -128,6 +143,32 @@ pub struct PresenceState {
     pub selected_elements: Vec<ElementId>,
     /// Active editor tool.
     pub active_tool: ToolKind,
+}
+
+/// A room participant's ephemeral identity for the collaboration roster.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Participant {
+    /// Stable client identity.
+    pub client_id: ClientId,
+    /// Display name supplied during the Hello handshake.
+    pub name: String,
+}
+
+impl Participant {
+    /// Validates the bounded participant identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError`] when the identity is nil or the name exceeds
+    /// the configured display-name bound.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.client_id.is_nil() {
+            return Err(ProtocolError::InvalidMessage(
+                "participant client id cannot be nil".to_owned(),
+            ));
+        }
+        validate_text(&self.name, MAX_CLIENT_NAME_BYTES)
+    }
 }
 
 impl PresenceState {
@@ -305,6 +346,15 @@ pub enum ServerMessage {
         room_id: RoomId,
         /// Participant identity.
         client_id: ClientId,
+        /// Display name supplied by the participant.
+        name: String,
+    },
+    /// Announces the complete current participant roster during room sync.
+    Participants {
+        /// Room containing the roster.
+        room_id: RoomId,
+        /// Current room participants, including the joining client.
+        participants: Vec<Participant>,
     },
     /// Announces a participant departure.
     UserLeft {
@@ -377,6 +427,8 @@ pub enum ErrorCode {
     Internal,
     /// The server is rate limiting the session.
     RateLimited,
+    /// The room already has its maximum number of participants.
+    RoomFull,
 }
 
 impl ClientMessage {
@@ -432,17 +484,27 @@ impl ClientMessage {
                 state.validate()?;
             }
             Self::Ping { .. } => {}
-            Self::LeaveRoom { room_id } | Self::StrokeEnd { room_id, .. } => {
+            Self::LeaveRoom { room_id } => validate_room_id(*room_id)?,
+            Self::StrokeEnd { room_id, stroke_id } => {
                 validate_room_id(*room_id)?;
+                validate_stroke_id(*stroke_id)?;
             }
-            Self::StrokeStart { room_id, start, .. } => {
+            Self::StrokeStart {
+                room_id,
+                stroke_id,
+                start,
+            } => {
                 validate_room_id(*room_id)?;
+                validate_stroke_id(*stroke_id)?;
                 start.validate()?;
             }
             Self::StrokeChunk {
-                room_id, points, ..
+                room_id,
+                stroke_id,
+                points,
             } => {
                 validate_room_id(*room_id)?;
+                validate_stroke_id(*stroke_id)?;
                 if points.len() > MAX_STROKE_CHUNK_POINTS {
                     return Err(ProtocolError::InvalidMessage(
                         "stroke chunk exceeds the maximum size".to_owned(),
@@ -464,9 +526,16 @@ impl ServerMessage {
     ///
     /// Returns a [`ProtocolError`] when a message contains malformed IDs,
     /// oversized operation batches, invalid presence, or invalid stroke data.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ProtocolError> {
         match self {
-            Self::Welcome { server_version, .. } => validate_text(server_version, 128)?,
+            Self::Welcome {
+                session_id,
+                server_version,
+            } => {
+                validate_session_id(*session_id)?;
+                validate_text(server_version, 128)?;
+            }
             Self::RoomCreated {
                 request_id,
                 room_id,
@@ -494,15 +563,46 @@ impl ServerMessage {
             } => {
                 validate_room_id(*room_id)?;
                 validate_request_id(*request_id)?;
-                if accepted.len() > crate::MAX_OPERATIONS_PER_MESSAGE {
-                    return Err(ProtocolError::TooManyOperations);
-                }
+                validate_acknowledged_ids(accepted)?;
             }
             Self::Presence { room_id, state } => {
                 validate_room_id(*room_id)?;
                 state.validate()?;
             }
-            Self::UserJoined { room_id, client_id } | Self::UserLeft { room_id, client_id } => {
+            Self::UserJoined {
+                room_id,
+                client_id,
+                name,
+            } => {
+                validate_room_id(*room_id)?;
+                if client_id.is_nil() {
+                    return Err(ProtocolError::InvalidMessage(
+                        "participant client id cannot be nil".to_owned(),
+                    ));
+                }
+                validate_text(name, MAX_CLIENT_NAME_BYTES)?;
+            }
+            Self::Participants {
+                room_id,
+                participants,
+            } => {
+                validate_room_id(*room_id)?;
+                if participants.len() > crate::MAX_PARTICIPANTS {
+                    return Err(ProtocolError::InvalidMessage(
+                        "participant roster exceeds the maximum size".to_owned(),
+                    ));
+                }
+                let mut client_ids = std::collections::BTreeSet::new();
+                for participant in participants {
+                    participant.validate()?;
+                    if !client_ids.insert(participant.client_id) {
+                        return Err(ProtocolError::InvalidMessage(
+                            "participant roster contains duplicate client ids".to_owned(),
+                        ));
+                    }
+                }
+            }
+            Self::UserLeft { room_id, client_id } => {
                 validate_room_id(*room_id)?;
                 if client_id.is_nil() {
                     return Err(ProtocolError::InvalidMessage(
@@ -515,15 +615,32 @@ impl ServerMessage {
                 validate_room_id(*room_id)?;
                 version.validate()?;
             }
-            Self::Error { message, .. } => validate_text(message, 1024)?,
-            Self::StrokeStart { room_id, start, .. } => {
+            Self::Error {
+                request_id,
+                message,
+                ..
+            } => {
+                if let Some(request_id) = request_id {
+                    validate_request_id(*request_id)?;
+                }
+                validate_text(message, 1024)?;
+            }
+            Self::StrokeStart {
+                room_id,
+                stroke_id,
+                start,
+            } => {
                 validate_room_id(*room_id)?;
+                validate_stroke_id(*stroke_id)?;
                 start.validate()?;
             }
             Self::StrokeChunk {
-                room_id, points, ..
+                room_id,
+                stroke_id,
+                points,
             } => {
                 validate_room_id(*room_id)?;
+                validate_stroke_id(*stroke_id)?;
                 if points.len() > MAX_STROKE_CHUNK_POINTS {
                     return Err(ProtocolError::InvalidMessage(
                         "stroke chunk exceeds the maximum size".to_owned(),
@@ -533,7 +650,10 @@ impl ServerMessage {
                     point.validate()?;
                 }
             }
-            Self::StrokeEnd { room_id, .. } => validate_room_id(*room_id)?,
+            Self::StrokeEnd { room_id, stroke_id } => {
+                validate_room_id(*room_id)?;
+                validate_stroke_id(*stroke_id)?;
+            }
         }
         Ok(())
     }
@@ -543,6 +663,42 @@ fn validate_request_id(request_id: u64) -> Result<(), ProtocolError> {
     if request_id == 0 {
         Err(ProtocolError::InvalidMessage(
             "request id must be non-zero".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_acknowledged_ids(operation_ids: &[OperationId]) -> Result<(), ProtocolError> {
+    if operation_ids.len() > crate::MAX_OPERATIONS_PER_MESSAGE {
+        return Err(ProtocolError::TooManyOperations);
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for operation_id in operation_ids {
+        validate_operation_id(*operation_id)?;
+        if !ids.insert(*operation_id) {
+            return Err(ProtocolError::InvalidMessage(
+                "ack contains duplicate operation IDs".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_session_id(session_id: SessionId) -> Result<(), ProtocolError> {
+    if session_id.is_nil() {
+        Err(ProtocolError::InvalidMessage(
+            "session id cannot be nil".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_stroke_id(stroke_id: StrokeId) -> Result<(), ProtocolError> {
+    if stroke_id.is_nil() {
+        Err(ProtocolError::InvalidMessage(
+            "stroke id cannot be nil".to_owned(),
         ))
     } else {
         Ok(())

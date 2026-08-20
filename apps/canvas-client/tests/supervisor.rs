@@ -1,6 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, missing_docs)]
 
-use canvas_client::supervisor::{LocalServer, ReconnectBackoff, ReconnectState};
+use canvas_client::supervisor::{
+    LocalServer, ReconnectBackoff, ReconnectState, SUPERVISED_BIND_ADDRESS,
+};
 use canvas_client::supervisor::{SupervisorError, parse_ready_line};
 use std::process::Command;
 use std::time::Duration;
@@ -28,6 +30,11 @@ fn readiness_requires_endpoint_and_certificate_pin() {
         parse_ready_line(r#"{"endpoint":"wss://127.0.0.1:1234","certificate_sha256":"abc"}"#,),
         Err(SupervisorError::InvalidReadiness(_))
     ));
+}
+
+#[test]
+fn supervised_server_requests_a_wildcard_bind_for_lan_reachability() {
+    assert_eq!(SUPERVISED_BIND_ADDRESS, "0.0.0.0:0");
 }
 
 #[test]

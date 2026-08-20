@@ -8,12 +8,12 @@ mod validation;
 
 pub use error::ProtocolError;
 pub use message::{
-    ClientMessage, Envelope, ErrorCode, PresenceState, RoomId, ServerMessage, SessionId, StrokeId,
-    ToolKind,
+    ClientMessage, Envelope, ErrorCode, Participant, PresenceState, RoomId, ServerMessage,
+    SessionId, StrokeId, ToolKind,
 };
 
 /// Current protocol envelope version.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Maximum encoded JSON frame accepted by either endpoint.
 ///
 /// This accommodates a maximum-size embedded image in both a durable
@@ -27,6 +27,8 @@ pub const MAX_OPERATIONS_PER_MESSAGE: usize = 256;
 pub const MAX_SELECTION: usize = 256;
 /// Maximum UTF-8 bytes in a client display name.
 pub const MAX_CLIENT_NAME_BYTES: usize = 128;
+/// Maximum number of participants in one collaboration room.
+pub const MAX_PARTICIPANTS: usize = 4;
 /// Maximum UTF-8 bytes in a capability token.
 pub const MAX_TOKEN_BYTES: usize = 4096;
 /// Maximum points in one ephemeral stroke chunk.

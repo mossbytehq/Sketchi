@@ -5,9 +5,12 @@
 #[allow(dead_code)]
 pub(crate) enum RemixIcon {
     New,
+    Import,
     Save,
     Information,
     InputMethod,
+    Router,
+    Connector,
     Keyboard,
     ListSettings,
     Settings,
@@ -62,9 +65,12 @@ impl RemixIcon {
     pub(crate) const fn glyph(self) -> char {
         match self {
             Self::New => '\u{ea13}',
+            Self::Import => '\u{f446}',
             Self::Save => '\u{f0b3}',
             Self::Information => '\u{ee59}',
             Self::InputMethod => '\u{ee60}',
+            Self::Router => '\u{f09d}',
+            Self::Connector => '\u{f69d}',
             Self::Keyboard => '\u{ee75}',
             Self::ListSettings => '\u{eebd}',
             Self::Settings => '\u{f0ee}',
@@ -173,5 +179,16 @@ mod tests {
         assert_eq!(RemixIcon::Keyboard.glyph(), '\u{ee75}');
         assert_eq!(RemixIcon::InputMethod.glyph(), '\u{ee60}');
         assert_eq!(RemixIcon::Information.glyph(), '\u{ee59}');
+    }
+
+    #[test]
+    fn collaboration_icons_use_the_requested_remix_glyphs() {
+        assert_eq!(RemixIcon::Router.glyph(), '\u{f09d}');
+        assert_eq!(RemixIcon::Connector.glyph(), '\u{f69d}');
+    }
+
+    #[test]
+    fn document_import_uses_the_remix_import_line_glyph() {
+        assert_eq!(RemixIcon::Import.glyph(), '\u{f446}');
     }
 }

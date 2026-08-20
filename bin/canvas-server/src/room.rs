@@ -1,11 +1,11 @@
 //! Capability-authenticated room state and operation application.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use canvas_core::{ClientId, CrdtDocument, CrdtSnapshot, Document, Operation, VersionVector};
-use canvas_protocol::{PresenceState, RoomId};
+use canvas_protocol::{MAX_PARTICIPANTS, Participant, PresenceState, RoomId};
 use thiserror::Error;
 
 use crate::{auth::CapabilityToken, store::RoomStore};
@@ -40,10 +40,18 @@ pub struct SubmitOutcome {
 /// Synchronization payload for a client version vector.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SyncPayload {
-    /// Complete current snapshot.
+    /// Latest durable snapshot checkpoint.
     pub snapshot: CrdtSnapshot,
-    /// Durable operations not covered by the caller's version vector.
+    /// All durable operations after the snapshot checkpoint, including ones
+    /// the caller may already know, so the checkpoint can be rebuilt safely.
     pub operations: Vec<Operation>,
+    /// Complete causal knowledge represented by the room after the snapshot
+    /// and delta are applied.
+    pub version: VersionVector,
+    /// Current ephemeral presence, never persisted with the snapshot.
+    pub presence: Vec<PresenceState>,
+    /// Current room participants, including display names.
+    pub participants: Vec<Participant>,
 }
 
 /// Room-specific errors.
@@ -67,6 +75,9 @@ pub enum RoomError {
     /// The capability token was invalid.
     #[error("invalid room capability")]
     Unauthorized,
+    /// The room already has the maximum number of participants.
+    #[error("room is full (maximum {MAX_PARTICIPANTS} participants)")]
+    RoomFull,
     /// The room store mutex was poisoned.
     #[error("room store lock is poisoned")]
     StoreLock,
@@ -80,8 +91,9 @@ pub enum RoomError {
 pub struct Room {
     room_id: RoomId,
     document: CrdtDocument,
+    snapshot: CrdtSnapshot,
     operations: Vec<Operation>,
-    members: BTreeSet<ClientId>,
+    members: BTreeMap<ClientId, String>,
     presence: BTreeMap<ClientId, PresenceState>,
     store: Arc<Mutex<RoomStore>>,
     operations_since_snapshot: usize,
@@ -109,18 +121,17 @@ impl Room {
                 store.load_operations(room_id)?,
             )
         };
-        let mut document = snapshot
-            .map(CrdtDocument::from_snapshot)
-            .transpose()?
-            .unwrap_or_default();
+        let snapshot = snapshot.unwrap_or_else(|| CrdtDocument::default().snapshot());
+        let mut document = CrdtDocument::from_snapshot(snapshot.clone())?;
         for operation in &operations {
             document.apply(operation)?;
         }
         Ok(Self {
             room_id,
             document,
+            snapshot,
             operations,
-            members: BTreeSet::new(),
+            members: BTreeMap::new(),
             presence: BTreeMap::new(),
             store,
             operations_since_snapshot: 0,
@@ -129,15 +140,20 @@ impl Room {
         })
     }
 
-    pub(crate) fn join(&mut self, client_id: ClientId) {
-        self.members.insert(client_id);
+    pub(crate) fn join(&mut self, client_id: ClientId, name: String) -> Result<(), RoomError> {
+        if !self.members.contains_key(&client_id) && self.members.len() >= MAX_PARTICIPANTS {
+            return Err(RoomError::RoomFull);
+        }
+        self.members.insert(client_id, name);
         self.last_activity = Instant::now();
+        Ok(())
     }
 
-    pub(crate) fn leave(&mut self, client_id: ClientId) {
-        self.members.remove(&client_id);
+    pub(crate) fn leave(&mut self, client_id: ClientId) -> bool {
+        let removed = self.members.remove(&client_id).is_some();
         self.presence.remove(&client_id);
         self.last_activity = Instant::now();
+        removed
     }
 
     fn has_members(&self) -> bool {
@@ -145,7 +161,7 @@ impl Room {
     }
 
     fn is_member(&self, client_id: ClientId) -> bool {
-        self.members.contains(&client_id)
+        self.members.contains_key(&client_id)
     }
 
     pub(crate) fn submit(
@@ -193,6 +209,7 @@ impl Room {
                 let snapshot = self.document.snapshot();
                 store.save_snapshot(self.room_id, &snapshot)?;
                 store.compact_operations(self.room_id)?;
+                self.snapshot = snapshot;
                 self.operations.clear();
                 self.operations_since_snapshot = 0;
                 self.last_snapshot = Instant::now();
@@ -204,17 +221,22 @@ impl Room {
         })
     }
 
-    pub(crate) fn sync(&mut self, known_version: &VersionVector) -> SyncPayload {
+    pub(crate) fn sync(&mut self, _known_version: &VersionVector) -> SyncPayload {
         self.last_activity = Instant::now();
-        let operations = self
-            .operations
-            .iter()
-            .filter(|operation| operation.id.sequence > known_version.get(operation.id.client_id))
-            .cloned()
-            .collect();
+        let operations = self.operations.clone();
         SyncPayload {
-            snapshot: self.document.snapshot(),
+            snapshot: self.snapshot.clone(),
             operations,
+            version: self.document.version_vector().clone(),
+            presence: self.presence.values().cloned().collect(),
+            participants: self
+                .members
+                .iter()
+                .map(|(client_id, name)| Participant {
+                    client_id: *client_id,
+                    name: name.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -277,6 +299,22 @@ impl RoomManager {
         token: &CapabilityToken,
         client_id: ClientId,
     ) -> Result<(), RoomError> {
+        self.join_named(room_id, token, client_id, "Sketchi")
+    }
+
+    /// Joins a room with the display name advertised to other participants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] when the token is invalid, the room is missing,
+    /// or the participant limit has been reached.
+    pub fn join_named(
+        &mut self,
+        room_id: RoomId,
+        token: &CapabilityToken,
+        client_id: ClientId,
+        name: impl Into<String>,
+    ) -> Result<(), RoomError> {
         let expected = self
             .store
             .lock()
@@ -287,8 +325,7 @@ impl RoomManager {
             return Err(RoomError::Unauthorized);
         }
         let room = self.room_mut(room_id)?;
-        room.join(client_id);
-        Ok(())
+        room.join(client_id, name.into())
     }
 
     /// Leaves a room.
@@ -299,7 +336,9 @@ impl RoomManager {
     pub fn leave(&mut self, room_id: RoomId, client_id: ClientId) -> Result<(), RoomError> {
         let remove = {
             let room = self.room_mut(room_id)?;
-            room.leave(client_id);
+            if !room.leave(client_id) {
+                return Err(RoomError::NotInRoom);
+            }
             !room.has_members()
         };
         if remove {

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use canvas_core::Operation;
+use canvas_core::{Operation, OperationId};
 
 use crate::{MAX_OPERATIONS_PER_MESSAGE, MAX_TOKEN_BYTES, error::ProtocolError, message::RoomId};
 
@@ -33,6 +33,17 @@ pub(crate) fn validate_room_id(room_id: RoomId) -> Result<(), ProtocolError> {
     if room_id.is_nil() {
         Err(ProtocolError::InvalidMessage(
             "room id cannot be nil".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates an operation identity carried outside a durable operation.
+pub(crate) fn validate_operation_id(operation_id: OperationId) -> Result<(), ProtocolError> {
+    if operation_id.client_id.is_nil() || operation_id.sequence == 0 {
+        Err(ProtocolError::InvalidMessage(
+            "operation id must contain a client and non-zero sequence".to_owned(),
         ))
     } else {
         Ok(())

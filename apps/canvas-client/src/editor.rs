@@ -3,9 +3,10 @@
 use thiserror::Error;
 
 use canvas_core::{
-    CrdtDocument, CrdtError, Document, EditorCommand, EmbeddedImage, Operation, OperationId,
-    StylePatch,
+    CrdtDocument, CrdtError, CrdtSnapshot, Document, EditorCommand, EmbeddedImage, Operation,
+    OperationId, StylePatch,
 };
+use canvas_protocol::ServerMessage;
 
 use crate::connection::{ConnectionError, SyncController};
 
@@ -21,6 +22,17 @@ pub enum EditorError {
     /// No redo entry is available.
     #[error("nothing to redo")]
     NothingToRedo,
+}
+
+/// Errors raised while applying a server update to the editor and sync queue.
+#[derive(Debug, Error)]
+pub enum EditorSyncError {
+    /// The shared CRDT rejected a snapshot or operation.
+    #[error(transparent)]
+    Editor(#[from] EditorError),
+    /// The durable sync journal could not be updated or read.
+    #[error(transparent)]
+    Connection(#[from] ConnectionError),
 }
 
 #[derive(Clone, Debug)]
@@ -98,10 +110,96 @@ impl Editor {
     /// Returns [`EditorError::Core`] when the shared CRDT rejects the operation.
     pub fn apply_remote(&mut self, operation: &Operation) -> Result<(), EditorError> {
         self.crdt.apply(operation)?;
-        self.next_sequence = self
-            .next_sequence
-            .max(operation.id.sequence.saturating_add(1));
+        self.advance_local_sequence(operation);
         Ok(())
+    }
+
+    /// Applies a remote batch atomically through the shared CRDT path.
+    ///
+    /// The editor is unchanged when any operation in the batch is rejected.
+    /// This is the boundary used for server operation frames so a malformed
+    /// frame cannot leave the rendered document partially updated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError::Core`] when the shared CRDT rejects an operation.
+    pub fn apply_remote_batch(&mut self, operations: &[Operation]) -> Result<(), EditorError> {
+        let mut crdt = self.crdt.clone();
+        for operation in operations {
+            crdt.apply(operation)?;
+        }
+        self.crdt = crdt;
+        for operation in operations {
+            self.advance_local_sequence(operation);
+        }
+        Ok(())
+    }
+
+    /// Replaces the editor's CRDT state with a server snapshot and reapplies
+    /// local operations that have not necessarily reached the server yet.
+    ///
+    /// `pending_operations` normally comes from the durable [`SyncController`]
+    /// journal. The editor's in-memory pending operations are included as well,
+    /// so a snapshot received during a local edit cannot discard that edit.
+    /// Duplicate operations are harmless because the core CRDT is idempotent.
+    /// The replacement is atomic: a rejected snapshot or replay leaves the
+    /// current editor state untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError::Core`] when the snapshot or a replay operation is
+    /// rejected by the shared CRDT.
+    pub fn apply_snapshot(
+        &mut self,
+        snapshot: CrdtSnapshot,
+        pending_operations: &[Operation],
+    ) -> Result<(), EditorError> {
+        let mut crdt = CrdtDocument::from_snapshot(snapshot)?;
+        for operation in &self.pending {
+            crdt.apply(operation)?;
+        }
+        for operation in pending_operations {
+            crdt.apply(operation)?;
+        }
+        self.crdt = crdt;
+        self.next_sequence = self
+            .crdt
+            .version_vector()
+            .get(self.client_id)
+            .saturating_add(1);
+        Ok(())
+    }
+
+    /// Applies one server update to both the document and local sync state.
+    ///
+    /// Snapshot frames replace the CRDT state and replay durable local work;
+    /// operation frames are applied atomically; acknowledgements clear both
+    /// the durable journal and any still in-memory local queue. Presence and
+    /// other ephemeral messages are intentionally ignored here because they
+    /// belong to the UI/presence layer, not the durable document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorSyncError`] when either the CRDT or durable journal
+    /// rejects the update.
+    pub fn apply_server_message(
+        &mut self,
+        synchronization: &mut SyncController,
+        message: &ServerMessage,
+    ) -> Result<crate::connection::SyncUpdate, EditorSyncError> {
+        let update = synchronization.apply_server_message(message)?;
+        match message {
+            ServerMessage::Snapshot { snapshot, .. } => {
+                let pending = synchronization.pending_operations()?;
+                self.apply_snapshot(snapshot.clone(), &pending)?;
+            }
+            ServerMessage::Operations { operations, .. } => {
+                self.apply_remote_batch(operations)?;
+            }
+            ServerMessage::Ack { accepted, .. } => self.acknowledge(accepted),
+            _ => {}
+        }
+        Ok(update)
     }
 
     /// Creates a compensating operation for the latest local command.
@@ -187,6 +285,14 @@ impl Editor {
         self.crdt.apply(&operation)?;
         self.pending.push(operation.clone());
         Ok(operation)
+    }
+
+    fn advance_local_sequence(&mut self, operation: &Operation) {
+        if operation.id.client_id == self.client_id {
+            self.next_sequence = self
+                .next_sequence
+                .max(operation.id.sequence.saturating_add(1));
+        }
     }
 
     fn inverse_for(&self, command: &EditorCommand) -> Option<EditorCommand> {

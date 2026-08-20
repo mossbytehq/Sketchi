@@ -51,7 +51,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let generated_readiness =
+        args.ready && args.certificate.is_none() && args.private_key.is_none();
     let tls_mode = if args.insecure_loopback
+        || generated_readiness
         || (args.bind.ip().is_loopback()
             && args.certificate.is_none()
             && args.private_key.is_none())
@@ -68,7 +71,9 @@ async fn main() -> Result<()> {
         private_key: args.private_key,
         emit_readiness: args.ready,
     };
-    config.validate().map_err(anyhow::Error::msg)?;
+    if !generated_readiness {
+        config.validate().map_err(anyhow::Error::msg)?;
+    }
     if args.check_config {
         println!("configuration ok: {}", config.bind);
         return Ok(());
@@ -81,11 +86,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("open database {}", config.database.display()))?;
     let manager = RoomManager::new(Arc::new(Mutex::new(store)));
     let state = ServerState::new(manager);
-    let generated_loopback = args.ready
-        && config.bind.ip().is_loopback()
-        && config.certificate.is_none()
-        && config.private_key.is_none();
-    if generated_loopback {
+    if generated_readiness {
         let certificate =
             LoopbackCertificate::generate().context("generate loopback readiness certificate")?;
         let tls = certificate

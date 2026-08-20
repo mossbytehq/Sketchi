@@ -607,3 +607,23 @@ fn invalid_geometry_and_bounded_payloads_are_rejected() {
     assert_eq!(oversized_text.validate(), Err(CrdtError::TextTooLong));
     assert_eq!(oversized_points.validate(), Err(CrdtError::TooManyPoints));
 }
+
+#[test]
+fn operation_dependencies_cannot_include_the_operation_itself() {
+    let operation_id = OperationId::new(ClientId::from_u128(1), 2);
+    let mut dependencies = VersionVector::default();
+    dependencies.observe(operation_id);
+    let operation = Operation::new(
+        operation_id,
+        LamportTimestamp::new(2),
+        dependencies,
+        OperationKind::Delete {
+            element_id: ElementId::from_u128(13),
+        },
+    );
+
+    assert!(matches!(
+        operation.validate(),
+        Err(CrdtError::InvalidOperation(_))
+    ));
+}

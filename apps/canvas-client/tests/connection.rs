@@ -9,8 +9,12 @@
 use std::time::{Duration, Instant};
 
 use canvas_client::{
-    connection::{ConnectionConfig, ConnectionError, PresenceThrottle, SyncController, SyncUpdate},
+    connection::{
+        ConnectionConfig, ConnectionError, PresenceThrottle, SyncController, SyncUpdate,
+        format_room_invite, parse_room_id, parse_room_invite, resolve_invite_readiness,
+    },
     storage::Journal,
+    supervisor::ReadyMessage,
 };
 use canvas_core::{
     ClientId, CrdtDocument, Element, ElementId, LamportTimestamp, Operation, OperationId,
@@ -205,6 +209,76 @@ fn websocket_connection_config_requires_a_valid_pin_for_tls() {
     assert!(matches!(
         ConnectionConfig::new("http://127.0.0.1:3210/ws", None),
         Err(ConnectionError::InvalidEndpoint(_))
+    ));
+}
+
+#[test]
+fn room_invites_include_endpoint_and_certificate_pin_and_keep_legacy_tokens_valid() {
+    let room_id = RoomId::from_u128(42);
+    let readiness = ReadyMessage {
+        endpoint: String::from("wss://192.168.1.20:3210/ws"),
+        certificate_sha256: "ab".repeat(32),
+    };
+    let invite = format_room_invite(room_id, "capability-token", &readiness);
+    assert_eq!(
+        invite,
+        format!(
+            "{room_id}:capability-token|{}|{}",
+            readiness.endpoint, readiness.certificate_sha256
+        )
+    );
+
+    let parsed = parse_room_invite(&invite).unwrap();
+    assert_eq!(parsed.room_id, room_id);
+    assert_eq!(parsed.capability_token, "capability-token");
+    assert_eq!(
+        parsed.endpoint.as_deref(),
+        Some(readiness.endpoint.as_str())
+    );
+    assert_eq!(
+        parsed.certificate_sha256.as_deref(),
+        Some(readiness.certificate_sha256.as_str())
+    );
+
+    let legacy = parse_room_invite(&format!("{room_id}:legacy-token")).unwrap();
+    assert_eq!(legacy.capability_token, "legacy-token");
+    assert!(legacy.endpoint.is_none());
+    assert!(legacy.certificate_sha256.is_none());
+}
+
+#[test]
+fn room_id_input_accepts_uuid_text_and_rejects_other_values() {
+    let room_id = RoomId::from_u128(42);
+    assert_eq!(parse_room_id(&room_id.to_string()).unwrap(), room_id);
+    assert!(matches!(
+        parse_room_id("not-a-room"),
+        Err(ConnectionError::InvalidRoomId)
+    ));
+}
+
+#[test]
+fn invite_connection_fields_fall_back_locally_or_validate_custom_targets() {
+    let local = ReadyMessage {
+        endpoint: String::from("wss://127.0.0.1:3000/ws"),
+        certificate_sha256: "ab".repeat(32),
+    };
+    assert_eq!(
+        resolve_invite_readiness(Some(&local), "", "").unwrap(),
+        local
+    );
+
+    let custom =
+        resolve_invite_readiness(Some(&local), "wss://192.168.1.10:4000/ws", &"cd".repeat(32))
+            .unwrap();
+    assert_eq!(custom.endpoint, "wss://192.168.1.10:4000/ws");
+    assert_eq!(custom.certificate_sha256, "cd".repeat(32));
+    assert!(matches!(
+        resolve_invite_readiness(Some(&local), "wss://example.test/ws", ""),
+        Err(ConnectionError::InvalidInvite(_))
+    ));
+    assert!(matches!(
+        resolve_invite_readiness(None, "", ""),
+        Err(ConnectionError::InvalidInvite(_))
     ));
 }
 

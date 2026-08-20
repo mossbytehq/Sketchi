@@ -17,6 +17,10 @@ use winit::{
     window::{Icon as WindowIcon, Theme, Window, WindowButtons, WindowId},
 };
 
+use crate::connection::{
+    CollaborationClient, CollaborationIntent, CollaborationView, parse_room_invite,
+    resolve_invite_readiness,
+};
 use crate::editor::Editor;
 use crate::gpu::GpuState;
 use crate::remix_icons;
@@ -166,6 +170,8 @@ impl DesktopShell {
             last_autosave: Instant::now(),
             autosave_retry_at: None,
             modifiers: ModifiersState::default(),
+            collaboration: None,
+            collaboration_error: None,
         };
         let result = event_loop.run_app(&mut application);
         if let Err(error) = result {
@@ -199,6 +205,8 @@ struct DesktopApplication {
     last_autosave: Instant,
     autosave_retry_at: Option<Instant>,
     modifiers: ModifiersState,
+    collaboration: Option<CollaborationClient>,
+    collaboration_error: Option<String>,
 }
 
 impl ApplicationHandler for DesktopApplication {
@@ -356,8 +364,26 @@ impl ApplicationHandler for DesktopApplication {
                 let raw_input = egui_state.take_egui_input(window.as_ref());
                 let context = self.egui.clone();
                 let full_output = context.run(raw_input, |context| {
-                    self.ui
-                        .show(context, &mut self.editor, &mut self.tools, &mut self.camera);
+                    let collaboration = self.collaboration_view();
+                    let action = self.ui.show(
+                        context,
+                        &mut self.editor,
+                        &mut self.tools,
+                        &mut self.camera,
+                        &collaboration,
+                    );
+                    self.handle_collaboration_action(action);
+                    if let Some(collaboration) = self.collaboration.as_mut()
+                        && let Some(room_id) = collaboration.room_id()
+                    {
+                        let presence =
+                            self.ui
+                                .local_presence(context, self.camera, self.editor.client_id());
+                        if let Err(error) = collaboration.offer_presence(room_id, presence) {
+                            self.collaboration_error = Some(error.to_string());
+                        }
+                    }
+                    self.flush_collaboration_operations();
                 });
                 self.sync_window_state_preferences();
                 self.sync_settings_preferences();
@@ -411,6 +437,10 @@ impl ApplicationHandler for DesktopApplication {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let collaboration_changed = self.poll_collaboration();
+        if collaboration_changed && let Some(window) = &self.window {
+            window.request_redraw();
+        }
         if self.ui.poll_update_check() {
             if let Some(window) = &self.settings_window {
                 window.request_redraw();
@@ -434,20 +464,179 @@ impl ApplicationHandler for DesktopApplication {
             .ui
             .update_checking()
             .then(|| Instant::now() + Duration::from_millis(100));
-        match (next_autosave, next_update_poll) {
-            (Some(autosave), Some(update)) => {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(autosave.min(update)));
-            }
-            (Some(next), None) | (None, Some(next)) => {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(next));
-            }
-            (None, None) => event_loop.set_control_flow(ControlFlow::Wait),
+        let next_collaboration_poll = self
+            .collaboration
+            .is_some()
+            .then(|| Instant::now() + Duration::from_millis(50));
+        let next_wakeup = [next_autosave, next_update_poll, next_collaboration_poll]
+            .into_iter()
+            .flatten()
+            .min();
+        if let Some(next_wakeup) = next_wakeup {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next_wakeup));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
         let _ = &self.local_server;
     }
 }
 
 impl DesktopApplication {
+    fn collaboration_view(&self) -> CollaborationView {
+        let mut view = self.collaboration.as_ref().map_or_else(
+            || CollaborationView::disconnected(self.local_server.is_some()),
+            CollaborationClient::view,
+        );
+        if let Some(error) = &self.collaboration_error {
+            view.status.clone_from(error);
+        }
+        view
+    }
+
+    fn handle_collaboration_action(&mut self, action: crate::ui::CollaborationAction) {
+        use crate::ui::CollaborationAction;
+
+        let local_readiness = self
+            .local_server
+            .as_ref()
+            .map(|server| server.readiness().clone());
+        let intent = match action {
+            CollaborationAction::None => return,
+            CollaborationAction::Create { display_name } => {
+                let Some(display_name) = normalized_display_name(&display_name) else {
+                    self.collaboration_error =
+                        Some(String::from("A display name is required to create a room."));
+                    return;
+                };
+                let Some(readiness) = local_readiness.clone() else {
+                    self.collaboration_error = Some(String::from(
+                        "The local collaboration server is unavailable.",
+                    ));
+                    return;
+                };
+                CollaborationIntent::Create {
+                    readiness,
+                    display_name,
+                }
+            }
+            CollaborationAction::Join {
+                invite_token,
+                display_name,
+                endpoint,
+                certificate_sha256,
+            } => {
+                let Some(display_name) = normalized_display_name(&display_name) else {
+                    self.collaboration_error =
+                        Some(String::from("A display name is required to join a room."));
+                    return;
+                };
+                let invite = match parse_room_invite(&invite_token) {
+                    Ok(invite) => invite,
+                    Err(error) => {
+                        self.collaboration_error = Some(error.to_string());
+                        return;
+                    }
+                };
+                let endpoint = invite
+                    .endpoint
+                    .as_deref()
+                    .unwrap_or(endpoint.as_str())
+                    .to_owned();
+                let certificate_sha256 = invite
+                    .certificate_sha256
+                    .as_deref()
+                    .unwrap_or(certificate_sha256.as_str())
+                    .to_owned();
+                let readiness = match resolve_invite_readiness(
+                    local_readiness.as_ref(),
+                    &endpoint,
+                    &certificate_sha256,
+                ) {
+                    Ok(readiness) => readiness,
+                    Err(error) => {
+                        self.collaboration_error = Some(error.to_string());
+                        return;
+                    }
+                };
+                CollaborationIntent::Join {
+                    room_id: invite.room_id,
+                    capability_token: invite.capability_token,
+                    readiness,
+                    display_name,
+                }
+            }
+        };
+
+        let journal = match storage::open_journal(&self.settings_state.autosave_directory) {
+            Ok(journal) => journal,
+            Err(error) => {
+                self.collaboration_error = Some(format!("Could not open sync journal: {error}"));
+                return;
+            }
+        };
+        match CollaborationClient::start(self.editor.client_id(), journal, intent) {
+            Ok(collaboration) => {
+                self.collaboration = Some(collaboration);
+                self.collaboration_error = None;
+            }
+            Err(error) => self.collaboration_error = Some(error.to_string()),
+        }
+    }
+
+    fn poll_collaboration(&mut self) -> bool {
+        let messages = {
+            let Some(collaboration) = self.collaboration.as_mut() else {
+                return false;
+            };
+            match collaboration.poll() {
+                Ok(messages) => messages,
+                Err(error) => {
+                    self.collaboration_error = Some(error.to_string());
+                    return true;
+                }
+            }
+        };
+        let changed = !messages.is_empty();
+        for message in messages {
+            let result = {
+                let Some(collaboration) = self.collaboration.as_mut() else {
+                    return changed;
+                };
+                collaboration
+                    .observe(&message)
+                    .map_err(|error| error.to_string())
+                    .and_then(|()| {
+                        self.editor
+                            .apply_server_message(collaboration.synchronization_mut(), &message)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    })
+            };
+            if let Err(error) = result {
+                self.collaboration_error = Some(error);
+            }
+        }
+        self.flush_collaboration_operations();
+        changed
+    }
+
+    fn flush_collaboration_operations(&mut self) {
+        let result = {
+            let Some(collaboration) = self.collaboration.as_mut() else {
+                return;
+            };
+            self.editor
+                .persist_pending(collaboration.synchronization_mut())
+                .and_then(|_| collaboration.queue_pending())
+        };
+        if let Err(error) = result {
+            if let Some(collaboration) = self.collaboration.as_mut() {
+                collaboration.set_error(error.to_string());
+            }
+            self.collaboration_error = Some(error.to_string());
+        }
+    }
+
     fn sync_settings_window(&mut self, event_loop: &ActiveEventLoop) {
         if self.ui.settings_open() {
             if self.settings_window.is_some() {
@@ -782,6 +971,15 @@ impl DesktopApplication {
     }
 }
 
+fn normalized_display_name(value: &str) -> Option<String> {
+    let name = value.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
+}
+
 impl Drop for DesktopApplication {
     fn drop(&mut self) {
         self.save_window_state(true);
@@ -864,7 +1062,10 @@ fn should_request_redraw(
 
 #[cfg(test)]
 mod tests {
-    use super::{WindowButtons, remix_icons, settings_window_buttons, should_request_redraw};
+    use super::{
+        WindowButtons, normalized_display_name, remix_icons, settings_window_buttons,
+        should_request_redraw,
+    };
     use winit::event::WindowEvent;
 
     #[test]
@@ -892,6 +1093,16 @@ mod tests {
             false,
             true,
         ));
+    }
+
+    #[test]
+    fn normalized_display_name_rejects_blank_and_trims_valid_names() {
+        assert_eq!(normalized_display_name(""), None);
+        assert_eq!(normalized_display_name(" \t\n"), None);
+        assert_eq!(
+            normalized_display_name("  Santanu Datta  "),
+            Some(String::from("Santanu Datta"))
+        );
     }
 
     #[test]

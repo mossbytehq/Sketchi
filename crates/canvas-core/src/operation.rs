@@ -63,6 +63,11 @@ impl Operation {
             ));
         }
         self.deps.validate()?;
+        if self.deps.get(self.id.client_id) >= self.id.sequence {
+            return Err(CrdtError::InvalidOperation(
+                "operation dependencies cannot include itself or a later sequence".to_owned(),
+            ));
+        }
         match &self.kind {
             OperationKind::Create { element } => element.validate(),
             OperationKind::Delete { element_id }

@@ -8,7 +8,7 @@ use std::{
 use canvas_core::Document;
 use canvas_core::{Operation, OperationId};
 use directories::BaseDirs;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 /// Errors raised by the local journal.
@@ -20,26 +20,48 @@ pub enum StorageError {
     /// Operation JSON could not be encoded or decoded.
     #[error("operation JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    /// A saved document could not be decoded as JSON.
+    #[error("document JSON error: {0}")]
+    DocumentJson(#[source] serde_json::Error),
+    /// An operation ID was reused with a different operation payload.
+    #[error("operation ID {operation_id} was reused with different content")]
+    OperationIdReuse {
+        /// Reused operation identity.
+        operation_id: OperationId,
+    },
     /// Document file could not be read or written.
     #[error("document file error: {0}")]
     DocumentIo(#[source] io::Error),
+    /// Sync-journal directory could not be created.
+    #[error("sync journal directory error: {0}")]
+    JournalIo(#[source] io::Error),
 }
 
 const DOCUMENT_FILE_NAME: &str = "sketchi.autosave.json";
+const JOURNAL_FILE_NAME: &str = "sketchi.sync.sqlite3";
 
-fn document_path(directory: &str) -> PathBuf {
+fn configured_directory(directory: &str) -> PathBuf {
     let directory = directory.trim();
     if let Some(relative) = directory.strip_prefix("~/")
         && let Some(base_dirs) = BaseDirs::new()
     {
-        return base_dirs.home_dir().join(relative).join(DOCUMENT_FILE_NAME);
+        return base_dirs.home_dir().join(relative);
     }
-    Path::new(if directory.is_empty() {
+    PathBuf::from(if directory.is_empty() {
         "autosave"
     } else {
         directory
     })
-    .join(DOCUMENT_FILE_NAME)
+}
+
+fn document_path(directory: &str) -> PathBuf {
+    configured_directory(directory).join(DOCUMENT_FILE_NAME)
+}
+
+/// Returns the durable sync-journal path for the configured data directory.
+#[must_use]
+pub fn journal_path(directory: &str) -> PathBuf {
+    configured_directory(directory).join(JOURNAL_FILE_NAME)
 }
 
 #[cfg(windows)]
@@ -65,7 +87,19 @@ pub fn load_document(directory: &str) -> Result<Option<Document>, StorageError> 
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(StorageError::DocumentIo(error)),
     };
-    Ok(Some(serde_json::from_slice(&bytes)?))
+    Ok(Some(
+        serde_json::from_slice(&bytes).map_err(StorageError::DocumentJson)?,
+    ))
+}
+
+/// Loads a materialized document from an explicit JSON file path.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the file cannot be read or decoded.
+pub fn load_document_from_path(path: impl AsRef<Path>) -> Result<Document, StorageError> {
+    let bytes = fs::read(path).map_err(StorageError::DocumentIo)?;
+    serde_json::from_slice(&bytes).map_err(StorageError::DocumentJson)
 }
 
 /// Saves a materialized document in the configured local directory.
@@ -109,6 +143,27 @@ pub fn save_document(directory: &str, document: &Document) -> Result<PathBuf, St
         return Err(StorageError::DocumentIo(error));
     }
     Ok(path)
+}
+
+/// Opens the durable sync journal below the configured data directory.
+///
+/// The parent directory is created when necessary, so collaboration startup
+/// does not depend on a prior autosave.
+///
+/// # Errors
+///
+/// Returns [`StorageError::JournalIo`] when the directory cannot be created or
+/// [`StorageError::Sqlite`] when the journal cannot be opened.
+pub fn open_journal(directory: &str) -> Result<Journal, StorageError> {
+    let path = journal_path(directory);
+    let Some(parent) = path.parent() else {
+        return Err(StorageError::JournalIo(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "journal path has no parent directory",
+        )));
+    };
+    fs::create_dir_all(parent).map_err(StorageError::JournalIo)?;
+    Journal::open(path)
 }
 
 /// SQLite-backed queue for operations awaiting server acknowledgement.
@@ -165,15 +220,34 @@ impl Journal {
         let encoded = operations
             .iter()
             .map(|operation| {
-                Ok::<_, StorageError>((operation.id.to_string(), serde_json::to_string(operation)?))
+                Ok::<_, StorageError>((
+                    operation.id,
+                    operation.id.to_string(),
+                    serde_json::to_string(operation)?,
+                ))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let transaction = self.connection.unchecked_transaction()?;
-        for (operation_id, payload) in encoded {
-            transaction.execute(
-                "INSERT OR IGNORE INTO pending_operations (operation_id, payload) VALUES (?1, ?2)",
-                params![operation_id, payload],
-            )?;
+        for (operation_id, operation_id_text, payload) in encoded {
+            let existing = transaction
+                .query_row(
+                    "SELECT payload FROM pending_operations WHERE operation_id = ?1",
+                    params![operation_id_text],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            match existing {
+                Some(existing) if existing != payload => {
+                    return Err(StorageError::OperationIdReuse { operation_id });
+                }
+                Some(_) => {}
+                None => {
+                    transaction.execute(
+                        "INSERT INTO pending_operations (operation_id, payload) VALUES (?1, ?2)",
+                        params![operation_id_text, payload],
+                    )?;
+                }
+            }
         }
         transaction.commit()?;
         Ok(())

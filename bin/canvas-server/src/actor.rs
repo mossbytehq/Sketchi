@@ -13,6 +13,8 @@ pub enum RoomCommand {
     Join {
         /// Client identity.
         client_id: ClientId,
+        /// Display name shown in the participant roster.
+        name: String,
         /// Completion channel.
         response: oneshot::Sender<Result<(), RoomError>>,
     },
@@ -68,10 +70,25 @@ impl RoomActorHandle {
     ///
     /// Returns [`RoomError`] when the actor has stopped.
     pub async fn join(&self, client_id: ClientId) -> Result<(), RoomError> {
+        self.join_named(client_id, "Sketchi").await
+    }
+
+    /// Joins a client with a display name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] when the room actor has stopped or the room is
+    /// already at its participant limit.
+    pub async fn join_named(
+        &self,
+        client_id: ClientId,
+        name: impl Into<String>,
+    ) -> Result<(), RoomError> {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(RoomCommand::Join {
                 client_id,
+                name: name.into(),
                 response,
             })
             .await
@@ -163,17 +180,21 @@ pub fn spawn(room: Room) -> (RoomActorHandle, JoinHandle<()>) {
             match command {
                 RoomCommand::Join {
                     client_id,
+                    name,
                     response,
                 } => {
-                    room.join(client_id);
-                    let _ = response.send(Ok(()));
+                    let _ = response.send(room.join(client_id, name));
                 }
                 RoomCommand::Leave {
                     client_id,
                     response,
                 } => {
-                    room.leave(client_id);
-                    let _ = response.send(Ok(()));
+                    let result = if room.leave(client_id) {
+                        Ok(())
+                    } else {
+                        Err(RoomError::NotInRoom)
+                    };
+                    let _ = response.send(result);
                 }
                 RoomCommand::Submit {
                     client_id,

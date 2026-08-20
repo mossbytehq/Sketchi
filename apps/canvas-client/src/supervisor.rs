@@ -25,6 +25,10 @@ pub const DEFAULT_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(250)
 /// Default maximum reconnect delay.
 pub const DEFAULT_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(8);
 
+/// Wildcard address used by the supervised server so peers on the local LAN
+/// can reach the advertised endpoint.
+pub const SUPERVISED_BIND_ADDRESS: &str = "0.0.0.0:0";
+
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -129,7 +133,7 @@ impl LocalServer {
         command
             .arg("--ready")
             .arg("--bind")
-            .arg("127.0.0.1:0")
+            .arg(SUPERVISED_BIND_ADDRESS)
             .arg("--database")
             .arg(database);
         let mut server = Self::spawn(command)?;

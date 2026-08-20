@@ -45,6 +45,36 @@ impl RegisterMetadata {
     }
 }
 
+fn validate_snapshot_metadata(
+    metadata: RegisterMetadata,
+    clock: LamportTimestamp,
+    version_vector: &VersionVector,
+    field: &str,
+) -> Result<(), CrdtError> {
+    if metadata == RegisterMetadata::ZERO {
+        return Ok(());
+    }
+    if metadata.timestamp.value() == 0
+        || metadata.operation_id.client_id.is_nil()
+        || metadata.operation_id.sequence == 0
+    {
+        return Err(CrdtError::InvalidSnapshot(format!(
+            "{field} has invalid register metadata"
+        )));
+    }
+    if metadata.timestamp > clock {
+        return Err(CrdtError::InvalidSnapshot(format!(
+            "{field} register metadata is newer than the snapshot clock"
+        )));
+    }
+    if version_vector.get(metadata.operation_id.client_id) < metadata.operation_id.sequence {
+        return Err(CrdtError::InvalidSnapshot(format!(
+            "{field} register metadata is outside the snapshot version vector"
+        )));
+    }
+    Ok(())
+}
+
 /// An LWW value and the metadata that selected it.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Register<T> {
@@ -77,6 +107,10 @@ impl<T: Default> Default for Register<T> {
     fn default() -> Self {
         Self::new(T::default())
     }
+}
+
+fn metadata_of<T>(register: &Register<T>) -> RegisterMetadata {
+    register.metadata
 }
 
 /// Full per-element CRDT state retained in a snapshot.
@@ -165,12 +199,53 @@ impl ElementSnapshot {
         }
     }
 
-    fn validate(&self) -> Result<(), CrdtError> {
+    fn validate_metadata(
+        &self,
+        clock: LamportTimestamp,
+        version_vector: &VersionVector,
+    ) -> Result<(), CrdtError> {
+        if let Some(metadata) = self.created {
+            validate_snapshot_metadata(metadata, clock, version_vector, "created")?;
+        }
+        if let Some(metadata) = self.deleted {
+            validate_snapshot_metadata(metadata, clock, version_vector, "deleted")?;
+        }
+        for (field, metadata) in [
+            ("kind", metadata_of(&self.kind)),
+            ("position", metadata_of(&self.position)),
+            ("size", metadata_of(&self.size)),
+            ("rotation", metadata_of(&self.rotation)),
+            ("stroke", metadata_of(&self.stroke)),
+            ("fill", metadata_of(&self.fill)),
+            ("stroke_width", metadata_of(&self.stroke_width)),
+            ("stroke_style", metadata_of(&self.stroke_style)),
+            ("sloppiness", metadata_of(&self.sloppiness)),
+            ("edges", metadata_of(&self.edges)),
+            ("opacity", metadata_of(&self.opacity)),
+            ("font_family", metadata_of(&self.font_family)),
+            ("font_size", metadata_of(&self.font_size)),
+            ("text_align", metadata_of(&self.text_align)),
+            ("text", metadata_of(&self.text)),
+            ("points", metadata_of(&self.points)),
+            ("image", metadata_of(&self.image)),
+            ("z_index", metadata_of(&self.z_index)),
+        ] {
+            validate_snapshot_metadata(metadata, clock, version_vector, field)?;
+        }
+        Ok(())
+    }
+
+    fn validate(
+        &self,
+        clock: LamportTimestamp,
+        version_vector: &VersionVector,
+    ) -> Result<(), CrdtError> {
         if self.id.is_nil() {
             return Err(CrdtError::InvalidSnapshot(
                 "element id cannot be nil".to_owned(),
             ));
         }
+        self.validate_metadata(clock, version_vector)?;
         self.position.value.validate()?;
         self.size.value.validate()?;
         if !self.rotation.value.is_finite() {
@@ -711,7 +786,7 @@ impl CrdtDocument {
         }
         let mut elements = BTreeMap::new();
         for state in snapshot_elements {
-            state.validate()?;
+            state.validate(clock, &version_vector)?;
             if elements.insert(state.id, state).is_some() {
                 return Err(CrdtError::InvalidSnapshot(
                     "snapshot contains duplicate element IDs".to_owned(),
@@ -721,6 +796,11 @@ impl CrdtDocument {
         let mut seen_operations = BTreeMap::new();
         for operation in snapshot_operations {
             operation.validate()?;
+            if operation.timestamp > clock {
+                return Err(CrdtError::InvalidSnapshot(
+                    "snapshot operation is newer than the snapshot clock".to_owned(),
+                ));
+            }
             if seen_operations.insert(operation.id, operation).is_some() {
                 return Err(CrdtError::InvalidSnapshot(
                     "snapshot contains duplicate operation IDs".to_owned(),
@@ -748,16 +828,12 @@ impl CrdtDocument {
                 ));
             }
         }
-        for operation_id in operation_fingerprints.keys() {
-            if operation_id.client_id.is_nil()
-                || operation_id.sequence == 0
-                || version_vector.get(operation_id.client_id) < operation_id.sequence
-            {
-                return Err(CrdtError::InvalidSnapshot(
-                    "snapshot contains operation fingerprint outside version vector".to_owned(),
-                ));
-            }
-        }
+        validate_snapshot_fingerprints(
+            &version_vector,
+            &compacted_version_vector,
+            &operation_fingerprints,
+        )?;
+        validate_retained_register_metadata(&elements, &seen_operations)?;
         let mut document = Self {
             elements,
             seen_operations,
@@ -770,6 +846,79 @@ impl CrdtDocument {
         document.materialized = document.build_document();
         Ok(document)
     }
+}
+
+fn state_metadata(state: &ElementSnapshot) -> impl Iterator<Item = RegisterMetadata> + '_ {
+    state
+        .created
+        .into_iter()
+        .chain(state.deleted)
+        .chain([
+            state.kind.metadata,
+            state.position.metadata,
+            state.size.metadata,
+            state.rotation.metadata,
+            state.stroke.metadata,
+            state.fill.metadata,
+            state.stroke_width.metadata,
+            state.stroke_style.metadata,
+            state.sloppiness.metadata,
+            state.edges.metadata,
+            state.opacity.metadata,
+            state.font_family.metadata,
+            state.font_size.metadata,
+            state.text_align.metadata,
+            state.text.metadata,
+            state.points.metadata,
+            state.image.metadata,
+            state.z_index.metadata,
+        ])
+        .filter(|metadata| *metadata != RegisterMetadata::ZERO)
+}
+
+fn validate_snapshot_fingerprints(
+    version_vector: &VersionVector,
+    compacted_version_vector: &VersionVector,
+    operation_fingerprints: &BTreeMap<OperationId, [u8; 32]>,
+) -> Result<(), CrdtError> {
+    for operation_id in operation_fingerprints.keys() {
+        if operation_id.client_id.is_nil()
+            || operation_id.sequence == 0
+            || version_vector.get(operation_id.client_id) < operation_id.sequence
+        {
+            return Err(CrdtError::InvalidSnapshot(
+                "snapshot contains operation fingerprint outside version vector".to_owned(),
+            ));
+        }
+    }
+    let mut covered_version = compacted_version_vector.clone();
+    for operation_id in operation_fingerprints.keys() {
+        covered_version.observe(*operation_id);
+    }
+    if covered_version != *version_vector {
+        return Err(CrdtError::InvalidSnapshot(
+            "snapshot version vector contains an unretained operation".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retained_register_metadata(
+    elements: &BTreeMap<ElementId, ElementSnapshot>,
+    seen_operations: &BTreeMap<OperationId, Operation>,
+) -> Result<(), CrdtError> {
+    for state in elements.values() {
+        for metadata in state_metadata(state) {
+            if let Some(operation) = seen_operations.get(&metadata.operation_id)
+                && operation.timestamp != metadata.timestamp
+            {
+                return Err(CrdtError::InvalidSnapshot(
+                    "register metadata does not match its retained operation".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn operation_fingerprint(operation: &Operation) -> Result<[u8; 32], CrdtError> {

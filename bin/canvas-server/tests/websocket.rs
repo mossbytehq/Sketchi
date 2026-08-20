@@ -94,6 +94,10 @@ async fn two_websocket_clients_receive_acknowledged_operations() {
         receive_server(&mut first).await,
         ServerMessage::SyncComplete { .. }
     ));
+    assert!(matches!(
+        receive_server(&mut first).await,
+        ServerMessage::Participants { .. }
+    ));
 
     let (mut second, _) = connect_async(format!("ws://{address}/ws")).await.unwrap();
     let second_id = ClientId::from_u128(2);
@@ -123,7 +127,14 @@ async fn two_websocket_clients_receive_acknowledged_operations() {
         receive_server(&mut second).await,
         ServerMessage::SyncComplete { .. }
     ));
-    let _ = receive_server(&mut first).await;
+    assert!(matches!(
+        receive_server(&mut second).await,
+        ServerMessage::Participants { .. }
+    ));
+    assert!(matches!(
+        receive_server(&mut first).await,
+        ServerMessage::UserJoined { .. }
+    ));
 
     let operation = Operation::new(
         OperationId::new(first_id, 1),

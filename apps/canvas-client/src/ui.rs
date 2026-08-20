@@ -7,14 +7,16 @@ use std::{
 };
 
 use canvas_core::{
-    Color, Document, EdgeStyle, EditorCommand, Element, ElementId, ElementKind, EmbeddedImage,
-    Point, Size, Sloppiness, StrokeStyle, Style, StylePatch, TextAlign, TextFontFamily, Transform,
+    ClientId, Color, Document, EdgeStyle, EditorCommand, Element, ElementId, ElementKind,
+    EmbeddedImage, Point, Size, Sloppiness, StrokeStyle, Style, StylePatch, TextAlign,
+    TextFontFamily, Transform,
 };
+use canvas_protocol::{PresenceState, ToolKind};
 use canvas_renderer::{Camera, RenderPrimitive, Renderer, Scene};
 use egui::epaint::{TextShape, Vertex};
 use egui::{
-    Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Key, Margin, Mesh, Modifiers, Painter,
-    PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
+    Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Key, Layout, Margin, Mesh, Modifiers,
+    Painter, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
 };
 
 #[path = "settings_ui.rs"]
@@ -27,6 +29,7 @@ use crate::{
         dropdown_field_sized, numeric_field, numeric_field_with_decimals, range_slider,
         sized_text_field,
     },
+    connection::{CollaborationView, format_room_invite},
     editor::Editor,
     images::{embedded_image_from_rgba, embedded_image_with_rgba},
     preview::{DropPreviewDecode, DropPreviewDecodeError, PreviewCancellation, PreviewWorker},
@@ -39,6 +42,7 @@ use crate::{
         selection_handle_position, translated_element,
     },
     settings,
+    supervisor::ReadyMessage,
     theme::CONTROL_CORNER_RADIUS,
     tools::{Tool, ToolController, ToolOutput},
     update::{self, UpdateCache, UpdateChannel},
@@ -47,6 +51,11 @@ use crate::{
 const DARK_CANVAS: Color32 = Color32::from_rgb(26, 27, 30);
 const LIGHT_CANVAS: Color32 = Color32::from_rgb(246, 247, 249);
 const ACCENT: Color32 = Color32::from_rgb(91, 87, 214);
+const MOSSBYTE_AGENCY_URL: &str = "https://mossbyteagency.com/";
+const MOSSBYTE_AGENCY_BUTTON_WIDTH: f32 = 136.0;
+const MOSSBYTE_AGENCY_ROW_GAP: f32 = 12.0;
+const MOSSBYTE_AGENCY_COPY_MIN_WIDTH: f32 = 220.0;
+const MOSSBYTE_AGENCY_ROW_HEIGHT: f32 = 72.0;
 const LIGHT_PANEL: Color32 = Color32::from_rgb(255, 255, 255);
 const DARK_PANEL: Color32 = Color32::from_rgb(37, 38, 43);
 const LIGHT_BORDER: Color32 = Color32::from_rgb(205, 209, 218);
@@ -69,6 +78,19 @@ const SETTINGS_CONTROL_HOVER_DARK: Color32 = Color32::from_rgb(61, 63, 72);
 const SETTINGS_CARD_BORDER_DARK: Color32 = Color32::from_rgb(52, 54, 62);
 const SETTINGS_CARD_BORDER_LIGHT: Color32 = Color32::from_rgb(218, 221, 228);
 const SETTINGS_DIVIDER_LIGHT: Color32 = Color32::from_rgb(225, 227, 232);
+const COLLABORATION_AVATAR_SIZE: f32 = 22.0;
+const COLLABORATION_AVATAR_OVERLAP: f32 = 7.0;
+const COLLABORATION_MAX_PARTICIPANTS: usize = 4;
+const COLLABORATION_AVATAR_COLORS: [Color32; 8] = [
+    Color32::from_rgb(91, 87, 214),
+    Color32::from_rgb(205, 78, 96),
+    Color32::from_rgb(43, 145, 112),
+    Color32::from_rgb(45, 128, 190),
+    Color32::from_rgb(202, 132, 42),
+    Color32::from_rgb(174, 86, 166),
+    Color32::from_rgb(35, 148, 161),
+    Color32::from_rgb(130, 103, 54),
+];
 
 const STROKE_COLORS: [Color32; 7] = [
     Color32::from_rgb(31, 31, 31),
@@ -119,6 +141,8 @@ pub(crate) struct WorkspaceUi {
     settings_baseline: Option<SettingsBaseline>,
     settings_restore_baseline: Option<bool>,
     new_document_confirmation: bool,
+    open_document_confirmation: bool,
+    pending_open_document: Option<(PathBuf, Editor)>,
     restore_session: bool,
     autosave_interval: AutosaveInterval,
     autosave_directory: String,
@@ -138,6 +162,11 @@ pub(crate) struct WorkspaceUi {
     update_receiver: Option<Receiver<Result<UpdateCache, String>>>,
     capturing_keybind: Option<KeybindAction>,
     status: String,
+    collaboration_popup: Option<CollaborationPopup>,
+    collaboration_display_name: String,
+    collaboration_invite: String,
+    collaboration_endpoint: String,
+    collaboration_certificate_sha256: String,
     selected: BTreeSet<ElementId>,
     element_clipboard: Vec<Element>,
     selection_gesture: Option<SelectionGesture>,
@@ -202,6 +231,36 @@ struct TextEditState {
     cursor: usize,
     style: Style,
     just_started: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CollaborationPopup {
+    Create,
+    Join,
+}
+
+/// User action requested by the collaboration controls.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CollaborationAction {
+    /// No collaboration action was selected this frame.
+    None,
+    /// Create a room on the local supervised server.
+    Create {
+        /// Display name advertised to collaborators.
+        display_name: String,
+    },
+    /// Join a room using the entered room ID and capability token.
+    Join {
+        /// Room ID text entered by the user.
+        /// Combined room ID and capability token copied from a room creator.
+        invite_token: String,
+        /// Display name advertised to collaborators.
+        display_name: String,
+        /// Optional server endpoint from a shared invite.
+        endpoint: String,
+        /// Optional certificate pin from a shared invite.
+        certificate_sha256: String,
+    },
 }
 
 struct DropPreview {
@@ -725,6 +784,8 @@ impl Default for WorkspaceUi {
             settings_baseline: None,
             settings_restore_baseline: None,
             new_document_confirmation: false,
+            open_document_confirmation: false,
+            pending_open_document: None,
             restore_session: true,
             autosave_interval: AutosaveInterval::OneMinute,
             autosave_directory: settings::Settings::default().autosave_directory,
@@ -752,6 +813,11 @@ impl Default for WorkspaceUi {
             update_receiver: None,
             capturing_keybind: None,
             status: String::from("Select a tool to start drawing"),
+            collaboration_popup: None,
+            collaboration_display_name: String::from("Sketchi user"),
+            collaboration_invite: String::new(),
+            collaboration_endpoint: String::new(),
+            collaboration_certificate_sha256: String::new(),
             selected: BTreeSet::new(),
             element_clipboard: Vec::new(),
             selection_gesture: None,
@@ -1166,7 +1232,8 @@ impl WorkspaceUi {
         editor: &mut Editor,
         tools: &mut ToolController,
         camera: &mut Camera,
-    ) {
+        collaboration: &CollaborationView,
+    ) -> CollaborationAction {
         self.preview_worker.set_repaint_context(context);
         tools.set_input_settings(self.stabilization, self.pressure_sensitivity);
         if self.appearance == AppearanceMode::System {
@@ -1175,15 +1242,16 @@ impl WorkspaceUi {
         context.set_visuals(sketchi_visuals(self.dark_mode));
 
         self.handle_keybind_input(context, editor, tools);
-        self.show_canvas(context, editor, tools, camera);
+        self.show_canvas(context, editor, tools, camera, &collaboration.presence);
         self.show_text_editor(context, editor, camera);
-        self.show_file_actions(context, editor);
+        let collaboration_action = self.show_file_actions(context, editor, collaboration);
         self.show_tool_palette(context, tools);
         self.show_history(context, editor);
         self.show_properties(context, editor);
         self.show_color_picker(context, editor);
         self.show_zoom_controls(context, camera);
         self.show_status(context, editor, camera);
+        collaboration_action
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1193,6 +1261,7 @@ impl WorkspaceUi {
         editor: &mut Editor,
         tools: &mut ToolController,
         camera: &mut Camera,
+        remote_presence: &[PresenceState],
     ) {
         let canvas_color = if self.dark_mode {
             self.dark_canvas_color
@@ -1308,6 +1377,14 @@ impl WorkspaceUi {
                         .collect::<Vec<_>>();
                     paint_selection(&painter, &elements, *camera, self.dark_mode);
                 }
+                paint_remote_presence(
+                    &painter,
+                    document,
+                    remote_presence,
+                    *camera,
+                    editor.client_id(),
+                    self.dark_mode,
+                );
                 if let Some(hovered_id) = hovered_element
                     && !self.selected.contains(&hovered_id)
                     && let Some(element) = document.element(hovered_id)
@@ -1320,6 +1397,31 @@ impl WorkspaceUi {
                     paint_marquee(&painter, *start, *current, *camera);
                 }
             });
+    }
+
+    /// Builds the current local ephemeral cursor, selection, and tool state.
+    pub(crate) fn local_presence(
+        &self,
+        context: &egui::Context,
+        camera: Camera,
+        client_id: ClientId,
+    ) -> PresenceState {
+        let cursor = context
+            .input(|input| input.pointer.hover_pos())
+            .and_then(|position| {
+                let viewport = camera.viewport();
+                (position.x >= 0.0
+                    && position.y >= 0.0
+                    && position.x <= viewport.width
+                    && position.y <= viewport.height)
+                    .then(|| camera.screen_to_world(Point::new(position.x, position.y)))
+            });
+        PresenceState {
+            client_id,
+            cursor,
+            selected_elements: self.selected.iter().copied().collect(),
+            active_tool: presence_tool_kind(self.active_tool),
+        }
     }
 
     fn prepare_drop_preview(&mut self, context: &egui::Context) {
@@ -2589,7 +2691,7 @@ impl WorkspaceUi {
         editor: &mut Editor,
         tools: &mut ToolController,
     ) {
-        if self.new_document_confirmation {
+        if self.new_document_confirmation || self.open_document_confirmation {
             return;
         }
         if self.text_edit.is_some() {
@@ -2770,6 +2872,60 @@ impl WorkspaceUi {
         }
     }
 
+    fn request_open_document(&mut self, editor: &mut Editor) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Open Sketchi document")
+            .add_filter("Sketchi JSON document", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        let restored = match Self::load_editor_from_path(editor.client_id(), &path) {
+            Ok(restored) => restored,
+            Err(error) => {
+                self.status = format!("Could not open document: {error}");
+                return;
+            }
+        };
+        if editor.document().is_empty() {
+            self.replace_editor(editor, &path, restored);
+        } else {
+            self.pending_open_document = Some((path, restored));
+            self.open_document_confirmation = true;
+        }
+    }
+
+    #[cfg(test)]
+    fn open_document(&mut self, editor: &mut Editor, path: &Path) -> bool {
+        let restored = match Self::load_editor_from_path(editor.client_id(), path) {
+            Ok(restored) => restored,
+            Err(error) => {
+                self.status = format!("Could not open document: {error}");
+                return false;
+            }
+        };
+        self.replace_editor(editor, path, restored);
+        true
+    }
+
+    fn load_editor_from_path(
+        client_id: canvas_core::ClientId,
+        path: &Path,
+    ) -> Result<Editor, String> {
+        let document =
+            crate::storage::load_document_from_path(path).map_err(|error| error.to_string())?;
+        Editor::from_document(client_id, &document).map_err(|error| error.to_string())
+    }
+
+    fn replace_editor(&mut self, editor: &mut Editor, path: &Path, restored: Editor) {
+        *editor = restored;
+        self.selected.clear();
+        self.selection_gesture = None;
+        self.text_edit = None;
+        self.status = format!("Opened {}", path.display());
+    }
+
     fn show_new_document_confirmation(&mut self, context: &egui::Context, editor: &mut Editor) {
         if !self.new_document_confirmation {
             return;
@@ -2842,6 +2998,84 @@ impl WorkspaceUi {
         }
     }
 
+    fn show_open_document_confirmation(&mut self, context: &egui::Context, editor: &mut Editor) {
+        if !self.open_document_confirmation {
+            return;
+        }
+
+        if context.input(|input| input.key_pressed(Key::Escape)) {
+            self.open_document_confirmation = false;
+            self.pending_open_document = None;
+            return;
+        }
+
+        let mut decision = None;
+        egui::Area::new(Id::new("sketchi.open_document_confirmation"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(context, |ui| {
+                confirmation_frame(self.dark_mode).show(ui, |ui| {
+                    ui.set_width(360.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("Open another whiteboard?")
+                                .size(18.0)
+                                .strong()
+                                .color(text_color(self.dark_mode)),
+                        );
+                    });
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("Your current work will be saved locally first.")
+                            .color(muted_color(self.dark_mode)),
+                    );
+                    ui.add_space(16.0);
+                    let button_width = ((ui.available_width() - 10.0) / 2.0).max(1.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        if button(
+                            ui,
+                            "Cancel",
+                            Vec2::new(button_width, STANDARD_CONTROL_SIZE.y),
+                            if self.dark_mode {
+                                Color32::from_rgb(52, 54, 62)
+                            } else {
+                                Color32::from_rgb(245, 246, 249)
+                            },
+                        )
+                        .clicked()
+                        {
+                            decision = Some(false);
+                        }
+                        if button(
+                            ui,
+                            egui::RichText::new("Save & open").color(Color32::WHITE),
+                            Vec2::new(button_width, STANDARD_CONTROL_SIZE.y),
+                            ACCENT,
+                        )
+                        .clicked()
+                        {
+                            decision = Some(true);
+                        }
+                    });
+                });
+            });
+
+        if let Some(save_and_open) = decision {
+            if !save_and_open {
+                self.open_document_confirmation = false;
+                self.pending_open_document = None;
+            } else if self.save_document(editor)
+                && let Some((path, restored)) = self.pending_open_document.take()
+            {
+                self.open_document_confirmation = false;
+                self.replace_editor(editor, &path, restored);
+            }
+        }
+    }
+
     fn choose_tool(&mut self, tool: Tool, tools: &mut ToolController) {
         self.active_tool = tool;
         self.selected.clear();
@@ -2853,8 +3087,14 @@ impl WorkspaceUi {
         self.status = format!("{} tool selected", tool_name(tool));
     }
 
-    fn show_file_actions(&mut self, context: &egui::Context, editor: &mut Editor) {
+    fn show_file_actions(
+        &mut self,
+        context: &egui::Context,
+        editor: &mut Editor,
+        collaboration: &CollaborationView,
+    ) -> CollaborationAction {
         let mut new_requested = false;
+        let mut open_requested = false;
         let mut save_requested = false;
         let mut settings_requested = false;
         egui::Area::new(Id::new("sketchi.file_actions"))
@@ -2879,6 +3119,17 @@ impl WorkspaceUi {
                         {
                             save_requested = true;
                         }
+                        if icon_button(
+                            ui,
+                            Icon::Import,
+                            "Open JSON document",
+                            false,
+                            self.dark_mode,
+                        )
+                        .clicked()
+                        {
+                            open_requested = true;
+                        }
                         if icon_button(ui, Icon::New, "New whiteboard", false, self.dark_mode)
                             .clicked()
                         {
@@ -2894,10 +3145,275 @@ impl WorkspaceUi {
         if save_requested {
             self.save_document(editor);
         }
+        if open_requested {
+            self.request_open_document(editor);
+        }
         if settings_requested {
             self.toggle_settings();
         }
         self.show_new_document_confirmation(context, editor);
+        self.show_open_document_confirmation(context, editor);
+        self.show_collaboration_controls(context, collaboration)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn show_collaboration_controls(
+        &mut self,
+        context: &egui::Context,
+        collaboration: &CollaborationView,
+    ) -> CollaborationAction {
+        let mut action = CollaborationAction::None;
+        let room_id = collaboration.room_id.clone();
+        let capability_token = collaboration.capability_token.clone();
+        let endpoint = collaboration.endpoint.clone();
+        let certificate_sha256 = collaboration.certificate_sha256.clone();
+        let display_name_valid =
+            collaboration_display_name_is_valid(&self.collaboration_display_name);
+        let toolbar_response = egui::Area::new(Id::new("sketchi.collaboration_controls"))
+            .anchor(Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
+            .order(egui::Order::Foreground)
+            .show(context, |ui| {
+                toolbar_frame(self.dark_mode).show(ui, |ui| {
+                    ui.with_layout(Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        collaboration_participant_avatar_stack(
+                            ui,
+                            &collaboration.participants,
+                            self.dark_mode,
+                        );
+                        if !collaboration.participants.is_empty() {
+                            ui.separator();
+                        }
+                        if icon_button(
+                            ui,
+                            Icon::Router,
+                            "Create collaboration room",
+                            self.collaboration_popup == Some(CollaborationPopup::Create),
+                            self.dark_mode,
+                        )
+                        .clicked()
+                        {
+                            self.collaboration_popup = match self.collaboration_popup {
+                                Some(CollaborationPopup::Create) => None,
+                                _ => Some(CollaborationPopup::Create),
+                            };
+                        }
+                        if icon_button(
+                            ui,
+                            Icon::Connector,
+                            "Join collaboration room",
+                            self.collaboration_popup == Some(CollaborationPopup::Join),
+                            self.dark_mode,
+                        )
+                        .clicked()
+                        {
+                            self.collaboration_popup = match self.collaboration_popup {
+                                Some(CollaborationPopup::Join) => None,
+                                _ => Some(CollaborationPopup::Join),
+                            };
+                        }
+                    });
+                })
+            });
+        let toolbar_rect = toolbar_response.inner.response.rect;
+
+        let Some(popup) = self.collaboration_popup else {
+            return action;
+        };
+        let has_custom_endpoint = !self.collaboration_endpoint.trim().is_empty()
+            || !self.collaboration_certificate_sha256.trim().is_empty();
+        let popup_response = egui::Area::new(Id::new("sketchi.collaboration_popup"))
+            .anchor(Align2::RIGHT_TOP, egui::vec2(-16.0, 76.0))
+            .order(egui::Order::Foreground)
+            .show(context, |ui| {
+                collaboration_popover_frame(self.dark_mode).show(ui, |ui| {
+                    ui.set_min_width(304.0);
+                    collaboration_popup_scope(ui, self.dark_mode, |ui| {
+                        ui.spacing_mut().item_spacing.y = 8.0;
+                        let title = match popup {
+                            CollaborationPopup::Create => "Create room",
+                            CollaborationPopup::Join => "Join room",
+                        };
+                        ui.label(
+                            egui::RichText::new(title)
+                                .size(16.0)
+                                .strong()
+                                .color(text_color(self.dark_mode)),
+                        );
+                        match popup {
+                            CollaborationPopup::Create => {
+                                collaboration_description(
+                                    ui,
+                                    "Choose the name others will see.",
+                                    self.dark_mode,
+                                );
+                                collaboration_text_field(
+                                    ui,
+                                    &mut self.collaboration_display_name,
+                                    "Your display name",
+                                    self.dark_mode,
+                                );
+                                if !display_name_valid && room_id.is_none() {
+                                    collaboration_required_name_message(ui, self.dark_mode);
+                                }
+                                if let (Some(room_id), Some(token)) = (&room_id, &capability_token)
+                                {
+                                    ui.separator();
+                                    collaboration_description(
+                                        ui,
+                                        "Share this invite with collaborators.",
+                                        self.dark_mode,
+                                    );
+                                    let mut invite = format_room_invite(
+                                        room_id,
+                                        token,
+                                        &ReadyMessage {
+                                            endpoint: endpoint.clone().unwrap_or_default(),
+                                            certificate_sha256: certificate_sha256
+                                                .clone()
+                                                .unwrap_or_default(),
+                                        },
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.add_sized(
+                                            Vec2::new(226.0, STANDARD_CONTROL_SIZE.y),
+                                            egui::TextEdit::singleline(&mut invite)
+                                                .interactive(false)
+                                                .margin(Margin::symmetric(8, 0)),
+                                        );
+                                        if collaboration_secondary_button(
+                                            ui,
+                                            "Copy",
+                                            self.dark_mode,
+                                        )
+                                        .clicked()
+                                        {
+                                            context.copy_text(invite);
+                                        }
+                                    });
+                                    if let Some(endpoint) = &endpoint {
+                                        ui.small(
+                                            egui::RichText::new(endpoint)
+                                                .color(muted_color(self.dark_mode)),
+                                        );
+                                    }
+                                    if let Some(pin) = &certificate_sha256 {
+                                        ui.collapsing("Advanced connection details", |ui| {
+                                            ui.small(
+                                                egui::RichText::new(pin)
+                                                    .color(muted_color(self.dark_mode)),
+                                            );
+                                        });
+                                    }
+                                } else if ui
+                                    .add_enabled_ui(
+                                        collaboration.server_available && display_name_valid,
+                                        |ui| collaboration_primary_button(ui, "Create room"),
+                                    )
+                                    .inner
+                                    .clicked()
+                                {
+                                    action = CollaborationAction::Create {
+                                        display_name: self
+                                            .collaboration_display_name
+                                            .trim()
+                                            .to_owned(),
+                                    };
+                                }
+                            }
+                            CollaborationPopup::Join => {
+                                collaboration_description(
+                                    ui,
+                                    "Use the invite copied by the room creator.",
+                                    self.dark_mode,
+                                );
+                                collaboration_text_field(
+                                    ui,
+                                    &mut self.collaboration_display_name,
+                                    "Your display name",
+                                    self.dark_mode,
+                                );
+                                if !display_name_valid {
+                                    collaboration_required_name_message(ui, self.dark_mode);
+                                }
+                                collaboration_text_field(
+                                    ui,
+                                    &mut self.collaboration_invite,
+                                    "Paste room invite token",
+                                    self.dark_mode,
+                                );
+                                egui::CollapsingHeader::new("Advanced")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        collaboration_text_field(
+                                            ui,
+                                            &mut self.collaboration_endpoint,
+                                            "wss:// endpoint (optional)",
+                                            self.dark_mode,
+                                        );
+                                        collaboration_text_field(
+                                            ui,
+                                            &mut self.collaboration_certificate_sha256,
+                                            "Certificate SHA-256 pin (optional)",
+                                            self.dark_mode,
+                                        );
+                                    });
+                                if ui
+                                    .add_enabled_ui(
+                                        (collaboration.server_available || has_custom_endpoint)
+                                            && display_name_valid,
+                                        |ui| collaboration_primary_button(ui, "Join room"),
+                                    )
+                                    .inner
+                                    .clicked()
+                                {
+                                    action = CollaborationAction::Join {
+                                        invite_token: self.collaboration_invite.trim().to_owned(),
+                                        display_name: self
+                                            .collaboration_display_name
+                                            .trim()
+                                            .to_owned(),
+                                        endpoint: self.collaboration_endpoint.trim().to_owned(),
+                                        certificate_sha256: self
+                                            .collaboration_certificate_sha256
+                                            .trim()
+                                            .to_owned(),
+                                    };
+                                }
+                            }
+                        }
+                        if !collaboration.status.is_empty() {
+                            ui.separator();
+                            ui.small(
+                                egui::RichText::new(&collaboration.status)
+                                    .color(muted_color(self.dark_mode)),
+                            );
+                        }
+                        if !collaboration.server_available && popup == CollaborationPopup::Create {
+                            ui.label(
+                                egui::RichText::new(
+                                    "The local collaboration server is unavailable.",
+                                )
+                                .size(11.0)
+                                .color(Color32::from_rgb(220, 80, 80)),
+                            );
+                        }
+                    });
+                })
+            });
+        let popup_rect = popup_response.inner.response.rect;
+        let outside_click = context.input(|input| {
+            collaboration_popup_should_dismiss(
+                input.pointer.button_pressed(PointerButton::Primary),
+                input.pointer.interact_pos(),
+                toolbar_rect,
+                popup_rect,
+            )
+        });
+        if outside_click {
+            self.collaboration_popup = None;
+        }
+        action
     }
 
     fn save_document(&mut self, editor: &Editor) -> bool {
@@ -3353,6 +3869,10 @@ impl WorkspaceUi {
                             } else {
                                 "Release"
                             };
+                            settings_group_frame(self.dark_mode).show(ui, |ui| {
+                                show_mossbyte_agency_credit(ui, context, self.dark_mode);
+                            });
+                            ui.add_space(12.0);
                             settings_group_frame(self.dark_mode).show(ui, |ui| {
                                 ui.label(
                                     egui::RichText::new("Sketchi")
@@ -4938,6 +5458,93 @@ fn settings_group_frame(dark_mode: bool) -> egui::Frame {
         .inner_margin(Margin::same(8))
 }
 
+fn show_mossbyte_agency_credit(ui: &mut egui::Ui, context: &egui::Context, dark_mode: bool) {
+    let available_width = ui.available_width();
+    ui.set_width(available_width);
+    let (horizontal, copy_width, button_width) = mossbyte_agency_credit_layout(available_width);
+    if !horizontal {
+        ui.vertical(|ui| {
+            mossbyte_agency_credit_copy(ui, dark_mode);
+            ui.add_space(12.0);
+            if mossbyte_agency_visit_button(ui, dark_mode, button_width).clicked() {
+                context.open_url(egui::OpenUrl::new_tab(MOSSBYTE_AGENCY_URL));
+            }
+        });
+        return;
+    }
+
+    ui.allocate_ui_with_layout(
+        Vec2::new(available_width, MOSSBYTE_AGENCY_ROW_HEIGHT),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            let visit_clicked = mossbyte_agency_visit_button(ui, dark_mode, button_width).clicked();
+            ui.add_space(MOSSBYTE_AGENCY_ROW_GAP);
+            ui.allocate_ui_with_layout(
+                Vec2::new(copy_width, MOSSBYTE_AGENCY_ROW_HEIGHT),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| mossbyte_agency_credit_copy(ui, dark_mode),
+            );
+            if visit_clicked {
+                context.open_url(egui::OpenUrl::new_tab(MOSSBYTE_AGENCY_URL));
+            }
+        },
+    );
+}
+
+fn mossbyte_agency_credit_layout(available_width: f32) -> (bool, f32, f32) {
+    let available_width = available_width.max(1.0);
+    let horizontal_width =
+        MOSSBYTE_AGENCY_BUTTON_WIDTH + MOSSBYTE_AGENCY_ROW_GAP + MOSSBYTE_AGENCY_COPY_MIN_WIDTH;
+    if available_width < horizontal_width {
+        (false, 0.0, available_width)
+    } else {
+        (
+            true,
+            available_width - MOSSBYTE_AGENCY_BUTTON_WIDTH - MOSSBYTE_AGENCY_ROW_GAP,
+            MOSSBYTE_AGENCY_BUTTON_WIDTH,
+        )
+    }
+}
+
+fn mossbyte_agency_credit_copy(ui: &mut egui::Ui, dark_mode: bool) {
+    ui.label(
+        egui::RichText::new("CREATED BY")
+            .size(11.0)
+            .strong()
+            .color(muted_color(dark_mode)),
+    );
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new("MossByte Agency")
+            .size(20.0)
+            .strong()
+            .color(text_color(dark_mode)),
+    );
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("The independent agency behind Sketchi.").color(muted_color(dark_mode)),
+    );
+}
+
+fn mossbyte_agency_visit_button(ui: &mut egui::Ui, dark_mode: bool, width: f32) -> egui::Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(10.0, 4.0);
+        ui.add_sized(
+            Vec2::new(width, STANDARD_CONTROL_SIZE.y),
+            egui::Button::new(egui::RichText::new("Visit website ↗").color(text_color(dark_mode)))
+                .fill(if dark_mode {
+                    SETTINGS_CONTROL_DARK
+                } else {
+                    Color32::from_rgb(245, 246, 249)
+                })
+                .corner_radius(CornerRadius::same(SETTINGS_CONTROL_RADIUS))
+                .wrap_mode(egui::TextWrapMode::Truncate),
+        )
+    })
+    .inner
+    .on_hover_text("Open mossbyteagency.com")
+}
+
 fn settings_sidebar_divider(ui: &mut egui::Ui, height: f32, dark_mode: bool) {
     let divider_height = (height - 2.0 * SETTINGS_DIVIDER_INSET).max(0.0);
     ui.allocate_ui_with_layout(
@@ -5367,6 +5974,337 @@ fn key_binding_label(binding: KeyBinding) -> String {
 
 fn keybind_action_name(action: KeybindAction) -> &'static str {
     action.label()
+}
+
+fn collaboration_popover_frame(dark_mode: bool) -> egui::Frame {
+    egui::Frame::new()
+        .fill(if dark_mode {
+            SETTINGS_CARD_DARK
+        } else {
+            LIGHT_PANEL
+        })
+        .stroke(Stroke::new(
+            1.0_f32,
+            if dark_mode {
+                SETTINGS_CARD_BORDER_DARK
+            } else {
+                SETTINGS_CARD_BORDER_LIGHT
+            },
+        ))
+        .corner_radius(CornerRadius::same(SETTINGS_CONTROL_RADIUS))
+        .inner_margin(Margin::symmetric(12, 12))
+        .shadow(egui::Shadow {
+            offset: [0, 4],
+            blur: 16,
+            spread: 1,
+            color: Color32::from_rgba_unmultiplied(0, 0, 0, if dark_mode { 72 } else { 32 }),
+        })
+}
+
+fn collaboration_popup_scope(
+    ui: &mut egui::Ui,
+    dark_mode: bool,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    ui.scope(|ui| {
+        let input_fill = if dark_mode {
+            SETTINGS_CONTROL_DARK
+        } else {
+            Color32::from_rgb(248, 249, 251)
+        };
+        let input_border = if dark_mode {
+            SETTINGS_CARD_BORDER_DARK
+        } else {
+            SETTINGS_CARD_BORDER_LIGHT
+        };
+        let visuals = ui.visuals_mut();
+        visuals.override_text_color = Some(text_color(dark_mode));
+        visuals.weak_text_color = Some(muted_color(dark_mode));
+        visuals.hyperlink_color = ACCENT;
+        visuals.text_edit_bg_color = Some(input_fill);
+        visuals.widgets.inactive.bg_fill = input_fill;
+        visuals.widgets.inactive.weak_bg_fill = input_fill;
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, input_border);
+        add_contents(ui);
+    });
+}
+
+fn collaboration_popup_should_dismiss(
+    primary_pressed: bool,
+    pointer_position: Option<Pos2>,
+    toolbar_rect: Rect,
+    popup_rect: Rect,
+) -> bool {
+    primary_pressed
+        && pointer_position.is_some_and(|position| {
+            !toolbar_rect.contains(position) && !popup_rect.contains(position)
+        })
+}
+
+fn collaboration_description(ui: &mut egui::Ui, text: &str, dark_mode: bool) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(11.0)
+            .color(muted_color(dark_mode)),
+    );
+}
+
+fn collaboration_required_name_message(ui: &mut egui::Ui, dark_mode: bool) {
+    ui.small(
+        egui::RichText::new("A display name is required.").color(if dark_mode {
+            Color32::from_rgb(240, 107, 107)
+        } else {
+            Color32::from_rgb(190, 45, 45)
+        }),
+    );
+}
+
+fn collaboration_display_name_is_valid(name: &str) -> bool {
+    !name.trim().is_empty()
+}
+
+fn collaboration_text_field(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    hint: &str,
+    dark_mode: bool,
+) -> egui::Response {
+    let fill = if dark_mode {
+        SETTINGS_CONTROL_DARK
+    } else {
+        Color32::from_rgb(248, 249, 251)
+    };
+    let border = if dark_mode {
+        SETTINGS_CARD_BORDER_DARK
+    } else {
+        SETTINGS_CARD_BORDER_LIGHT
+    };
+    let hover = if dark_mode {
+        SETTINGS_CONTROL_HOVER_DARK
+    } else {
+        Color32::from_rgb(242, 243, 247)
+    };
+    ui.scope(|ui| {
+        let visuals = ui.visuals_mut();
+        visuals.text_edit_bg_color = Some(fill);
+        visuals.widgets.inactive.bg_fill = fill;
+        visuals.widgets.inactive.weak_bg_fill = fill;
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, border);
+        visuals.widgets.hovered.bg_fill = hover;
+        visuals.widgets.hovered.weak_bg_fill = hover;
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+        visuals.widgets.active.bg_fill = fill;
+        visuals.widgets.active.weak_bg_fill = fill;
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+        sized_text_field(
+            ui,
+            value,
+            Vec2::new(ui.available_width(), STANDARD_CONTROL_SIZE.y),
+            hint,
+        )
+    })
+    .inner
+}
+
+fn collaboration_primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.scope(|ui| {
+        let visuals = ui.visuals_mut();
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+        ui.add_sized(
+            Vec2::new(ui.available_width(), STANDARD_CONTROL_SIZE.y),
+            egui::Button::new(label)
+                .fill(ACCENT)
+                .stroke(Stroke::new(1.0_f32, ACCENT))
+                .corner_radius(CornerRadius::same(SETTINGS_CONTROL_RADIUS)),
+        )
+    })
+    .inner
+}
+
+fn collaboration_secondary_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    dark_mode: bool,
+) -> egui::Response {
+    let fill = if dark_mode {
+        SETTINGS_CONTROL_DARK
+    } else {
+        Color32::from_rgb(248, 249, 251)
+    };
+    let border = if dark_mode {
+        SETTINGS_CARD_BORDER_DARK
+    } else {
+        SETTINGS_CARD_BORDER_LIGHT
+    };
+    ui.add_sized(
+        Vec2::new(64.0, STANDARD_CONTROL_SIZE.y),
+        egui::Button::new(label)
+            .fill(fill)
+            .stroke(Stroke::new(1.0_f32, border))
+            .corner_radius(CornerRadius::same(SETTINGS_CONTROL_RADIUS)),
+    )
+}
+
+fn collaboration_participant_avatar_stack(
+    ui: &mut egui::Ui,
+    participants: &[canvas_protocol::Participant],
+    dark_mode: bool,
+) -> egui::Response {
+    let participants = participants
+        .get(..participants.len().min(COLLABORATION_MAX_PARTICIPANTS))
+        .unwrap_or(participants);
+    if participants.is_empty() {
+        return ui.allocate_exact_size(Vec2::ZERO, Sense::hover()).1;
+    }
+    let stack_width = collaboration_avatar_stack_width(participants.len());
+    let (stack_rect, stack_response) = ui.allocate_exact_size(
+        Vec2::new(stack_width, COLLABORATION_AVATAR_SIZE),
+        Sense::hover(),
+    );
+    let avatar_colors = collaboration_participant_avatar_colors(participants);
+
+    for (index, (participant, avatar_color)) in participants
+        .iter()
+        .zip(avatar_colors.iter())
+        .enumerate()
+        .rev()
+    {
+        let name = participant.name.trim();
+        let center = Pos2::new(
+            collaboration_avatar_center_x(stack_rect.left(), index),
+            stack_rect.center().y,
+        );
+        let avatar_rect = Rect::from_center_size(center, Vec2::splat(COLLABORATION_AVATAR_SIZE));
+        let response = ui.interact(
+            avatar_rect,
+            Id::new("sketchi.collaboration.participant").with(participant.client_id),
+            Sense::hover(),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), name)
+        });
+        let _response = response.on_hover_text(name);
+        ui.painter()
+            .circle_filled(center, COLLABORATION_AVATAR_SIZE / 2.0, *avatar_color);
+        ui.painter().circle_stroke(
+            center,
+            COLLABORATION_AVATAR_SIZE / 2.0,
+            Stroke::new(
+                1.5_f32,
+                if dark_mode {
+                    DARK_PANEL
+                } else {
+                    Color32::WHITE
+                },
+            ),
+        );
+        ui.painter().text(
+            center,
+            Align2::CENTER_CENTER,
+            collaboration_participant_initial(name),
+            FontId::proportional(11.0),
+            Color32::WHITE,
+        );
+    }
+
+    stack_response
+}
+
+fn collaboration_avatar_stack_width(participant_count: usize) -> f32 {
+    let participant_count = participant_count.min(COLLABORATION_MAX_PARTICIPANTS);
+    match participant_count {
+        0 => 0.0,
+        count => {
+            let overlap_count = u8::try_from(
+                count
+                    .saturating_sub(1)
+                    .min(COLLABORATION_MAX_PARTICIPANTS.saturating_sub(1)),
+            )
+            .unwrap_or_default();
+            COLLABORATION_AVATAR_SIZE
+                + f32::from(overlap_count)
+                    * (COLLABORATION_AVATAR_SIZE - COLLABORATION_AVATAR_OVERLAP)
+        }
+    }
+}
+
+fn collaboration_avatar_center_x(stack_left: f32, index: usize) -> f32 {
+    let index = u8::try_from(index.min(COLLABORATION_MAX_PARTICIPANTS.saturating_sub(1)))
+        .unwrap_or_default();
+    stack_left
+        + (COLLABORATION_AVATAR_SIZE / 2.0)
+        + f32::from(index) * (COLLABORATION_AVATAR_SIZE - COLLABORATION_AVATAR_OVERLAP)
+}
+
+fn collaboration_participant_initial(name: &str) -> String {
+    let initials: String = name
+        .trim()
+        .chars()
+        .next()
+        .map(|character| character.to_uppercase().collect())
+        .unwrap_or_default();
+
+    if initials.is_empty() {
+        "?".to_owned()
+    } else {
+        initials
+    }
+}
+
+fn collaboration_participant_avatar_colors(
+    participants: &[canvas_protocol::Participant],
+) -> Vec<Color32> {
+    let mut sorted_participants = participants.iter().enumerate().collect::<Vec<_>>();
+    sorted_participants.sort_unstable_by_key(|(_, participant)| participant.client_id);
+
+    let mut colors = vec![Color32::TRANSPARENT; participants.len()];
+    let mut used_colors = Vec::with_capacity(participants.len());
+    for (index, participant) in sorted_participants {
+        let color = collaboration_participant_avatar_color(
+            participant.client_id,
+            &participant.name,
+            &used_colors,
+        );
+        used_colors.push(color);
+        if let Some(slot) = colors.get_mut(index) {
+            *slot = color;
+        }
+    }
+    colors
+}
+
+fn collaboration_participant_avatar_color(
+    client_id: canvas_core::ClientId,
+    name: &str,
+    used_colors: &[Color32],
+) -> Color32 {
+    let mut hash = 2_166_136_261_u32;
+    for byte in client_id.as_uuid().as_u128().to_le_bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    for byte in name.trim().as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(16_777_619);
+    }
+    let start = usize::try_from(hash).unwrap_or_default() % COLLABORATION_AVATAR_COLORS.len();
+    for offset in 0..COLLABORATION_AVATAR_COLORS.len() {
+        let Some(color) = COLLABORATION_AVATAR_COLORS
+            .get((start + offset) % COLLABORATION_AVATAR_COLORS.len())
+            .copied()
+        else {
+            continue;
+        };
+        if !used_colors.contains(&color) {
+            return color;
+        }
+    }
+    COLLABORATION_AVATAR_COLORS
+        .get(start)
+        .copied()
+        .unwrap_or_default()
 }
 
 fn toolbar_frame(dark_mode: bool) -> egui::Frame {
@@ -6971,6 +7909,66 @@ fn paint_selection(painter: &Painter, elements: &[&Element], camera: Camera, dar
     }
 }
 
+fn presence_tool_kind(tool: Tool) -> ToolKind {
+    match tool {
+        Tool::Select | Tool::Text => ToolKind::Select,
+        Tool::Rectangle | Tool::Diamond => ToolKind::Rectangle,
+        Tool::Triangle => ToolKind::Triangle,
+        Tool::Ellipse => ToolKind::Ellipse,
+        Tool::Line => ToolKind::Line,
+        Tool::Arrow => ToolKind::Arrow,
+        Tool::Freehand => ToolKind::Freehand,
+        Tool::Pan => ToolKind::Pan,
+    }
+}
+
+fn paint_remote_presence(
+    painter: &Painter,
+    document: &Document,
+    presence: &[PresenceState],
+    camera: Camera,
+    local_client_id: ClientId,
+    dark_mode: bool,
+) {
+    let mut used_colors = Vec::new();
+    for state in presence {
+        if state.client_id == local_client_id {
+            continue;
+        }
+        let color =
+            collaboration_participant_avatar_color(state.client_id, "participant", &used_colors);
+        used_colors.push(color);
+        for element_id in &state.selected_elements {
+            if let Some(element) = document.element(*element_id) {
+                let rect = world_rect_to_screen(element_bounds(element), camera);
+                painter.rect_stroke(
+                    rect,
+                    CornerRadius::same(3),
+                    Stroke::new(1.5_f32, color),
+                    StrokeKind::Outside,
+                );
+            }
+        }
+        if let Some(cursor) = state.cursor {
+            let screen = camera.world_to_screen(cursor);
+            let position = Pos2::new(screen.x, screen.y);
+            painter.circle_filled(position, 5.0, color);
+            painter.circle_stroke(
+                position,
+                7.0,
+                Stroke::new(
+                    1.0_f32,
+                    if dark_mode {
+                        Color32::WHITE
+                    } else {
+                        Color32::BLACK
+                    },
+                ),
+            );
+        }
+    }
+}
+
 fn selection_handle_fill(dark_mode: bool) -> Color32 {
     if dark_mode { DARK_CANVAS } else { LIGHT_CANVAS }
 }
@@ -7362,18 +8360,24 @@ mod tests {
     use super::{
         CONTROL_CORNER_RADIUS, ColorPickerTarget, CustomFontSizeState, DARK_BORDER, ElementAction,
         KeyBinding, KeybindAction, Keybinds, LIGHT_BORDER, LIGHT_CANVAS, LIGHT_MUTED, LayerAction,
-        PreparedImage, SETTINGS_CARD_BORDER_DARK, SETTINGS_CARD_DARK, SETTINGS_CONTROL_DARK,
+        MOSSBYTE_AGENCY_BUTTON_WIDTH, MOSSBYTE_AGENCY_ROW_GAP, MOSSBYTE_AGENCY_URL, PreparedImage,
+        SETTINGS_CARD_BORDER_DARK, SETTINGS_CARD_DARK, SETTINGS_CONTROL_DARK,
         SETTINGS_CONTROL_RADIUS, SETTINGS_ROOT_DARK, SETTINGS_ROOT_RADIUS, STROKE_COLORS,
-        WorkspaceUi, apply_text_resize_font_size, char_cursor_to_byte_index, color_picker_patch,
+        WorkspaceUi, apply_text_resize_font_size, char_cursor_to_byte_index,
+        collaboration_avatar_center_x, collaboration_avatar_stack_width,
+        collaboration_display_name_is_valid, collaboration_participant_avatar_colors,
+        collaboration_participant_initial, collaboration_popup_should_dismiss,
+        collaboration_primary_button, collaboration_text_field, color_picker_patch,
         confirmation_frame, custom_font_size_selected, delete_previous_word, fill_choice_patch,
-        grid_step_for_zoom, insert_text_at_cursor, key_binding_label, next_char_cursor,
-        next_word_cursor, next_z_index, padded_selection_bounds, platform_label,
-        preset_font_size_selected, previous_char_cursor, previous_word_cursor, reordered_layer_ids,
-        resolve_drop_screen_position, rotated_text_origin, selection_drag_position,
-        selection_handle_cursor_tolerance, selection_handle_drag_tolerance, settings_group_frame,
-        settings_keybind_card_frame, settings_visuals, settings_window_frame, sloppiness_amplitude,
-        sloppy_polyline, text_create_command, text_update_command, to_core_color,
-        zoom_delta_for_scroll, zoom_percent,
+        grid_step_for_zoom, insert_text_at_cursor, key_binding_label,
+        mossbyte_agency_credit_layout, next_char_cursor, next_word_cursor, next_z_index,
+        padded_selection_bounds, platform_label, preset_font_size_selected, previous_char_cursor,
+        previous_word_cursor, reordered_layer_ids, resolve_drop_screen_position,
+        rotated_text_origin, selection_drag_position, selection_handle_cursor_tolerance,
+        selection_handle_drag_tolerance, settings_group_frame, settings_keybind_card_frame,
+        settings_visuals, settings_window_frame, sloppiness_amplitude, sloppy_polyline,
+        text_create_command, text_update_command, to_core_color, zoom_delta_for_scroll,
+        zoom_percent,
     };
 
     use crate::selection::SelectionHandle;
@@ -7530,6 +8534,158 @@ mod tests {
         };
         assert!((first - second).abs() < f32::EPSILON);
         assert!(swatch_lefts.next().is_none());
+    }
+
+    #[test]
+    fn collaboration_controls_fill_the_popup_inner_width() {
+        let value = std::cell::RefCell::new(String::new());
+        let widths = std::cell::RefCell::new(None);
+
+        egui::__run_test_ui(|ui| {
+            ui.set_width(304.0);
+            let available_width = ui.available_width();
+            let field_response =
+                collaboration_text_field(ui, &mut value.borrow_mut(), "Name", true);
+            let button_response = collaboration_primary_button(ui, "Create room");
+            *widths.borrow_mut() = Some((
+                available_width,
+                field_response.rect.width(),
+                button_response.rect.width(),
+            ));
+        });
+
+        let widths = widths.into_inner();
+        assert!(widths.is_some(), "egui test UI did not run");
+        let Some((available_width, field_width, button_width)) = widths else {
+            return;
+        };
+        assert!((field_width - available_width).abs() < f32::EPSILON);
+        assert!((button_width - available_width).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn mossbyte_agency_credit_uses_the_configured_https_url() {
+        assert_eq!(MOSSBYTE_AGENCY_URL, "https://mossbyteagency.com/");
+    }
+
+    #[test]
+    fn mossbyte_agency_credit_layout_fills_wide_cards_and_stacks_narrow_cards() {
+        let (horizontal, copy_width, button_width) = mossbyte_agency_credit_layout(420.0);
+        assert!(horizontal);
+        assert!((button_width - MOSSBYTE_AGENCY_BUTTON_WIDTH).abs() < f32::EPSILON);
+        assert!((copy_width + button_width + MOSSBYTE_AGENCY_ROW_GAP - 420.0).abs() < f32::EPSILON);
+
+        let (horizontal, copy_width, button_width) = mossbyte_agency_credit_layout(300.0);
+        assert!(!horizontal);
+        assert!(copy_width.abs() < f32::EPSILON);
+        assert!((button_width - 300.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn collaboration_participant_initial_uses_name_parts_and_unicode_safely() {
+        assert_eq!(collaboration_participant_initial("Santanu Datta"), "S");
+        assert_eq!(
+            collaboration_participant_initial("Santanu Datta Sketchi"),
+            "S"
+        );
+        assert_eq!(collaboration_participant_initial("Santanu"), "S");
+        assert_eq!(collaboration_participant_initial("alice"), "A");
+        assert_eq!(collaboration_participant_initial("éclair Иван"), "É");
+        assert_eq!(collaboration_participant_initial(""), "?");
+        assert_eq!(collaboration_participant_initial("   "), "?");
+    }
+
+    #[test]
+    fn collaboration_display_name_must_contain_non_whitespace() {
+        assert!(!collaboration_display_name_is_valid(""));
+        assert!(!collaboration_display_name_is_valid("   "));
+        assert!(collaboration_display_name_is_valid("Santanu"));
+        assert!(collaboration_display_name_is_valid(" Santanu Datta "));
+    }
+
+    #[test]
+    fn collaboration_avatar_colors_are_stable_and_avoid_visible_collisions() {
+        let ids = [1_u128, 9, 17, 25];
+        let participants = ids
+            .iter()
+            .map(|id| canvas_protocol::Participant {
+                client_id: ClientId::from_u128(*id),
+                name: String::from("Name"),
+            })
+            .collect::<Vec<_>>();
+        let forward = collaboration_participant_avatar_colors(&participants);
+        let reverse_participants = participants.iter().rev().cloned().collect::<Vec<_>>();
+        let reverse = collaboration_participant_avatar_colors(&reverse_participants);
+
+        assert_eq!(
+            participants
+                .iter()
+                .zip(&forward)
+                .map(|(participant, color)| (participant.client_id, *color))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            reverse_participants
+                .iter()
+                .zip(&reverse)
+                .map(|(participant, color)| (participant.client_id, *color))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        );
+        assert_eq!(
+            {
+                let mut colors = forward.iter().map(Color32::to_array).collect::<Vec<_>>();
+                colors.sort_unstable();
+                colors.dedup();
+                colors.len()
+            },
+            4,
+        );
+    }
+
+    #[test]
+    fn collaboration_avatar_stack_overlaps_and_caps_at_four_participants() {
+        assert!((collaboration_avatar_stack_width(0) - 0.0).abs() < f32::EPSILON);
+        assert!((collaboration_avatar_stack_width(1) - 22.0).abs() < f32::EPSILON);
+        assert!((collaboration_avatar_stack_width(4) - 67.0).abs() < f32::EPSILON);
+        assert!((collaboration_avatar_stack_width(8) - 67.0).abs() < f32::EPSILON);
+
+        let first_center = collaboration_avatar_center_x(100.0, 0);
+        let second_center = collaboration_avatar_center_x(100.0, 1);
+        assert!((first_center - 111.0).abs() < f32::EPSILON);
+        assert!((second_center - first_center - 15.0).abs() < f32::EPSILON);
+        assert!(second_center - first_center < 22.0);
+    }
+
+    #[test]
+    fn collaboration_popup_dismisses_only_for_primary_clicks_outside_overlay() {
+        let toolbar = Rect::from_min_size(Pos2::new(300.0, 16.0), Vec2::new(100.0, 40.0));
+        let popup = Rect::from_min_size(Pos2::new(200.0, 76.0), Vec2::new(304.0, 260.0));
+
+        assert!(collaboration_popup_should_dismiss(
+            true,
+            Some(Pos2::new(40.0, 40.0)),
+            toolbar,
+            popup,
+        ));
+        assert!(!collaboration_popup_should_dismiss(
+            false,
+            Some(Pos2::new(40.0, 40.0)),
+            toolbar,
+            popup,
+        ));
+        assert!(!collaboration_popup_should_dismiss(
+            true,
+            Some(Pos2::new(320.0, 24.0)),
+            toolbar,
+            popup,
+        ));
+        assert!(!collaboration_popup_should_dismiss(
+            true,
+            Some(Pos2::new(220.0, 100.0)),
+            toolbar,
+            popup,
+        ));
+        assert!(!collaboration_popup_should_dismiss(
+            true, None, toolbar, popup
+        ));
     }
 
     #[test]
@@ -7814,6 +8970,96 @@ mod tests {
 
         assert!(workspace.new_document_confirmation);
         assert_eq!(editor.document().len(), 1);
+    }
+
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    #[test]
+    fn opening_a_document_replaces_editor_state_and_clears_selection() {
+        let directory = std::env::temp_dir().join(format!(
+            "sketchi-open-document-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("drawing.json");
+        let element_id = ElementId::from_u128(97);
+        let mut source_editor = Editor::new(ClientId::new());
+        assert!(
+            source_editor
+                .execute(EditorCommand::Create(Element::rectangle(
+                    element_id,
+                    Transform::new(Point::new(8.0, 9.0), Size::new(40.0, 30.0)),
+                )))
+                .is_ok()
+        );
+        std::fs::write(&path, serde_json::to_vec(source_editor.document()).unwrap()).unwrap();
+
+        let mut editor = Editor::new(ClientId::new());
+        let old_id = ElementId::from_u128(98);
+        assert!(
+            editor
+                .execute(EditorCommand::Create(Element::rectangle(
+                    old_id,
+                    Transform::new(Point::default(), Size::new(12.0, 12.0)),
+                )))
+                .is_ok()
+        );
+        let mut workspace = WorkspaceUi::default();
+        workspace.selected.insert(old_id);
+
+        assert!(workspace.open_document(&mut editor, &path));
+        assert_eq!(editor.document().element(element_id).map(|_| ()), Some(()));
+        assert!(editor.document().element(old_id).is_none());
+        assert!(workspace.selected.is_empty());
+        assert!(workspace.status.contains("Opened"));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
+    #[test]
+    fn opening_invalid_document_preserves_editor_and_does_not_save_autosave() {
+        let directory = std::env::temp_dir().join(format!(
+            "sketchi-open-invalid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("invalid.json");
+        std::fs::write(&path, b"not a Sketchi document").unwrap();
+
+        let element_id = ElementId::from_u128(99);
+        let mut editor = Editor::new(ClientId::new());
+        assert!(
+            editor
+                .execute(EditorCommand::Create(Element::rectangle(
+                    element_id,
+                    Transform::new(Point::default(), Size::new(12.0, 12.0)),
+                )))
+                .is_ok()
+        );
+        let mut workspace = WorkspaceUi::default();
+        workspace.selected.insert(element_id);
+        workspace.autosave_directory = directory.join("autosave").to_string_lossy().into_owned();
+
+        assert!(!workspace.open_document(&mut editor, &path));
+        assert!(editor.document().element(element_id).is_some());
+        assert_eq!(workspace.selected.len(), 1);
+        assert!(workspace.status.contains("Could not open document"));
+        assert!(
+            !directory
+                .join("autosave")
+                .join("sketchi.autosave.json")
+                .exists()
+        );
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
