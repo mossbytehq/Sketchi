@@ -18,8 +18,8 @@ use winit::{
 };
 
 use crate::connection::{
-    CollaborationClient, CollaborationIntent, CollaborationView, parse_room_invite,
-    resolve_invite_readiness,
+    CollaborationClient, CollaborationIntent, CollaborationView, ConnectionError,
+    parse_room_invite, resolve_invite_readiness,
 };
 use crate::editor::Editor;
 use crate::gpu::GpuState;
@@ -392,7 +392,9 @@ impl ApplicationHandler for DesktopApplication {
                         let presence =
                             self.ui
                                 .local_presence(ui.ctx(), self.camera, self.editor.client_id());
-                        if let Err(error) = collaboration.offer_presence(room_id, presence) {
+                        if let Err(error) = collaboration.offer_presence(room_id, presence)
+                            && !matches!(error, ConnectionError::QueueFull)
+                        {
                             self.collaboration_error = Some(error.to_string());
                         }
                     }
@@ -630,9 +632,15 @@ impl DesktopApplication {
                 collaboration
                     .observe(&message)
                     .map_err(|error| error.to_string())
-                    .and_then(|()| {
+                    .and_then(|accepted| {
+                        if !accepted {
+                            return Ok(());
+                        }
                         self.editor
-                            .apply_server_message(collaboration.synchronization_mut(), &message)
+                            .apply_server_message(
+                                collaboration.synchronization_mut(),
+                                &message.message,
+                            )
                             .map(|_| ())
                             .map_err(|error| error.to_string())
                     })
@@ -654,7 +662,9 @@ impl DesktopApplication {
                 .persist_pending(collaboration.synchronization_mut())
                 .and_then(|_| collaboration.queue_pending())
         };
-        if let Err(error) = result {
+        if let Err(error) = result
+            && !matches!(error, ConnectionError::QueueFull)
+        {
             if let Some(collaboration) = self.collaboration.as_mut() {
                 collaboration.set_error(error.to_string());
             }

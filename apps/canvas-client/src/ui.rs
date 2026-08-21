@@ -281,8 +281,6 @@ pub(crate) struct WorkspaceUi {
     appearance: AppearanceMode,
     settings_open: bool,
     settings_page: SettingsPage,
-    settings_baseline: Option<SettingsBaseline>,
-    settings_restore_baseline: Option<bool>,
     new_document_confirmation: bool,
     open_document_confirmation: bool,
     pending_open_document: Option<(PathBuf, Editor)>,
@@ -303,6 +301,8 @@ pub(crate) struct WorkspaceUi {
     update_checking: bool,
     update_checked_in_session: bool,
     update_error: Option<String>,
+    update_install_error: Option<String>,
+    update_message: Option<String>,
     update_receiver: Option<Receiver<Result<UpdateCache, String>>>,
     update_installing: bool,
     update_install_receiver: Option<Receiver<Result<(), String>>>,
@@ -425,14 +425,6 @@ struct PendingDroppedFile {
     path: PathBuf,
     prepared: Option<PreparedImage>,
     position: Option<Pos2>,
-}
-
-#[derive(Clone, Debug)]
-struct SettingsBaseline {
-    settings: settings::Settings,
-    new_object_style: Style,
-    drawing_style_loaded: bool,
-    draft_style: Style,
 }
 
 struct DecodedImage {
@@ -929,8 +921,6 @@ impl Default for WorkspaceUi {
             appearance: AppearanceMode::System,
             settings_open: false,
             settings_page: SettingsPage::General,
-            settings_baseline: None,
-            settings_restore_baseline: None,
             new_document_confirmation: false,
             open_document_confirmation: false,
             pending_open_document: None,
@@ -951,6 +941,8 @@ impl Default for WorkspaceUi {
             update_checking: false,
             update_checked_in_session: false,
             update_error: None,
+            update_install_error: None,
+            update_message: None,
             update_receiver: None,
             update_installing: false,
             update_install_receiver: None,
@@ -1059,6 +1051,8 @@ impl WorkspaceUi {
         self.update_channel = persisted.update_channel;
         self.update_cache = persisted.update_cache.clone();
         self.update_error = None;
+        self.update_install_error = None;
+        self.update_message = None;
         self.appearance = match persisted.appearance {
             settings::Appearance::System => AppearanceMode::System,
             settings::Appearance::Light => AppearanceMode::Light,
@@ -1190,21 +1184,22 @@ impl WorkspaceUi {
             Ok(Ok(())) => {
                 self.update_installing = false;
                 self.update_install_receiver = None;
-                self.update_error = Some(String::from(
+                self.update_install_error = None;
+                self.update_message = Some(String::from(
                     "Update handoff started. Sketchi will restart to finish the update.",
                 ));
                 self.update_restart_requested = true;
                 true
             }
             Ok(Err(error)) => {
-                self.update_error = Some(error);
+                self.update_install_error = Some(error);
                 self.update_installing = false;
                 self.update_install_receiver = None;
                 true
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
-                self.update_error =
+                self.update_install_error =
                     Some(String::from("The update installation stopped unexpectedly"));
                 self.update_installing = false;
                 self.update_install_receiver = None;
@@ -1222,6 +1217,8 @@ impl WorkspaceUi {
         self.update_checking = true;
         self.update_checked_in_session = true;
         self.update_error = None;
+        self.update_install_error = None;
+        self.update_message = None;
         self.update_receiver = Some(receiver);
         let worker = std::thread::Builder::new()
             .name(String::from("sketchi-update-check"))
@@ -1243,7 +1240,7 @@ impl WorkspaceUi {
 
     /// Shows a result reported by the previous update handoff.
     pub(crate) fn set_update_message(&mut self, message: String) {
-        self.update_error = Some(message);
+        self.update_message = Some(message);
     }
 
     /// Returns the current status derived from the cached release data.
@@ -1257,7 +1254,7 @@ impl WorkspaceUi {
         }
         let status = self.update_status();
         let (Some(url), Some(name)) = (status.target_asset_url, status.target_asset_name) else {
-            self.update_error = Some(String::from(
+            self.update_install_error = Some(String::from(
                 "This release does not contain an automatic update for your platform.",
             ));
             return;
@@ -1265,7 +1262,8 @@ impl WorkspaceUi {
         let digest = status.target_asset_digest;
         let (sender, receiver) = std::sync::mpsc::channel();
         self.update_installing = true;
-        self.update_error = None;
+        self.update_install_error = None;
+        self.update_message = None;
         self.update_install_receiver = Some(receiver);
         let worker = std::thread::Builder::new()
             .name(String::from("sketchi-update-install"))
@@ -1277,7 +1275,8 @@ impl WorkspaceUi {
         if let Err(error) = worker {
             self.update_installing = false;
             self.update_install_receiver = None;
-            self.update_error = Some(format!("Could not start the update installation: {error}"));
+            self.update_install_error =
+                Some(format!("Could not start the update installation: {error}"));
         }
     }
 
@@ -1315,8 +1314,6 @@ impl WorkspaceUi {
     /// Closes the native settings window and abandons an in-progress shortcut capture.
     pub(crate) fn close_settings(&mut self) {
         self.settings_open = false;
-        self.settings_baseline = None;
-        self.settings_restore_baseline = None;
         self.capturing_keybind = None;
     }
 
@@ -1324,56 +1321,8 @@ impl WorkspaceUi {
         if self.settings_open {
             self.close_settings();
         } else {
-            self.settings_baseline = Some(SettingsBaseline {
-                settings: self.settings_snapshot(),
-                new_object_style: self.new_object_style,
-                drawing_style_loaded: self.drawing_style_loaded,
-                draft_style: self.draft_style,
-            });
-            self.settings_restore_baseline = Some(self.restore_session);
             self.settings_open = true;
         }
-    }
-
-    fn cancel_settings(&mut self) {
-        if let Some(baseline) = self.settings_baseline.take() {
-            self.apply_settings(&baseline.settings);
-            self.new_object_style = baseline.new_object_style;
-            self.drawing_style_loaded = baseline.drawing_style_loaded;
-            self.draft_style = baseline.draft_style;
-        }
-        if let Some(restore_session) = self.settings_restore_baseline.take() {
-            self.restore_session = restore_session;
-        }
-        self.settings_open = false;
-        self.capturing_keybind = None;
-    }
-
-    fn restore_settings_defaults(&mut self) {
-        let defaults = Self::default();
-        self.appearance = AppearanceMode::System;
-        self.restore_session = defaults.restore_session;
-        self.autosave_interval = defaults.autosave_interval;
-        self.autosave_directory
-            .clone_from(&defaults.autosave_directory);
-        self.light_canvas_color = defaults.light_canvas_color;
-        self.dark_canvas_color = defaults.dark_canvas_color;
-        self.canvas_background = defaults.canvas_background;
-        self.light_palette = defaults.light_palette;
-        self.dark_palette = defaults.dark_palette;
-        self.stabilization = defaults.stabilization;
-        self.pressure_sensitivity = defaults.pressure_sensitivity;
-        self.remember_drawing_style = defaults.remember_drawing_style;
-        self.keybinds = defaults.keybinds;
-        self.update_channel = defaults.update_channel;
-        self.update_cache = defaults.update_cache;
-        self.update_error = None;
-        self.new_object_style = defaults.new_object_style;
-        self.drawing_style_loaded = false;
-        self.draft_style = self.new_object_style;
-        self.capturing_keybind = None;
-        self.dark_mode = self.system_dark_mode.unwrap_or(false);
-        self.sync_draft_palette();
     }
 
     fn reset_drawing_style(&mut self) {
@@ -3508,7 +3457,7 @@ impl WorkspaceUi {
                                         "Share this invite with collaborators.",
                                         self.dark_mode,
                                     );
-                                    let mut invite = format_room_invite(
+                                    let invite = format_room_invite(
                                         room_id,
                                         token,
                                         &ReadyMessage {
@@ -3518,16 +3467,19 @@ impl WorkspaceUi {
                                                 .unwrap_or_default(),
                                         },
                                     );
+                                    let mut invite_preview =
+                                        collaboration_invite_preview(room_id, token);
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = COLLABORATION_CONTROL_GAP;
                                         let field_width =
                                             collaboration_invite_field_width(ui.available_width());
                                         collaboration_invite_field(
                                             ui,
-                                            &mut invite,
+                                            &mut invite_preview,
                                             field_width,
                                             self.dark_mode,
-                                        );
+                                        )
+                                        .on_hover_text("Copy the complete invite with the button");
                                         let copy_response = collaboration_secondary_icon_button(
                                             ui,
                                             Icon::Clipboard,
@@ -3753,8 +3705,7 @@ impl WorkspaceUi {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    let footer_height = 49.0;
-                    let content_height = (settings_body_height - footer_height).max(0.0);
+                    let content_height = settings_body_height;
                     ui.allocate_ui_with_layout(
                         Vec2::new(settings_body_width, content_height),
                         egui::Layout::left_to_right(egui::Align::Min),
@@ -3791,16 +3742,18 @@ impl WorkspaceUi {
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
                                     ui.add_space(10.0);
-                                    egui::ScrollArea::vertical()
-                                        .id_salt(("sketchi.settings.content", selected_page))
-                                        .max_height(page_content_height)
-                                        .auto_shrink([false, false])
-                                        .scroll_bar_visibility(
-                                            settings_scroll_bar_visibility(),
-                                        )
-                                        .show(ui, |ui| {
-                                            ui.set_width(page_width);
-                                            match selected_page {
+                                    ui.scope(|ui| {
+                                        ui.spacing_mut().scroll.fade.strength = 0.0;
+                                        egui::ScrollArea::vertical()
+                                            .id_salt(("sketchi.settings.content", selected_page))
+                                            .max_height(page_content_height)
+                                            .auto_shrink([false, false])
+                                            .scroll_bar_visibility(
+                                                settings_scroll_bar_visibility(),
+                                            )
+                                            .show(ui, |ui| {
+                                                ui.set_width(page_width);
+                                                match selected_page {
                         SettingsPage::General => {
                             ui.heading(
                                 egui::RichText::new("General")
@@ -4275,6 +4228,8 @@ impl WorkspaceUi {
                                             {
                                                 self.update_channel = channel;
                                                 self.update_error = None;
+                                                self.update_install_error = None;
+                                                self.update_message = None;
                                                 self.start_update_check();
                                             }
                                         },
@@ -4368,96 +4323,76 @@ impl WorkspaceUi {
                                         .wrap(),
                                     );
                                 }
+                                if let Some(error) = self.update_install_error.as_deref() {
+                                    ui.add_space(4.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!(
+                                                "Update installation failed: {error}"
+                                            ))
+                                            .small()
+                                            .color(Color32::from_rgb(220, 80, 80)),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                                if let Some(message) = self.update_message.as_deref() {
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(message)
+                                            .small()
+                                            .color(muted_color(self.dark_mode)),
+                                    );
+                                }
                                 if let Some(target) = update_status.target.as_ref() {
                                     ui.add_space(10.0);
+                                    let can_install = update_status.target_asset_url.is_some();
                                     ui.horizontal(|ui| {
                                         ui.label(
                                             egui::RichText::new(format!(
                                                 "Sketchi {target} is available."
                                             ))
-                                            .color(Color32::from_rgb(82, 170, 100)),
+                                                .color(Color32::from_rgb(82, 170, 100)),
                                         );
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                let can_install = update_status
-                                                    .target_asset_url
-                                                    .is_some()
-                                                    && !self.update_installing;
-                                                if button(
-                                                    ui,
-                                                    if self.update_installing {
-                                                        "Installing…"
-                                                    } else {
-                                                        "Install update"
-                                                    },
-                                                    Vec2::new(132.0, STANDARD_CONTROL_SIZE.y),
-                                                    Color32::from_rgb(54, 125, 75),
-                                                )
-                                                .clicked()
-                                                    && can_install
-                                                {
-                                                    self.install_update();
-                                                }
-                                            },
-                                        );
+                                        if can_install {
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if button(
+                                                        ui,
+                                                        if self.update_installing {
+                                                            "Installing…"
+                                                        } else {
+                                                            "Install update"
+                                                        },
+                                                        Vec2::new(132.0, STANDARD_CONTROL_SIZE.y),
+                                                        Color32::from_rgb(54, 125, 75),
+                                                    )
+                                                    .clicked()
+                                                    && !self.update_installing
+                                                    {
+                                                        self.install_update();
+                                                    }
+                                                },
+                                            );
+                                        }
                                     });
+                                    if !can_install {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "This release has no automatic package update for this installation. Use your package manager.",
+                                            )
+                                            .small()
+                                            .color(muted_color(self.dark_mode)),
+                                        );
+                                    }
                                 }
                             });
                         }
                         }
-                                        });
-                                },
-                            );
-                            ui.separator();
-                            ui.allocate_ui_with_layout(
-                                        Vec2::new(settings_body_width, 48.0),
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                    ui.add_space(6.0);
-                                    if button(
-                                        ui,
-                                        "Defaults",
-                                        Vec2::new(90.0, 32.0),
-                                        if self.dark_mode {
-                                            SETTINGS_CONTROL_DARK
-                                        } else {
-                                            Color32::from_rgb(245, 246, 249)
-                                        },
-                                    )
-                                    .clicked()
-                                    {
-                                        self.restore_settings_defaults();
-                                    }
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if button(
-                                                ui,
-                                                "Cancel",
-                                                Vec2::new(82.0, 32.0),
-                                                if self.dark_mode {
-                                                    SETTINGS_CONTROL_DARK
-                                                } else {
-                                                    Color32::from_rgb(245, 246, 249)
-                                                },
-                                            )
-                                            .clicked()
-                                            {
-                                                self.cancel_settings();
-                                            }
-                                            if button(
-                                                ui,
-                                                egui::RichText::new("OK").color(Color32::WHITE),
-                                                Vec2::new(82.0, 32.0),
-                                                ACCENT,
-                                            )
-                                            .clicked()
-                                            {
-                                                self.close_settings();
-                                            }
-                                        },
-                                    );
+                                                ui.add_space(12.0);
+                                            });
+                                    });
                                 },
                             );
                         },
@@ -4656,445 +4591,257 @@ impl WorkspaceUi {
                     // Keep enough room for the full palette rows before the
                     // properties scrollbar starts.
                     ui.set_width(260.0);
-                    egui::ScrollArea::vertical()
-                        .max_height(panel_height)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if !text_selection && !image_selection {
-                                ui.label(
-                                    egui::RichText::new(if self.selected.len() > 1 {
-                                        "Selected objects"
-                                    } else if !self.selected.is_empty() {
-                                        "Selected object"
-                                    } else {
-                                        "New object"
-                                    })
-                                    .strong()
-                                    .size(14.0)
-                                    .color(text_color(self.dark_mode)),
-                                );
-                                ui.add_space(10.0);
-                            }
-
-                            if text_selection {
-                                section_label(ui, "Stroke", self.dark_mode);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    for color in palette.into_iter().take(stroke_preset_limit) {
-                                        if color_swatch(
-                                            ui,
-                                            Some(color),
-                                            to_color32(style.stroke) == color,
-                                            self.dark_mode,
-                                        )
-                                        .clicked()
-                                        {
-                                            patch.stroke = Some(to_core_color(color));
-                                            changed = true;
-                                        }
-                                    }
-                                    let custom = to_color32(style.stroke);
-                                    ui.separator();
-                                    if color_swatch(
-                                        ui,
-                                        Some(custom),
-                                        self.color_picker == Some(ColorPickerTarget::Stroke),
-                                        self.dark_mode,
-                                    )
-                                    .clicked()
-                                    {
-                                        color_target = Some(ColorPickerTarget::Stroke);
-                                    }
-                                });
-
-                                ui.add_space(10.0);
-                                section_label(ui, "Font family", self.dark_mode);
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    for (family, icon, label) in [
-                                        (
-                                            TextFontFamily::Handwritten,
-                                            Icon::HandDrawn,
-                                            "Hand-drawn",
-                                        ),
-                                        (TextFontFamily::Sans, Icon::FontSans, "Normal"),
-                                        (TextFontFamily::Monospace, Icon::Code, "Code"),
-                                    ] {
-                                        if text_property_icon_choice(
-                                            ui,
-                                            icon,
-                                            style.font_family == family,
-                                            self.dark_mode,
-                                        )
-                                        .on_hover_text(label)
-                                        .clicked()
-                                        {
-                                            patch.font_family = Some(family);
-                                            changed = true;
-                                        }
-                                    }
-                                });
-
-                                ui.add_space(10.0);
-                                section_label(ui, "Font size", self.dark_mode);
-                                let custom_size_open =
-                                    self.custom_font_size == CustomFontSizeState::Open;
-                                let has_preset_font_size = [12.0_f32, 16.0, 24.0, 32.0]
-                                    .into_iter()
-                                    .any(|size| (style.font_size - size).abs() < f32::EPSILON);
-                                let custom_size_selected = custom_font_size_selected(
-                                    self.custom_font_size,
-                                    has_preset_font_size,
-                                );
-                                ui.horizontal(|ui| {
-                                    for (size, label) in
-                                        [(12.0_f32, "S"), (16.0, "M"), (24.0, "L"), (32.0, "XL")]
-                                    {
-                                        if text_size_choice(
-                                            ui,
-                                            size,
-                                            label,
-                                            preset_font_size_selected(
-                                                self.custom_font_size,
-                                                style.font_size,
-                                                size,
-                                            ),
-                                            self.dark_mode,
-                                        )
-                                        .clicked()
-                                        {
-                                            patch.font_size = Some(size);
-                                            self.custom_font_size = CustomFontSizeState::Closed;
-                                            changed = true;
-                                        }
-                                    }
-                                    ui.separator();
-                                    if custom_text_size_choice(
-                                        ui,
-                                        custom_size_selected,
-                                        self.dark_mode,
-                                    )
-                                    .clicked()
-                                    {
-                                        self.custom_font_size = match self.custom_font_size {
-                                            CustomFontSizeState::Closed => {
-                                                CustomFontSizeState::Open
-                                            }
-                                            CustomFontSizeState::Open => {
-                                                CustomFontSizeState::Closed
-                                            }
-                                        };
-                                        if self.custom_font_size == CustomFontSizeState::Open {
-                                            patch.font_size = Some(style.font_size);
-                                            changed = true;
-                                        }
-                                    }
-                                });
-                                if custom_size_open {
-                                    ui.add_space(8.0);
-                                    let mut custom_size = style.font_size;
-                                    if numeric_field_with_decimals(
-                                        ui,
-                                        &mut custom_size,
-                                        1.0..=256.0,
-                                        STANDARD_CONTROL_SIZE,
-                                        0,
-                                        "",
-                                    )
-                                    .changed()
-                                    {
-                                        patch.font_size = Some(custom_size);
-                                        changed = true;
-                                    }
+                    ui.scope(|ui| {
+                        ui.spacing_mut().scroll.fade.strength = 0.0;
+                        egui::ScrollArea::vertical()
+                            .max_height(panel_height)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if !text_selection && !image_selection {
+                                    ui.label(
+                                        egui::RichText::new(if self.selected.len() > 1 {
+                                            "Selected objects"
+                                        } else if !self.selected.is_empty() {
+                                            "Selected object"
+                                        } else {
+                                            "New object"
+                                        })
+                                        .strong()
+                                        .size(14.0)
+                                        .color(text_color(self.dark_mode)),
+                                    );
+                                    ui.add_space(10.0);
                                 }
 
-                                ui.add_space(10.0);
-                                section_label(ui, "Text align", self.dark_mode);
-                                ui.horizontal(|ui| {
-                                    for (align, icon, label) in [
-                                        (TextAlign::Left, Icon::TextAlignLeft, "Left"),
-                                        (TextAlign::Center, Icon::TextAlignCenter, "Center"),
-                                        (TextAlign::Right, Icon::TextAlignRight, "Right"),
-                                    ] {
-                                        if text_property_icon_choice(
-                                            ui,
-                                            icon,
-                                            style.text_align == align,
-                                            self.dark_mode,
-                                        )
-                                        .on_hover_text(label)
-                                        .clicked()
-                                        {
-                                            patch.text_align = Some(align);
-                                            changed = true;
-                                        }
-                                    }
-                                });
-                            } else if image_selection {
-                                section_label(ui, "Stroke", self.dark_mode);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    for color in palette.into_iter().take(stroke_preset_limit) {
-                                        if color_swatch(
-                                            ui,
-                                            Some(color),
-                                            to_color32(style.stroke) == color,
-                                            self.dark_mode,
-                                        )
-                                        .clicked()
-                                        {
-                                            patch.stroke = Some(to_core_color(color));
-                                            changed = true;
-                                        }
-                                    }
-                                    let custom = to_color32(style.stroke);
-                                    ui.separator();
-                                    if color_swatch(
-                                        ui,
-                                        Some(custom),
-                                        self.color_picker == Some(ColorPickerTarget::Stroke),
-                                        self.dark_mode,
-                                    )
-                                    .clicked()
-                                    {
-                                        color_target = Some(ColorPickerTarget::Stroke);
-                                    }
-                                });
-
-                                ui.add_space(10.0);
-                                section_label(ui, "Stroke width", self.dark_mode);
-                                ui.horizontal(|ui| {
-                                    for width in [1.0_f32, 2.0, 4.0] {
-                                        if width_choice(
-                                            ui,
-                                            width,
-                                            (style.stroke_width - width).abs() < f32::EPSILON,
-                                            self.dark_mode,
-                                        )
-                                        .clicked()
-                                        {
-                                            patch.stroke_width = Some(width);
-                                            changed = true;
-                                        }
-                                    }
-                                });
-
-                                ui.add_space(10.0);
-                                section_label(ui, "Stroke style", self.dark_mode);
-                                ui.horizontal(|ui| {
-                                    for (stroke_style, label) in [
-                                        (StrokeStyle::Solid, "Solid"),
-                                        (StrokeStyle::Dashed, "Dashed"),
-                                        (StrokeStyle::Dotted, "Dotted"),
-                                    ] {
-                                        if stroke_style_choice(
-                                            ui,
-                                            stroke_style,
-                                            style.stroke_style == stroke_style,
-                                            self.dark_mode,
-                                        )
-                                        .on_hover_text(label)
-                                        .clicked()
-                                        {
-                                            patch.stroke_style = Some(stroke_style);
-                                            changed = true;
-                                        }
-                                    }
-                                });
-
-                                ui.add_space(10.0);
-                                section_label(ui, "Sloppiness", self.dark_mode);
-                                ui.horizontal(|ui| {
-                                    for (sloppiness, icon, label) in [
-                                        (Sloppiness::Architect, Icon::PenNib, "Architect"),
-                                        (Sloppiness::Artist, Icon::QuillPen, "Artist"),
-                                        (Sloppiness::Cartoonist, Icon::Brush, "Cartoonist"),
-                                    ] {
-                                        if property_choice(
-                                            ui,
-                                            icon,
-                                            label,
-                                            style.sloppiness == sloppiness,
-                                            self.dark_mode,
-                                        )
-                                        .clicked()
-                                        {
-                                            patch.sloppiness = Some(sloppiness);
-                                            changed = true;
-                                        }
-                                    }
-                                });
-
-                                ui.add_space(10.0);
-                                section_label(ui, "Edges", self.dark_mode);
-                                ui.horizontal(|ui| {
-                                    for (edges, icon, label) in [
-                                        (EdgeStyle::Sharp, Icon::Rectangle, "Sharp"),
-                                        (EdgeStyle::Rounded, Icon::Rounded, "Rounded"),
-                                    ] {
-                                        if property_choice(
-                                            ui,
-                                            icon,
-                                            label,
-                                            style.edges == edges,
-                                            self.dark_mode,
-                                        )
-                                        .clicked()
-                                        {
-                                            patch.edges = Some(edges);
-                                            changed = true;
-                                        }
-                                    }
-                                });
-                            } else {
-                                section_label(ui, "Stroke", self.dark_mode);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    for color in palette.into_iter().take(stroke_preset_limit) {
-                                        if color_swatch(
-                                            ui,
-                                            Some(color),
-                                            to_color32(style.stroke) == color,
-                                            self.dark_mode,
-                                        )
-                                        .clicked()
-                                        {
-                                            patch.stroke = Some(to_core_color(color));
-                                            changed = true;
-                                        }
-                                    }
-                                    let custom = to_color32(style.stroke);
-                                    ui.separator();
-                                    let response = color_swatch(
-                                        ui,
-                                        Some(custom),
-                                        self.color_picker == Some(ColorPickerTarget::Stroke),
-                                        self.dark_mode,
-                                    );
-                                    if response.clicked() {
-                                        color_target = Some(ColorPickerTarget::Stroke);
-                                    }
-                                });
-
-                                if !freehand_properties {
-                                    ui.add_space(10.0);
-                                    section_label(ui, "Background", self.dark_mode);
+                                if text_selection {
+                                    section_label(ui, "Stroke", self.dark_mode);
                                     ui.horizontal_wrapped(|ui| {
                                         ui.spacing_mut().item_spacing.x = 4.0;
-                                        if color_swatch(
-                                            ui,
-                                            None,
-                                            style.fill.is_none(),
-                                            self.dark_mode,
-                                        )
-                                        .on_hover_text("Transparent")
-                                        .clicked()
-                                        {
-                                            patch.fill = Some(None);
-                                            changed = true;
-                                        }
-                                        for color in FILL_COLORS {
+                                        for color in palette.into_iter().take(stroke_preset_limit) {
                                             if color_swatch(
                                                 ui,
                                                 Some(color),
-                                                style
-                                                    .fill
-                                                    .is_some_and(|fill| to_color32(fill) == color),
+                                                to_color32(style.stroke) == color,
                                                 self.dark_mode,
                                             )
                                             .clicked()
                                             {
-                                                patch.fill = Some(Some(to_core_color(color)));
+                                                patch.stroke = Some(to_core_color(color));
                                                 changed = true;
                                             }
                                         }
-                                        let custom = style
-                                            .fill
-                                            .map_or(Color32::from_rgb(221, 214, 254), to_color32);
+                                        let custom = to_color32(style.stroke);
                                         ui.separator();
-                                        let response = color_swatch(
+                                        if color_swatch(
                                             ui,
                                             Some(custom),
-                                            self.color_picker == Some(ColorPickerTarget::Fill),
+                                            self.color_picker == Some(ColorPickerTarget::Stroke),
                                             self.dark_mode,
-                                        );
-                                        if response.clicked() {
-                                            color_target = Some(ColorPickerTarget::Fill);
+                                        )
+                                        .clicked()
+                                        {
+                                            color_target = Some(ColorPickerTarget::Stroke);
                                         }
                                     });
-                                }
 
-                                ui.add_space(10.0);
-                                section_label(ui, "Fill", self.dark_mode);
-                                ui.horizontal(|ui| {
-                                    if property_choice(
-                                        ui,
-                                        Icon::FillNone,
-                                        "None",
-                                        style.fill.is_none(),
-                                        self.dark_mode,
-                                    )
-                                    .clicked()
-                                    {
-                                        patch = fill_choice_patch(style.fill, false);
-                                        changed = true;
-                                    }
-                                    if property_choice(
-                                        ui,
-                                        Icon::FillSolid,
-                                        "Solid",
-                                        style.fill.is_some(),
-                                        self.dark_mode,
-                                    )
-                                    .clicked()
-                                    {
-                                        patch = fill_choice_patch(style.fill, true);
-                                        changed = true;
-                                    }
-                                });
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Font family", self.dark_mode);
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        for (family, icon, label) in [
+                                            (
+                                                TextFontFamily::Handwritten,
+                                                Icon::HandDrawn,
+                                                "Hand-drawn",
+                                            ),
+                                            (TextFontFamily::Sans, Icon::FontSans, "Normal"),
+                                            (TextFontFamily::Monospace, Icon::Code, "Code"),
+                                        ] {
+                                            if text_property_icon_choice(
+                                                ui,
+                                                icon,
+                                                style.font_family == family,
+                                                self.dark_mode,
+                                            )
+                                            .on_hover_text(label)
+                                            .clicked()
+                                            {
+                                                patch.font_family = Some(family);
+                                                changed = true;
+                                            }
+                                        }
+                                    });
 
-                                ui.add_space(10.0);
-                                section_label(ui, "Stroke width", self.dark_mode);
-                                ui.horizontal(|ui| {
-                                    for width in [1.0_f32, 2.0, 4.0] {
-                                        if width_choice(
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Font size", self.dark_mode);
+                                    let custom_size_open =
+                                        self.custom_font_size == CustomFontSizeState::Open;
+                                    let has_preset_font_size = [12.0_f32, 16.0, 24.0, 32.0]
+                                        .into_iter()
+                                        .any(|size| (style.font_size - size).abs() < f32::EPSILON);
+                                    let custom_size_selected = custom_font_size_selected(
+                                        self.custom_font_size,
+                                        has_preset_font_size,
+                                    );
+                                    ui.horizontal(|ui| {
+                                        for (size, label) in [
+                                            (12.0_f32, "S"),
+                                            (16.0, "M"),
+                                            (24.0, "L"),
+                                            (32.0, "XL"),
+                                        ] {
+                                            if text_size_choice(
+                                                ui,
+                                                size,
+                                                label,
+                                                preset_font_size_selected(
+                                                    self.custom_font_size,
+                                                    style.font_size,
+                                                    size,
+                                                ),
+                                                self.dark_mode,
+                                            )
+                                            .clicked()
+                                            {
+                                                patch.font_size = Some(size);
+                                                self.custom_font_size = CustomFontSizeState::Closed;
+                                                changed = true;
+                                            }
+                                        }
+                                        ui.separator();
+                                        if custom_text_size_choice(
                                             ui,
-                                            width,
-                                            (style.stroke_width - width).abs() < f32::EPSILON,
+                                            custom_size_selected,
                                             self.dark_mode,
                                         )
                                         .clicked()
                                         {
-                                            patch.stroke_width = Some(width);
+                                            self.custom_font_size = match self.custom_font_size {
+                                                CustomFontSizeState::Closed => {
+                                                    CustomFontSizeState::Open
+                                                }
+                                                CustomFontSizeState::Open => {
+                                                    CustomFontSizeState::Closed
+                                                }
+                                            };
+                                            if self.custom_font_size == CustomFontSizeState::Open {
+                                                patch.font_size = Some(style.font_size);
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+                                    if custom_size_open {
+                                        ui.add_space(8.0);
+                                        let mut custom_size = style.font_size;
+                                        if numeric_field_with_decimals(
+                                            ui,
+                                            &mut custom_size,
+                                            1.0..=256.0,
+                                            STANDARD_CONTROL_SIZE,
+                                            0,
+                                            "",
+                                        )
+                                        .changed()
+                                        {
+                                            patch.font_size = Some(custom_size);
                                             changed = true;
                                         }
                                     }
-                                });
 
-                                ui.add_space(10.0);
-                                section_label(ui, "Stroke style", self.dark_mode);
-                                ui.horizontal(|ui| {
-                                    for (stroke_style, label) in [
-                                        (StrokeStyle::Solid, "Solid"),
-                                        (StrokeStyle::Dashed, "Dashed"),
-                                        (StrokeStyle::Dotted, "Dotted"),
-                                    ] {
-                                        if stroke_style_choice(
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Text align", self.dark_mode);
+                                    ui.horizontal(|ui| {
+                                        for (align, icon, label) in [
+                                            (TextAlign::Left, Icon::TextAlignLeft, "Left"),
+                                            (TextAlign::Center, Icon::TextAlignCenter, "Center"),
+                                            (TextAlign::Right, Icon::TextAlignRight, "Right"),
+                                        ] {
+                                            if text_property_icon_choice(
+                                                ui,
+                                                icon,
+                                                style.text_align == align,
+                                                self.dark_mode,
+                                            )
+                                            .on_hover_text(label)
+                                            .clicked()
+                                            {
+                                                patch.text_align = Some(align);
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+                                } else if image_selection {
+                                    section_label(ui, "Stroke", self.dark_mode);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        for color in palette.into_iter().take(stroke_preset_limit) {
+                                            if color_swatch(
+                                                ui,
+                                                Some(color),
+                                                to_color32(style.stroke) == color,
+                                                self.dark_mode,
+                                            )
+                                            .clicked()
+                                            {
+                                                patch.stroke = Some(to_core_color(color));
+                                                changed = true;
+                                            }
+                                        }
+                                        let custom = to_color32(style.stroke);
+                                        ui.separator();
+                                        if color_swatch(
                                             ui,
-                                            stroke_style,
-                                            style.stroke_style == stroke_style,
+                                            Some(custom),
+                                            self.color_picker == Some(ColorPickerTarget::Stroke),
                                             self.dark_mode,
                                         )
-                                        .on_hover_text(label)
                                         .clicked()
                                         {
-                                            patch.stroke_style = Some(stroke_style);
-                                            changed = true;
+                                            color_target = Some(ColorPickerTarget::Stroke);
                                         }
-                                    }
-                                });
+                                    });
 
-                                if !freehand_properties {
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Stroke width", self.dark_mode);
+                                    ui.horizontal(|ui| {
+                                        for width in [1.0_f32, 2.0, 4.0] {
+                                            if width_choice(
+                                                ui,
+                                                width,
+                                                (style.stroke_width - width).abs() < f32::EPSILON,
+                                                self.dark_mode,
+                                            )
+                                            .clicked()
+                                            {
+                                                patch.stroke_width = Some(width);
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Stroke style", self.dark_mode);
+                                    ui.horizontal(|ui| {
+                                        for (stroke_style, label) in [
+                                            (StrokeStyle::Solid, "Solid"),
+                                            (StrokeStyle::Dashed, "Dashed"),
+                                            (StrokeStyle::Dotted, "Dotted"),
+                                        ] {
+                                            if stroke_style_choice(
+                                                ui,
+                                                stroke_style,
+                                                style.stroke_style == stroke_style,
+                                                self.dark_mode,
+                                            )
+                                            .on_hover_text(label)
+                                            .clicked()
+                                            {
+                                                patch.stroke_style = Some(stroke_style);
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+
                                     ui.add_space(10.0);
                                     section_label(ui, "Sloppiness", self.dark_mode);
                                     ui.horizontal(|ui| {
@@ -5117,9 +4864,7 @@ impl WorkspaceUi {
                                             }
                                         }
                                     });
-                                }
 
-                                if !freehand_properties {
                                     ui.add_space(10.0);
                                     section_label(ui, "Edges", self.dark_mode);
                                     ui.horizontal(|ui| {
@@ -5141,140 +4886,341 @@ impl WorkspaceUi {
                                             }
                                         }
                                     });
+                                } else {
+                                    section_label(ui, "Stroke", self.dark_mode);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        for color in palette.into_iter().take(stroke_preset_limit) {
+                                            if color_swatch(
+                                                ui,
+                                                Some(color),
+                                                to_color32(style.stroke) == color,
+                                                self.dark_mode,
+                                            )
+                                            .clicked()
+                                            {
+                                                patch.stroke = Some(to_core_color(color));
+                                                changed = true;
+                                            }
+                                        }
+                                        let custom = to_color32(style.stroke);
+                                        ui.separator();
+                                        let response = color_swatch(
+                                            ui,
+                                            Some(custom),
+                                            self.color_picker == Some(ColorPickerTarget::Stroke),
+                                            self.dark_mode,
+                                        );
+                                        if response.clicked() {
+                                            color_target = Some(ColorPickerTarget::Stroke);
+                                        }
+                                    });
+
+                                    if !freehand_properties {
+                                        ui.add_space(10.0);
+                                        section_label(ui, "Background", self.dark_mode);
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            if color_swatch(
+                                                ui,
+                                                None,
+                                                style.fill.is_none(),
+                                                self.dark_mode,
+                                            )
+                                            .on_hover_text("Transparent")
+                                            .clicked()
+                                            {
+                                                patch.fill = Some(None);
+                                                changed = true;
+                                            }
+                                            for color in FILL_COLORS {
+                                                if color_swatch(
+                                                    ui,
+                                                    Some(color),
+                                                    style.fill.is_some_and(|fill| {
+                                                        to_color32(fill) == color
+                                                    }),
+                                                    self.dark_mode,
+                                                )
+                                                .clicked()
+                                                {
+                                                    patch.fill = Some(Some(to_core_color(color)));
+                                                    changed = true;
+                                                }
+                                            }
+                                            let custom = style.fill.map_or(
+                                                Color32::from_rgb(221, 214, 254),
+                                                to_color32,
+                                            );
+                                            ui.separator();
+                                            let response = color_swatch(
+                                                ui,
+                                                Some(custom),
+                                                self.color_picker == Some(ColorPickerTarget::Fill),
+                                                self.dark_mode,
+                                            );
+                                            if response.clicked() {
+                                                color_target = Some(ColorPickerTarget::Fill);
+                                            }
+                                        });
+                                    }
+
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Fill", self.dark_mode);
+                                    ui.horizontal(|ui| {
+                                        if property_choice(
+                                            ui,
+                                            Icon::FillNone,
+                                            "None",
+                                            style.fill.is_none(),
+                                            self.dark_mode,
+                                        )
+                                        .clicked()
+                                        {
+                                            patch = fill_choice_patch(style.fill, false);
+                                            changed = true;
+                                        }
+                                        if property_choice(
+                                            ui,
+                                            Icon::FillSolid,
+                                            "Solid",
+                                            style.fill.is_some(),
+                                            self.dark_mode,
+                                        )
+                                        .clicked()
+                                        {
+                                            patch = fill_choice_patch(style.fill, true);
+                                            changed = true;
+                                        }
+                                    });
+
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Stroke width", self.dark_mode);
+                                    ui.horizontal(|ui| {
+                                        for width in [1.0_f32, 2.0, 4.0] {
+                                            if width_choice(
+                                                ui,
+                                                width,
+                                                (style.stroke_width - width).abs() < f32::EPSILON,
+                                                self.dark_mode,
+                                            )
+                                            .clicked()
+                                            {
+                                                patch.stroke_width = Some(width);
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Stroke style", self.dark_mode);
+                                    ui.horizontal(|ui| {
+                                        for (stroke_style, label) in [
+                                            (StrokeStyle::Solid, "Solid"),
+                                            (StrokeStyle::Dashed, "Dashed"),
+                                            (StrokeStyle::Dotted, "Dotted"),
+                                        ] {
+                                            if stroke_style_choice(
+                                                ui,
+                                                stroke_style,
+                                                style.stroke_style == stroke_style,
+                                                self.dark_mode,
+                                            )
+                                            .on_hover_text(label)
+                                            .clicked()
+                                            {
+                                                patch.stroke_style = Some(stroke_style);
+                                                changed = true;
+                                            }
+                                        }
+                                    });
+
+                                    if !freehand_properties {
+                                        ui.add_space(10.0);
+                                        section_label(ui, "Sloppiness", self.dark_mode);
+                                        ui.horizontal(|ui| {
+                                            for (sloppiness, icon, label) in [
+                                                (Sloppiness::Architect, Icon::PenNib, "Architect"),
+                                                (Sloppiness::Artist, Icon::QuillPen, "Artist"),
+                                                (Sloppiness::Cartoonist, Icon::Brush, "Cartoonist"),
+                                            ] {
+                                                if property_choice(
+                                                    ui,
+                                                    icon,
+                                                    label,
+                                                    style.sloppiness == sloppiness,
+                                                    self.dark_mode,
+                                                )
+                                                .clicked()
+                                                {
+                                                    patch.sloppiness = Some(sloppiness);
+                                                    changed = true;
+                                                }
+                                            }
+                                        });
+                                    }
+
+                                    if !freehand_properties {
+                                        ui.add_space(10.0);
+                                        section_label(ui, "Edges", self.dark_mode);
+                                        ui.horizontal(|ui| {
+                                            for (edges, icon, label) in [
+                                                (EdgeStyle::Sharp, Icon::Rectangle, "Sharp"),
+                                                (EdgeStyle::Rounded, Icon::Rounded, "Rounded"),
+                                            ] {
+                                                if property_choice(
+                                                    ui,
+                                                    icon,
+                                                    label,
+                                                    style.edges == edges,
+                                                    self.dark_mode,
+                                                )
+                                                .clicked()
+                                                {
+                                                    patch.edges = Some(edges);
+                                                    changed = true;
+                                                }
+                                            }
+                                        });
+                                    }
                                 }
-                            }
 
-                            ui.add_space(10.0);
-                            section_label(ui, "Opacity", self.dark_mode);
-                            let mut opacity = style.opacity;
-                            // Leave room for the properties scroll bar and the
-                            // slider handle so the two controls never overlap.
-                            let slider_width = (ui.available_width() - 18.0).max(80.0);
-                            let track = if self.dark_mode {
-                                DARK_BORDER
-                            } else {
-                                LIGHT_BORDER
-                            };
-                            let opacity_tooltip = format!("{:.0}%", opacity * 100.0);
-                            let slider_response = range_slider(
-                                ui,
-                                &mut opacity,
-                                0.0..=1.0,
-                                Vec2::new(slider_width, 16.0),
-                                track,
-                                ACCENT,
-                                Some(opacity_tooltip),
-                            );
-                            if slider_response.changed() {
-                                patch.opacity = Some(opacity);
-                                changed = true;
-                            }
-                            if self.selected.len() > 1 {
                                 ui.add_space(10.0);
-                                section_label(ui, "Align", self.dark_mode);
-                                ui.horizontal_wrapped(|ui| {
-                                    for (action, icon, label) in [
-                                        (AlignAction::Left, Icon::AlignItemLeft, "Align left"),
-                                        (
-                                            AlignAction::CenterHorizontal,
-                                            Icon::AlignItemHorizontalCenter,
-                                            "Align center",
-                                        ),
-                                        (AlignAction::Right, Icon::AlignItemRight, "Align right"),
-                                        (AlignAction::Top, Icon::AlignItemTop, "Align top"),
-                                        (
-                                            AlignAction::CenterVertical,
-                                            Icon::AlignItemVerticalCenter,
-                                            "Align middle",
-                                        ),
-                                        (
-                                            AlignAction::Bottom,
-                                            Icon::AlignItemBottom,
-                                            "Align bottom",
-                                        ),
-                                    ] {
-                                        if icon_button(ui, icon, label, false, self.dark_mode)
-                                            .clicked()
-                                        {
-                                            align_action = Some(action);
+                                section_label(ui, "Opacity", self.dark_mode);
+                                let mut opacity = style.opacity;
+                                // Leave room for the properties scroll bar and the
+                                // slider handle so the two controls never overlap.
+                                let slider_width = (ui.available_width() - 18.0).max(80.0);
+                                let track = if self.dark_mode {
+                                    DARK_BORDER
+                                } else {
+                                    LIGHT_BORDER
+                                };
+                                let opacity_tooltip = format!("{:.0}%", opacity * 100.0);
+                                let slider_response = range_slider(
+                                    ui,
+                                    &mut opacity,
+                                    0.0..=1.0,
+                                    Vec2::new(slider_width, 16.0),
+                                    track,
+                                    ACCENT,
+                                    Some(opacity_tooltip),
+                                );
+                                if slider_response.changed() {
+                                    patch.opacity = Some(opacity);
+                                    changed = true;
+                                }
+                                if self.selected.len() > 1 {
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Align", self.dark_mode);
+                                    ui.horizontal_wrapped(|ui| {
+                                        for (action, icon, label) in [
+                                            (AlignAction::Left, Icon::AlignItemLeft, "Align left"),
+                                            (
+                                                AlignAction::CenterHorizontal,
+                                                Icon::AlignItemHorizontalCenter,
+                                                "Align center",
+                                            ),
+                                            (
+                                                AlignAction::Right,
+                                                Icon::AlignItemRight,
+                                                "Align right",
+                                            ),
+                                            (AlignAction::Top, Icon::AlignItemTop, "Align top"),
+                                            (
+                                                AlignAction::CenterVertical,
+                                                Icon::AlignItemVerticalCenter,
+                                                "Align middle",
+                                            ),
+                                            (
+                                                AlignAction::Bottom,
+                                                Icon::AlignItemBottom,
+                                                "Align bottom",
+                                            ),
+                                        ] {
+                                            if icon_button(ui, icon, label, false, self.dark_mode)
+                                                .clicked()
+                                            {
+                                                align_action = Some(action);
+                                            }
                                         }
-                                    }
-                                });
-                            }
+                                    });
+                                }
 
-                            if !self.selected.is_empty() {
-                                ui.add_space(10.0);
-                                section_label(ui, "Layers", self.dark_mode);
-                                ui.horizontal(|ui| {
-                                    for (action, icon, label) in [
-                                        (
-                                            LayerAction::SendToBack,
-                                            Icon::LayerSendToBack,
-                                            "Send to back",
-                                        ),
-                                        (
-                                            LayerAction::SendBackward,
-                                            Icon::LayerSendBackward,
-                                            "Send backward",
-                                        ),
-                                        (
-                                            LayerAction::BringForward,
-                                            Icon::LayerBringForward,
-                                            "Bring forward",
-                                        ),
-                                        (
-                                            LayerAction::BringToFront,
-                                            Icon::LayerBringToFront,
-                                            "Bring to front",
-                                        ),
-                                    ] {
-                                        if icon_button(ui, icon, label, false, self.dark_mode)
-                                            .clicked()
-                                        {
-                                            layer_action = Some(action);
+                                if !self.selected.is_empty() {
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Layers", self.dark_mode);
+                                    ui.horizontal(|ui| {
+                                        for (action, icon, label) in [
+                                            (
+                                                LayerAction::SendToBack,
+                                                Icon::LayerSendToBack,
+                                                "Send to back",
+                                            ),
+                                            (
+                                                LayerAction::SendBackward,
+                                                Icon::LayerSendBackward,
+                                                "Send backward",
+                                            ),
+                                            (
+                                                LayerAction::BringForward,
+                                                Icon::LayerBringForward,
+                                                "Bring forward",
+                                            ),
+                                            (
+                                                LayerAction::BringToFront,
+                                                Icon::LayerBringToFront,
+                                                "Bring to front",
+                                            ),
+                                        ] {
+                                            if icon_button(ui, icon, label, false, self.dark_mode)
+                                                .clicked()
+                                            {
+                                                layer_action = Some(action);
+                                            }
                                         }
-                                    }
-                                });
+                                    });
 
-                                ui.add_space(10.0);
-                                section_label(ui, "Actions", self.dark_mode);
-                                ui.horizontal(|ui| {
-                                    if icon_button(
-                                        ui,
-                                        Icon::Duplicate,
-                                        "Duplicate",
-                                        false,
-                                        self.dark_mode,
-                                    )
-                                    .clicked()
-                                    {
-                                        element_action = Some(ElementAction::Duplicate);
-                                    }
-                                    if icon_button(
-                                        ui,
-                                        Icon::Delete,
-                                        "Delete",
-                                        false,
-                                        self.dark_mode,
-                                    )
-                                    .clicked()
-                                    {
-                                        element_action = Some(ElementAction::Delete);
-                                    }
-                                    if icon_button(
-                                        ui,
-                                        Icon::Link,
-                                        "Copy element link",
-                                        false,
-                                        self.dark_mode,
-                                    )
-                                    .clicked()
-                                    {
-                                        element_action = Some(ElementAction::CopyLink);
-                                    }
-                                });
-                            }
-                        });
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Actions", self.dark_mode);
+                                    ui.horizontal(|ui| {
+                                        if icon_button(
+                                            ui,
+                                            Icon::Duplicate,
+                                            "Duplicate",
+                                            false,
+                                            self.dark_mode,
+                                        )
+                                        .clicked()
+                                        {
+                                            element_action = Some(ElementAction::Duplicate);
+                                        }
+                                        if icon_button(
+                                            ui,
+                                            Icon::Delete,
+                                            "Delete",
+                                            false,
+                                            self.dark_mode,
+                                        )
+                                        .clicked()
+                                        {
+                                            element_action = Some(ElementAction::Delete);
+                                        }
+                                        if icon_button(
+                                            ui,
+                                            Icon::Link,
+                                            "Copy element link",
+                                            false,
+                                            self.dark_mode,
+                                        )
+                                        .clicked()
+                                        {
+                                            element_action = Some(ElementAction::CopyLink);
+                                        }
+                                    });
+                                }
+                            });
+                    });
                 });
             });
 
@@ -6405,6 +6351,11 @@ fn collaboration_display_name_is_valid(name: &str) -> bool {
 
 fn collaboration_invite_field_width(available_width: f32) -> f32 {
     (available_width - COLLABORATION_CONTROL_GAP - COLLABORATION_COPY_BUTTON_WIDTH).max(0.0)
+}
+
+fn collaboration_invite_preview(room_id: &str, capability_token: &str) -> String {
+    let token_preview = capability_token.chars().take(8).collect::<String>();
+    format!("{room_id}:{token_preview}")
 }
 
 fn collaboration_invite_field(
@@ -8963,19 +8914,19 @@ mod tests {
         WorkspaceUi, apply_palette_with_default_migration, apply_text_resize_font_size,
         char_cursor_to_byte_index, collaboration_avatar_center_x, collaboration_avatar_stack_width,
         collaboration_display_name_is_valid, collaboration_invite_field_width,
-        collaboration_participant_avatar_colors, collaboration_participant_initial,
-        collaboration_popup_should_dismiss, collaboration_primary_button, collaboration_text_field,
-        color_picker_patch, confirmation_frame, custom_font_size_selected, delete_previous_word,
-        fill_choice_patch, grid_step_for_zoom, insert_text_at_cursor, insert_text_event,
-        key_binding_label, mossbyte_agency_credit_layout, next_char_cursor, next_word_cursor,
-        next_z_index, padded_selection_bounds, platform_label, preset_font_size_selected,
-        previous_char_cursor, previous_word_cursor, reordered_layer_ids,
-        resolve_drop_screen_position, rotated_text_origin, selection_drag_position,
-        selection_handle_cursor_tolerance, selection_handle_drag_tolerance, settings_group_frame,
-        settings_keybind_card_frame, settings_scroll_bar_visibility, settings_visuals,
-        settings_window_frame, sloppiness_amplitude, sloppy_polyline, stroke_preset_count,
-        text_create_command, text_update_command, to_core_color, zoom_delta_for_scroll,
-        zoom_percent,
+        collaboration_invite_preview, collaboration_participant_avatar_colors,
+        collaboration_participant_initial, collaboration_popup_should_dismiss,
+        collaboration_primary_button, collaboration_text_field, color_picker_patch,
+        confirmation_frame, custom_font_size_selected, delete_previous_word, fill_choice_patch,
+        grid_step_for_zoom, insert_text_at_cursor, insert_text_event, key_binding_label,
+        mossbyte_agency_credit_layout, next_char_cursor, next_word_cursor, next_z_index,
+        padded_selection_bounds, platform_label, preset_font_size_selected, previous_char_cursor,
+        previous_word_cursor, reordered_layer_ids, resolve_drop_screen_position,
+        rotated_text_origin, selection_drag_position, selection_handle_cursor_tolerance,
+        selection_handle_drag_tolerance, settings_group_frame, settings_keybind_card_frame,
+        settings_scroll_bar_visibility, settings_visuals, settings_window_frame,
+        sloppiness_amplitude, sloppy_polyline, stroke_preset_count, text_create_command,
+        text_update_command, to_core_color, zoom_delta_for_scroll, zoom_percent,
     };
 
     use crate::selection::SelectionHandle;
@@ -9335,6 +9286,17 @@ mod tests {
     }
 
     #[test]
+    fn collaboration_invite_preview_keeps_room_id_and_short_token_hint() {
+        assert_eq!(
+            collaboration_invite_preview(
+                "92b45a26-1f24-47b0-ada2-df37660c65c2",
+                "48e32363-ed3a-459f-ab71-9813584dfee9e6d690e8-0309-4449-a211-d5b973f774da",
+            ),
+            "92b45a26-1f24-47b0-ada2-df37660c65c2:48e32363"
+        );
+    }
+
+    #[test]
     fn mossbyte_agency_credit_uses_the_configured_https_url() {
         assert_eq!(MOSSBYTE_AGENCY_URL, "https://mossbyteagency.com/");
     }
@@ -9592,32 +9554,15 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_settings_restores_the_session_preference() {
+    fn closing_settings_keeps_live_changes() {
         let mut workspace = WorkspaceUi::default();
         workspace.toggle_settings();
         workspace.restore_session = false;
 
-        workspace.cancel_settings();
+        workspace.close_settings();
 
-        assert!(workspace.restore_session_enabled());
+        assert!(!workspace.restore_session_enabled());
         assert!(!workspace.settings_open);
-    }
-
-    #[test]
-    fn restoring_settings_defaults_resets_appearance_mode() {
-        let mut workspace = WorkspaceUi {
-            appearance: super::AppearanceMode::Dark,
-            dark_mode: true,
-            ..WorkspaceUi::default()
-        };
-
-        workspace.restore_settings_defaults();
-
-        assert_eq!(workspace.appearance, super::AppearanceMode::System);
-        assert_eq!(
-            workspace.dark_mode,
-            workspace.system_dark_mode.unwrap_or(false)
-        );
     }
 
     #[test]
@@ -9673,25 +9618,6 @@ mod tests {
         let restored = WorkspaceUi::from_settings(&snapshot);
         assert_eq!(restored.new_object_style, new_style);
         assert_eq!(restored.draft_style, new_style);
-    }
-
-    #[test]
-    fn cancelling_settings_preserves_an_unremembered_drawing_style() {
-        let mut workspace = WorkspaceUi::default();
-        let style = Style {
-            stroke: Color::rgba(12, 34, 56, 255),
-            stroke_width: 7.0,
-            ..Style::default()
-        };
-        workspace.remember_drawing_style = false;
-        workspace.new_object_style = style;
-        workspace.draft_style = style;
-        workspace.toggle_settings();
-
-        workspace.cancel_settings();
-
-        assert_eq!(workspace.new_object_style, style);
-        assert_eq!(workspace.draft_style, style);
     }
 
     #[test]

@@ -9,6 +9,9 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
+
+#[cfg(target_os = "linux")]
 use std::process::Stdio;
 
 #[cfg(target_os = "windows")]
@@ -162,6 +165,15 @@ struct ReleaseAsset {
     digest: Option<String>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxAssetKind {
+    Portable,
+    Arch,
+    Debian,
+    Rpm,
+}
+
 /// Checks GitHub Releases and returns a cache suitable for persistence.
 pub(crate) fn check() -> Result<UpdateCache, UpdateError> {
     let client = reqwest::blocking::Client::builder()
@@ -180,6 +192,8 @@ pub(crate) fn check() -> Result<UpdateCache, UpdateError> {
     }
     let releases = response.error_for_status()?.json::<Vec<GitHubRelease>>()?;
 
+    #[cfg(target_os = "linux")]
+    let asset_kind = linux_asset_kind();
     let mut latest_stable: Option<(Version, String, Option<ReleaseAsset>)> = None;
     let mut latest_edge: Option<(Version, String, Option<ReleaseAsset>)> = None;
     for release in releases {
@@ -189,6 +203,9 @@ pub(crate) fn check() -> Result<UpdateCache, UpdateError> {
         let Some(version) = parse_tag(&release.tag_name) else {
             continue;
         };
+        #[cfg(target_os = "linux")]
+        let asset = auto_update_asset(&release, asset_kind).and_then(release_asset);
+        #[cfg(not(target_os = "linux"))]
         let asset = auto_update_asset(&release).and_then(release_asset);
         let entry = (version.clone(), release.html_url, asset);
         if latest_edge
@@ -351,6 +368,24 @@ pub(crate) fn take_update_result() -> Option<String> {
     })
 }
 
+#[cfg(target_os = "linux")]
+fn auto_update_asset(release: &GitHubRelease, asset_kind: LinuxAssetKind) -> Option<&GitHubAsset> {
+    let suffix = match asset_kind {
+        LinuxAssetKind::Portable => "-linux-x86_64",
+        LinuxAssetKind::Arch => ".pkg.tar.zst",
+        LinuxAssetKind::Debian => ".deb",
+        LinuxAssetKind::Rpm => ".rpm",
+    };
+
+    release.assets.iter().find(|asset| {
+        asset.name.ends_with(suffix)
+            && asset
+                .browser_download_url
+                .starts_with(RELEASE_DOWNLOAD_PREFIX)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
 fn auto_update_asset(release: &GitHubRelease) -> Option<&GitHubAsset> {
     #[cfg(target_os = "windows")]
     let suffix = if release.prerelease {
@@ -358,8 +393,6 @@ fn auto_update_asset(release: &GitHubRelease) -> Option<&GitHubAsset> {
     } else {
         "-windows-x86_64-setup.exe"
     };
-    #[cfg(target_os = "linux")]
-    let suffix = "-linux-x86_64";
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let suffix = "";
 
@@ -403,10 +436,19 @@ fn is_supported_asset_name(name: &str) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        return name.ends_with("-linux-x86_64");
+        return name.ends_with("-linux-x86_64")
+            || name.ends_with(".pkg.tar.zst")
+            || has_extension(name, "deb")
+            || has_extension(name, "rpm");
     }
     #[allow(unreachable_code)]
     false
+}
+
+fn has_extension(name: &str, extension: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case(extension))
 }
 
 fn download_asset(url: &str, destination: &std::path::Path) -> Result<(), UpdateError> {
@@ -467,7 +509,9 @@ fn install_linux_update(
     name: &str,
     expected_digest: Option<&str>,
 ) -> Result<(), UpdateError> {
-    use std::os::unix::fs::PermissionsExt;
+    if name.ends_with(".pkg.tar.zst") || has_extension(name, "deb") || has_extension(name, "rpm") {
+        return install_linux_package_update(url, name, expected_digest);
+    }
 
     let executable = std::env::current_exe()?;
     let parent = executable.parent().ok_or_else(|| {
@@ -511,6 +555,96 @@ fn install_linux_update(
         return Err(error.into());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_package_update(
+    url: &str,
+    name: &str,
+    expected_digest: Option<&str>,
+) -> Result<(), UpdateError> {
+    let package_command = if name.ends_with(".pkg.tar.zst") {
+        if linux_asset_kind() != LinuxAssetKind::Arch {
+            return Err(UpdateError::UnsupportedAsset);
+        }
+        String::from("pkexec pacman --upgrade --noconfirm \"$1\"")
+    } else if has_extension(name, "deb") {
+        if linux_asset_kind() != LinuxAssetKind::Debian {
+            return Err(UpdateError::UnsupportedAsset);
+        }
+        String::from("pkexec dpkg --install \"$1\"")
+    } else if has_extension(name, "rpm") {
+        if linux_asset_kind() != LinuxAssetKind::Rpm {
+            return Err(UpdateError::UnsupportedAsset);
+        }
+        String::from("pkexec rpm --upgrade --replacepkgs \"$1\"")
+    } else {
+        return Err(UpdateError::UnsupportedAsset);
+    };
+    let executable = std::env::current_exe()?;
+    let staged = std::env::temp_dir().join(format!("Sketchi-update-{}-{name}", std::process::id()));
+    download_asset(url, &staged)?;
+    if let Err(error) = verify_digest(&staged, expected_digest) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+
+    let result_path = mark_update_pending()?;
+    let script = format!(
+        "while kill -0 \"$3\" 2>/dev/null; do sleep 0.1; done; \\
+         if {package_command}; then \\
+             printf 'success\\n' > \"$4\"; \\
+             exec \"$2\"; \\
+         else \\
+             printf 'failure: package manager could not install the update\\n' > \"$4\"; \\
+             exit 1; \\
+         fi"
+    );
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(script)
+        .arg("sketchi-update")
+        .arg(&staged)
+        .arg(&executable)
+        .arg(std::process::id().to_string())
+        .arg(&result_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Err(error) = command.spawn() {
+        clear_update_result(&result_path);
+        let _ = fs::remove_file(&staged);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_asset_kind() -> LinuxAssetKind {
+    let Ok(executable) = std::env::current_exe() else {
+        return LinuxAssetKind::Portable;
+    };
+    let executable = executable.to_string_lossy();
+    if command_succeeds("pacman", &["-Qo", executable.as_ref()]) {
+        LinuxAssetKind::Arch
+    } else if command_succeeds("dpkg-query", &["--search", executable.as_ref()]) {
+        LinuxAssetKind::Debian
+    } else if command_succeeds("rpm", &["-qf", executable.as_ref()]) {
+        LinuxAssetKind::Rpm
+    } else {
+        LinuxAssetKind::Portable
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn command_succeeds(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(target_os = "windows")]
@@ -683,6 +817,9 @@ mod tests {
 
     use super::{UpdateCache, UpdateChannel, format_last_checked, is_check_due, now_epoch, status};
 
+    #[cfg(target_os = "linux")]
+    use super::{GitHubAsset, GitHubRelease, LinuxAssetKind, auto_update_asset};
+
     #[test]
     fn stable_channel_ignores_edge_only_updates() {
         let cache = UpdateCache {
@@ -746,5 +883,76 @@ mod tests {
         assert!(is_check_due(None));
         assert!(!is_check_due(Some(now_epoch())));
         assert!(is_check_due(Some(now_epoch().saturating_sub(4 * 60 * 60))));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_asset_selection_matches_the_installed_package_format() {
+        let release = GitHubRelease {
+            tag_name: String::from("v0.3.1"),
+            html_url: String::from("https://github.com/mossbytehq/Sketchi/releases/tag/v0.3.1"),
+            prerelease: false,
+            draft: false,
+            assets: vec![
+                GitHubAsset {
+                    name: String::from("Sketchi-0.3.1-linux-x86_64"),
+                    browser_download_url: String::from(
+                        "https://github.com/mossbytehq/Sketchi/releases/download/v0.3.1/Sketchi-0.3.1-linux-x86_64",
+                    ),
+                    digest: None,
+                },
+                GitHubAsset {
+                    name: String::from("sketchi-0.3.1-1-x86_64.pkg.tar.zst"),
+                    browser_download_url: String::from(
+                        "https://github.com/mossbytehq/Sketchi/releases/download/v0.3.1/sketchi-0.3.1-1-x86_64.pkg.tar.zst",
+                    ),
+                    digest: None,
+                },
+                GitHubAsset {
+                    name: String::from("sketchi_0.3.1_amd64.deb"),
+                    browser_download_url: String::from(
+                        "https://github.com/mossbytehq/Sketchi/releases/download/v0.3.1/sketchi_0.3.1_amd64.deb",
+                    ),
+                    digest: None,
+                },
+                GitHubAsset {
+                    name: String::from("sketchi-0.3.1-1.x86_64.rpm"),
+                    browser_download_url: String::from(
+                        "https://github.com/mossbytehq/Sketchi/releases/download/v0.3.1/sketchi-0.3.1-1.x86_64.rpm",
+                    ),
+                    digest: None,
+                },
+            ],
+        };
+
+        assert!(
+            auto_update_asset(&release, LinuxAssetKind::Portable)
+                .is_some_and(|asset| asset.name.ends_with("-linux-x86_64"))
+        );
+        assert!(
+            auto_update_asset(&release, LinuxAssetKind::Arch)
+                .is_some_and(|asset| asset.name.ends_with(".pkg.tar.zst"))
+        );
+        assert!(
+            auto_update_asset(&release, LinuxAssetKind::Debian)
+                .is_some_and(|asset| super::has_extension(&asset.name, "deb"))
+        );
+        assert!(
+            auto_update_asset(&release, LinuxAssetKind::Rpm)
+                .is_some_and(|asset| super::has_extension(&asset.name, "rpm"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_package_assets_are_supported() {
+        assert!(super::is_supported_asset_name("sketchi_0.3.1_amd64.deb"));
+        assert!(super::is_supported_asset_name(
+            "sketchi-0.3.1-1-x86_64.pkg.tar.zst"
+        ));
+        assert!(super::is_supported_asset_name("sketchi-0.3.1-1.x86_64.rpm"));
+        assert!(!super::is_supported_asset_name(
+            "sketchi-0.3.1_amd64.tar.gz"
+        ));
     }
 }

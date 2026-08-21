@@ -3,7 +3,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Display,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -178,6 +181,7 @@ pub async fn run_reconnecting(
         mut outbound,
         inbound,
         handshake,
+        connection_generation,
         mut shutdown,
     } = endpoints;
     loop {
@@ -190,11 +194,28 @@ pub async fn run_reconnecting(
             }
         };
         if let Ok((socket, _)) = connection {
+            let generation = connection_generation
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
             backoff.on_connected();
-            match run_socket(socket, &mut outbound, &inbound, &handshake, &mut shutdown).await {
+            match run_socket(
+                socket,
+                &mut outbound,
+                &inbound,
+                &handshake,
+                generation,
+                &mut shutdown,
+            )
+            .await
+            {
                 Ok(()) => return Ok(()),
-                Err(ConnectionError::Disconnected | ConnectionError::Transport(_)) => {}
-                Err(error) => return Err(error),
+                Err(ConnectionError::Disconnected | ConnectionError::Transport(_)) => {
+                    connection_generation.fetch_add(1, Ordering::AcqRel);
+                }
+                Err(error) => {
+                    connection_generation.fetch_add(1, Ordering::AcqRel);
+                    return Err(error);
+                }
             }
         }
         match backoff.on_disconnect() {
@@ -218,8 +239,9 @@ pub async fn run_reconnecting(
 async fn run_socket<S>(
     socket: WebSocketStream<S>,
     outbound: &mut mpsc::Receiver<ClientMessage>,
-    inbound: &mpsc::Sender<ServerMessage>,
+    inbound: &mpsc::Sender<ReceivedServerMessage>,
     handshake: &Mutex<Vec<ClientMessage>>,
+    generation: u64,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), ConnectionError>
 where
@@ -250,8 +272,26 @@ where
                     return Err(ConnectionError::Disconnected);
                 };
                 match message? {
-                    Message::Text(text) => inbound.send(decode_server(text.as_bytes())?).await.map_err(|_| ConnectionError::InboundClosed)?,
-                    Message::Binary(bytes) => inbound.send(decode_server(&bytes)?).await.map_err(|_| ConnectionError::InboundClosed)?,
+                    Message::Text(text) => {
+                        let message = decode_server(text.as_bytes())?;
+                        inbound
+                            .send(ReceivedServerMessage {
+                                generation,
+                                message,
+                            })
+                            .await
+                            .map_err(|_| ConnectionError::InboundClosed)?;
+                    }
+                    Message::Binary(bytes) => {
+                        let message = decode_server(&bytes)?;
+                        inbound
+                            .send(ReceivedServerMessage {
+                                generation,
+                                message,
+                            })
+                            .await
+                            .map_err(|_| ConnectionError::InboundClosed)?;
+                    }
                     Message::Close(_) => return Err(ConnectionError::Disconnected),
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
                 }
@@ -262,6 +302,15 @@ where
             }
         }
     }
+}
+
+/// A server frame tagged with the transport connection that delivered it.
+#[derive(Debug)]
+pub struct ReceivedServerMessage {
+    /// Monotonic client-side transport generation.
+    pub generation: u64,
+    /// Decoded server protocol message.
+    pub message: ServerMessage,
 }
 
 #[derive(Debug)]
@@ -345,9 +394,10 @@ pub struct ConnectionChannels {
     /// Outbound client messages.
     pub outbound: mpsc::Sender<ClientMessage>,
     /// Inbound server messages.
-    pub inbound: mpsc::Receiver<ServerMessage>,
+    pub inbound: mpsc::Receiver<ReceivedServerMessage>,
     /// Shared handshake replay state used before every transport connection.
     pub handshake: Arc<Mutex<Vec<ClientMessage>>>,
+    connection_generation: Arc<AtomicU64>,
     shutdown: ShutdownSignal,
 }
 
@@ -356,9 +406,10 @@ pub struct NetworkEndpoints {
     /// Receiver consumed by the network task.
     pub outbound: mpsc::Receiver<ClientMessage>,
     /// Sender used by the network task.
-    pub inbound: mpsc::Sender<ServerMessage>,
+    pub inbound: mpsc::Sender<ReceivedServerMessage>,
     /// Shared handshake replay state used before every transport connection.
     pub handshake: Arc<Mutex<Vec<ClientMessage>>>,
+    connection_generation: Arc<AtomicU64>,
     /// Cancellation signal owned by the UI session.
     pub shutdown: watch::Receiver<bool>,
 }
@@ -381,6 +432,7 @@ pub fn bounded_channels() -> (ConnectionChannels, NetworkEndpoints) {
     let (outbound, outbound_receiver) = mpsc::channel(CHANNEL_CAPACITY);
     let (inbound_sender, inbound) = mpsc::channel(CHANNEL_CAPACITY);
     let handshake = Arc::new(Mutex::new(Vec::new()));
+    let connection_generation = Arc::new(AtomicU64::new(0));
     let (shutdown_sender, shutdown) = watch::channel(false);
     let shutdown_signal = ShutdownSignal {
         sender: shutdown_sender,
@@ -390,12 +442,14 @@ pub fn bounded_channels() -> (ConnectionChannels, NetworkEndpoints) {
             outbound,
             inbound,
             handshake: Arc::clone(&handshake),
+            connection_generation: Arc::clone(&connection_generation),
             shutdown: shutdown_signal,
         },
         NetworkEndpoints {
             outbound: outbound_receiver,
             inbound: inbound_sender,
             handshake,
+            connection_generation,
             shutdown,
         },
     )
@@ -614,6 +668,9 @@ pub struct CollaborationClient {
     presence: BTreeMap<canvas_core::ClientId, PresenceState>,
     presence_throttle: PresenceThrottle,
     create_request_id: Option<u64>,
+    connection_generation: Arc<AtomicU64>,
+    welcome_generation: Option<u64>,
+    sync_generation: Option<u64>,
 }
 
 impl CollaborationClient {
@@ -638,6 +695,7 @@ impl CollaborationClient {
         )?;
         let (channels, endpoints) = bounded_channels();
         let shutdown = channels.shutdown.clone();
+        let connection_generation = Arc::clone(&channels.connection_generation);
         let backoff = ReconnectBackoff::default_policy();
         let mut client = Self {
             handshake: Arc::clone(&channels.handshake),
@@ -662,6 +720,9 @@ impl CollaborationClient {
             presence_throttle: PresenceThrottle::new(Duration::from_millis(50))
                 .map_err(|error| ConnectionError::InvalidInvite(error.to_string()))?,
             create_request_id: None,
+            connection_generation,
+            welcome_generation: None,
+            sync_generation: None,
         };
         client
             .participants
@@ -744,6 +805,9 @@ impl CollaborationClient {
         let Some(room_id) = self.room_id else {
             return Ok(());
         };
+        if !self.is_synchronized_for_current_connection() {
+            return Ok(());
+        }
         let pending = self.synchronization.pending_operations()?;
         let unsent = pending
             .into_iter()
@@ -769,13 +833,18 @@ impl CollaborationClient {
     ///
     /// Returns [`ConnectionError`] when the inbound channel closes or the
     /// runtime task finishes with a transport error.
-    pub fn poll(&mut self) -> Result<Vec<ServerMessage>, ConnectionError> {
+    pub fn poll(&mut self) -> Result<Vec<ReceivedServerMessage>, ConnectionError> {
         self.join_finished_runtime()?;
         self.flush_presence()?;
         let mut messages = Vec::new();
         loop {
             match self.channels.inbound.try_recv() {
-                Ok(message) => messages.push(message),
+                Ok(message)
+                    if message.generation == self.connection_generation.load(Ordering::Acquire) =>
+                {
+                    messages.push(message);
+                }
+                Ok(_) => {}
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     self.join_finished_runtime()?;
@@ -812,10 +881,15 @@ impl CollaborationClient {
     ///
     /// Returns [`ConnectionError::QueueFull`] or [`ConnectionError::Closed`]
     /// when the automatic join message cannot be queued.
-    pub fn observe(&mut self, message: &ServerMessage) -> Result<(), ConnectionError> {
-        match message {
+    pub fn observe(&mut self, received: &ReceivedServerMessage) -> Result<bool, ConnectionError> {
+        if received.generation != self.connection_generation.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        match &received.message {
             ServerMessage::Welcome { .. } => {
                 self.status = String::from("Connected; waiting for room sync…");
+                self.welcome_generation = Some(received.generation);
+                self.sync_generation = None;
             }
             ServerMessage::RoomCreated {
                 room_id,
@@ -833,8 +907,11 @@ impl CollaborationClient {
                 )?;
             }
             ServerMessage::SyncComplete { .. } => {
-                self.status = String::from("In collaboration room");
-                self.sent_operations.clear();
+                if self.welcome_generation == Some(received.generation) {
+                    self.status = String::from("In collaboration room");
+                    self.sync_generation = Some(received.generation);
+                    self.sent_operations.clear();
+                }
             }
             ServerMessage::Participants { participants, .. } => {
                 self.participants = participants
@@ -871,7 +948,7 @@ impl CollaborationClient {
             }
             _ => {}
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Sends one protocol message through the bounded channel.
@@ -934,6 +1011,12 @@ impl CollaborationClient {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.saturating_add(1).max(1);
         request_id
+    }
+
+    fn is_synchronized_for_current_connection(&self) -> bool {
+        self.sync_generation.is_some_and(|sync_generation| {
+            sync_generation == self.connection_generation.load(Ordering::Acquire)
+        })
     }
 }
 
@@ -1020,6 +1103,9 @@ mod tests {
             presence: BTreeMap::new(),
             presence_throttle,
             create_request_id: None,
+            connection_generation: Arc::new(AtomicU64::new(0)),
+            welcome_generation: None,
+            sync_generation: None,
         };
 
         assert!(matches!(
@@ -1027,6 +1113,63 @@ mod tests {
             Err(ConnectionError::ReconnectExhausted)
         ));
         assert_eq!(client.status, "reconnect attempts exhausted");
+    }
+
+    #[test]
+    fn synchronization_is_invalidated_when_transport_generation_changes() {
+        let (channels, endpoints) = bounded_channels();
+        let journal = Journal::open_in_memory();
+        assert!(journal.is_ok());
+        let Ok(journal) = journal else {
+            return;
+        };
+        let Ok(presence_throttle) = PresenceThrottle::new(Duration::from_millis(50)) else {
+            return;
+        };
+        let connection_generation = Arc::clone(&channels.connection_generation);
+        let mut client = CollaborationClient {
+            channels,
+            handshake: Arc::new(Mutex::new(Vec::new())),
+            runtime: None,
+            shutdown: ShutdownSignal {
+                sender: watch::channel(false).0,
+            },
+            synchronization: SyncController::new(journal),
+            room_id: None,
+            capability_token: None,
+            readiness: ReadyMessage {
+                endpoint: String::from("wss://127.0.0.1:3000/ws"),
+                certificate_sha256: "ab".repeat(32),
+            },
+            next_request_id: 1,
+            sent_operations: BTreeSet::new(),
+            status: String::from("Connecting"),
+            server_available: true,
+            client_id: canvas_core::ClientId::from_u128(1),
+            display_name: String::from("Test user"),
+            participants: BTreeMap::new(),
+            presence: BTreeMap::new(),
+            presence_throttle,
+            create_request_id: None,
+            connection_generation,
+            welcome_generation: Some(1),
+            sync_generation: Some(1),
+        };
+
+        client.connection_generation.store(1, Ordering::Release);
+        assert!(client.is_synchronized_for_current_connection());
+        client.connection_generation.store(2, Ordering::Release);
+        assert!(!client.is_synchronized_for_current_connection());
+        assert!(
+            endpoints
+                .inbound
+                .try_send(ReceivedServerMessage {
+                    generation: 1,
+                    message: ServerMessage::Pong { nonce: 1 },
+                })
+                .is_ok()
+        );
+        assert!(client.poll().is_ok_and(|messages| messages.is_empty()));
     }
 
     #[tokio::test]

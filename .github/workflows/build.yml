@@ -478,6 +478,53 @@ jobs:
           path: dist/artifacts
           if-no-files-found: error
 
+  deb-package:
+    name: Debian package
+    needs: [metadata, build]
+    if: ${{ !contains(needs.metadata.outputs.version, '-') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: sketchi-staging-x86_64-unknown-linux-gnu
+          path: dist/staging
+      - name: Build Debian package
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$(find dist/staging -mindepth 1 -maxdepth 1 -type d -name 'Sketchi-*-x86_64-unknown-linux-gnu' ! -name 'Sketchi-server-*' -print -quit)"
+          test -n "$stage" || { echo "client staging directory was not downloaded"; exit 1; }
+          stage="$(realpath "$stage")"
+          export SKETCHI_VERSION="$(tr -d '\r\n' < "$stage/VERSION")"
+          if [[ "$SKETCHI_VERSION" != "${{ needs.metadata.outputs.version }}" ]]; then
+            echo "metadata version ${{ needs.metadata.outputs.version }} does not match staged workspace version $SKETCHI_VERSION"
+            exit 1
+          fi
+          package_root="$PWD/dist/deb/sketchi"
+          mkdir -p "$package_root/DEBIAN" "$PWD/dist/artifacts"
+          sed "s/\${SKETCHI_VERSION}/$SKETCHI_VERSION/" packaging/deb/control > "$package_root/DEBIAN/control"
+          install -Dm755 "$stage/Sketchi" "$package_root/usr/bin/sketchi"
+          install -Dm755 "$stage/Sketchi-server" "$package_root/usr/bin/sketchi-server"
+          install -Dm644 "$stage/LICENSE.md" "$package_root/usr/share/doc/sketchi/LICENSE.md"
+          install -Dm644 "$stage/VERSION" "$package_root/usr/share/sketchi/VERSION"
+          install -Dm644 "$stage/share/applications/sketchi.desktop" \
+            "$package_root/usr/share/applications/sketchi.desktop"
+          install -Dm644 "$stage/share/icons/hicolor/512x512/apps/sketchi.png" \
+            "$package_root/usr/share/icons/hicolor/512x512/apps/sketchi.png"
+          dpkg-deb --build --root-owner-group "$package_root" \
+            "dist/artifacts/sketchi_${SKETCHI_VERSION}_amd64.deb"
+          dpkg-deb --info "dist/artifacts/sketchi_${SKETCHI_VERSION}_amd64.deb"
+          dpkg-deb --contents "dist/artifacts/sketchi_${SKETCHI_VERSION}_amd64.deb" \
+            | grep -F './usr/bin/sketchi'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sketchi-package-deb-${{ needs.metadata.outputs.version }}
+          path: dist/artifacts
+          if-no-files-found: error
+
   rpm-package:
     name: RPM package
     needs: [metadata, build]
