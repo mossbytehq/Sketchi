@@ -52,6 +52,7 @@ egui-winit.workspace = true
 futures-util.workspace = true
 glam.workspace = true
 image.workspace = true
+lucide-icons.workspace = true
 rfd.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -68,6 +69,10 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 wgpu.workspace = true
 winit.workspace = true
+flate2.workspace = true
 
 [lints]
 workspace = true
+
+[build-dependencies]
+flate2.workspace = true

@@ -12,6 +12,10 @@ use clap::Parser;
 struct Args {}
 
 fn main() {
+    // Rustls has multiple crypto providers in the dependency graph. Install
+    // the provider explicitly so release builds do not depend on feature
+    // unification choosing one for us.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,wgpu=warn"));
     let _ = tracing_subscriber::fmt()

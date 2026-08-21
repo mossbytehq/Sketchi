@@ -1,11 +1,15 @@
 //! Local collaboration-server supervision boundaries.
 
 use std::{
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     path::PathBuf,
-    process::{Child, Command, Stdio},
-    time::Duration,
+    process::{Child, Command, Output, Stdio},
+    sync::mpsc,
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
+
+use flate2::read::GzDecoder;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -32,6 +36,10 @@ pub const SUPERVISED_BIND_ADDRESS: &str = "0.0.0.0:0";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+const MAX_SERVER_DIAGNOSTICS_BYTES: usize = 16 * 1024;
+const SIDECAR_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
+const SERVER_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Readiness payload emitted by a supervised `sketchi-server` process.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ReadyMessage {
@@ -53,6 +61,9 @@ pub enum SupervisorError {
     /// The supervised server process could not be started or read.
     #[error("local server process failed: {0}")]
     Io(#[from] std::io::Error),
+    /// The supervised server exited before readiness and reported a startup error.
+    #[error("local server did not become ready: {0}")]
+    Startup(String),
     /// The supervised server exited before emitting readiness.
     #[error("local server exited before readiness")]
     ExitedBeforeReadiness,
@@ -86,6 +97,7 @@ pub struct LocalServer {
     child: Child,
     readiness: ReadyMessage,
     extracted_server: Option<PathBuf>,
+    stderr_thread: Option<JoinHandle<Result<String, std::io::Error>>>,
 }
 
 impl LocalServer {
@@ -114,14 +126,10 @@ impl LocalServer {
         } else {
             ["Sketchi-server", "sketchi-server"]
         };
-        let (executable, extracted_server) = match names
+        let sidecar = names
             .iter()
             .map(|name| directory.join(name))
-            .find(|candidate| candidate.is_file())
-        {
-            Some(executable) => (executable, None),
-            None => Self::extract_embedded_server()?,
-        };
+            .find(|candidate| candidate.is_file());
         let database = ProjectDirs::from("org", "Sketchi", "Sketchi").map_or_else(
             || directory.join("sketchi.sqlite3"),
             |directories| directories.data_dir().join("sketchi.sqlite3"),
@@ -129,6 +137,36 @@ impl LocalServer {
         if let Some(parent) = database.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        if let Some(sidecar) = sidecar {
+            let sidecar_matches_client = Self::sidecar_matches_client_version(&sidecar);
+            if sidecar_matches_client || EMBEDDED_SERVER_GZIP.is_empty() {
+                match Self::spawn(Self::server_command(&sidecar, &database)) {
+                    Ok(server) => return Ok(server),
+                    Err(error) if !EMBEDDED_SERVER_GZIP.is_empty() => {
+                        tracing::warn!(
+                            executable = %sidecar.display(),
+                            error = %error,
+                            "adjacent Sketchi server failed; trying embedded server"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                tracing::warn!(
+                    executable = %sidecar.display(),
+                    client_version = env!("CARGO_PKG_VERSION"),
+                    "adjacent Sketchi server is stale; trying embedded server"
+                );
+            }
+        }
+
+        let (embedded, extracted_server) = Self::extract_embedded_server()?;
+        let mut server = Self::spawn(Self::server_command(&embedded, &database))?;
+        server.extracted_server = extracted_server;
+        Ok(server)
+    }
+
+    fn server_command(executable: &std::path::Path, database: &std::path::Path) -> Command {
         let mut command = Command::new(executable);
         command
             .arg("--ready")
@@ -136,9 +174,21 @@ impl LocalServer {
             .arg(SUPERVISED_BIND_ADDRESS)
             .arg("--database")
             .arg(database);
-        let mut server = Self::spawn(command)?;
-        server.extracted_server = extracted_server;
-        Ok(server)
+        command
+    }
+
+    fn sidecar_matches_client_version(executable: &std::path::Path) -> bool {
+        let mut command = Command::new(executable);
+        command.arg("--version");
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+        let Some(output) = command_output_with_timeout(command, SIDECAR_VERSION_TIMEOUT) else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        output_matches_client_version(&output.stdout, &output.stderr)
     }
 
     /// Spawns a server command and waits for its first readiness line.
@@ -156,19 +206,70 @@ impl LocalServer {
 
         let mut child = command
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()?;
+        let stderr_thread = child.stderr.take().map(|stderr| {
+            std::thread::Builder::new()
+                .name(String::from("sketchi-server-stderr"))
+                .spawn(move || {
+                    let mut reader = BufReader::new(stderr);
+                    let mut output = String::new();
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line)? == 0 {
+                            break;
+                        }
+                        tracing::debug!(
+                            target: "sketchi-server",
+                            output = %line.trim_end(),
+                            "supervised server output"
+                        );
+                        if output.len() < MAX_SERVER_DIAGNOSTICS_BYTES {
+                            for character in line.chars() {
+                                if output.len() + character.len_utf8()
+                                    > MAX_SERVER_DIAGNOSTICS_BYTES
+                                {
+                                    break;
+                                }
+                                output.push(character);
+                            }
+                        }
+                    }
+                    Ok(output)
+                })
+        });
+        let stderr_thread = match stderr_thread {
+            Some(Ok(thread)) => Some(thread),
+            Some(Err(error)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SupervisorError::Io(error));
+            }
+            None => None,
+        };
         let result = Self::readiness_from_child(&mut child);
         match result {
             Ok(readiness) => Ok(Self {
                 child,
                 readiness,
                 extracted_server: None,
+                stderr_thread,
             }),
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                Err(error)
+                let diagnostics = stderr_thread
+                    .and_then(|thread| thread.join().ok())
+                    .and_then(Result::ok)
+                    .map(|output| output.trim().to_owned())
+                    .filter(|output| !output.is_empty());
+                match diagnostics {
+                    Some(diagnostics) => Err(SupervisorError::Startup(format!(
+                        "{error}; server output: {diagnostics}"
+                    ))),
+                    None => Err(error),
+                }
             }
         }
     }
@@ -190,16 +291,46 @@ impl LocalServer {
             .stdout
             .take()
             .ok_or(SupervisorError::ExitedBeforeReadiness)?;
-        let mut lines = BufReader::new(stdout).lines();
-        let line = lines
-            .next()
-            .transpose()?
-            .ok_or(SupervisorError::ExitedBeforeReadiness)?;
-        parse_ready_line(&line)
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::Builder::new()
+            .name(String::from("sketchi-server-readiness"))
+            .spawn(move || {
+                let mut lines = BufReader::new(stdout).lines();
+                let result = lines
+                    .next()
+                    .transpose()
+                    .map_err(SupervisorError::Io)
+                    .and_then(|line| {
+                        line.map_or(Err(SupervisorError::ExitedBeforeReadiness), |line| {
+                            parse_ready_line(&line)
+                        })
+                    });
+                let _ = sender.send(result);
+            })
+            .map_err(SupervisorError::Io)?;
+        match receiver.recv_timeout(SERVER_READINESS_TIMEOUT) {
+            Ok(result) => {
+                let _ = reader.join();
+                result
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                Err(SupervisorError::Startup(format!(
+                    "server did not emit readiness within {} seconds",
+                    SERVER_READINESS_TIMEOUT.as_secs()
+                )))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = reader.join();
+                Err(SupervisorError::ExitedBeforeReadiness)
+            }
+        }
     }
 
     fn extract_embedded_server() -> Result<(PathBuf, Option<PathBuf>), SupervisorError> {
-        if EMBEDDED_SERVER.is_empty() {
+        if EMBEDDED_SERVER_GZIP.is_empty() {
             return Err(SupervisorError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "Sketchi server sidecar was not found next to the client",
@@ -215,7 +346,10 @@ impl LocalServer {
         } else {
             "Sketchi-server"
         });
-        if let Err(error) = std::fs::write(&executable, EMBEDDED_SERVER) {
+        let mut decoder = GzDecoder::new(EMBEDDED_SERVER_GZIP);
+        let mut server = Vec::new();
+        decoder.read_to_end(&mut server)?;
+        if let Err(error) = std::fs::write(&executable, server) {
             let _ = std::fs::remove_dir_all(&extraction_directory);
             return Err(SupervisorError::Io(error));
         }
@@ -231,6 +365,51 @@ impl LocalServer {
     }
 }
 
+fn command_output_with_timeout(mut command: Command, timeout: Duration) -> Option<Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now().checked_add(timeout)?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                child.stdout.take()?.read_to_end(&mut stdout).ok()?;
+                child.stderr.take()?.read_to_end(&mut stderr).ok()?;
+                return Some(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+fn output_matches_client_version(stdout: &[u8], stderr: &[u8]) -> bool {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    stdout
+        .split_whitespace()
+        .chain(stderr.split_whitespace())
+        .any(|token| {
+            token.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && character != '.' && character != '-'
+            }) == env!("CARGO_PKG_VERSION")
+        })
+}
+
 impl Drop for LocalServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -238,6 +417,43 @@ impl Drop for LocalServer {
         if let Some(directory) = self.extracted_server.take() {
             let _ = std::fs::remove_dir_all(directory);
         }
+        if let Some(thread) = self.stderr_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    use super::{command_output_with_timeout, output_matches_client_version};
+
+    #[test]
+    fn sidecar_version_must_match_the_client() {
+        let version = env!("CARGO_PKG_VERSION");
+        let current = format!("sketchi-server {version}\n");
+        let stale = format!("sketchi-server {version}.1\n");
+        assert!(output_matches_client_version(current.as_bytes(), &[]));
+        assert!(!output_matches_client_version(stale.as_bytes(), &[]));
+    }
+
+    #[test]
+    fn sidecar_version_can_be_read_from_stderr() {
+        let version = env!("CARGO_PKG_VERSION");
+        let output = format!("server version: {version}\n");
+        assert!(output_matches_client_version(&[], output.as_bytes()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_timeout_terminates_a_stuck_process() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let started = Instant::now();
+        assert!(command_output_with_timeout(command, Duration::from_millis(20)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
 

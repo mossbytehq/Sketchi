@@ -9,8 +9,9 @@ pub mod editor;
 mod gpu;
 mod images;
 pub mod input;
+#[path = "lucide_icons.rs"]
+mod lucide_icons;
 mod preview;
-mod remix_icons;
 mod selection;
 pub(crate) mod settings;
 pub mod storage;

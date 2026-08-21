@@ -8,7 +8,7 @@ use egui::{
     RectAlign, Response, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui, Vec2, WidgetText,
 };
 
-use crate::remix_icons::{self, RemixIcon};
+use crate::lucide_icons::{self, LucideIcon};
 #[allow(unused_imports)]
 use crate::theme::{CONTROL_CORNER_RADIUS, ThemeTokens};
 
@@ -579,9 +579,9 @@ pub(crate) fn dropdown_field_sized(
                     ui,
                     rect,
                     if is_open {
-                        RemixIcon::ContractUpDown
+                        LucideIcon::ContractUpDown
                     } else {
-                        RemixIcon::ExpandUpDown
+                        LucideIcon::ExpandUpDown
                     },
                     visuals.fg_stroke.color,
                 );
@@ -711,9 +711,9 @@ pub(crate) fn themed_dropdown_field_sized(
                     ui,
                     rect,
                     if is_open {
-                        RemixIcon::ContractUpDown
+                        LucideIcon::ContractUpDown
                     } else {
-                        RemixIcon::ExpandUpDown
+                        LucideIcon::ExpandUpDown
                     },
                     visuals.fg_stroke.color,
                 );
@@ -853,7 +853,7 @@ pub(crate) fn themed_numeric_field(
             let decrement = themed_numeric_stepper_button(
                 ui,
                 Vec2::new(stepper_width, size.y),
-                RemixIcon::ArrowDownS,
+                LucideIcon::ArrowDownS,
                 true,
                 theme,
             );
@@ -885,7 +885,7 @@ pub(crate) fn themed_numeric_field(
             let increment = themed_numeric_stepper_button(
                 ui,
                 Vec2::new(stepper_width, size.y),
-                RemixIcon::ArrowUpS,
+                LucideIcon::ArrowUpS,
                 false,
                 theme,
             );
@@ -914,7 +914,7 @@ pub(crate) fn themed_numeric_field(
 fn themed_numeric_stepper_button(
     ui: &mut Ui,
     size: Vec2,
-    icon: RemixIcon,
+    icon: LucideIcon,
     left_side: bool,
     theme: ThemeTokens,
 ) -> Response {
@@ -1154,7 +1154,7 @@ pub(crate) fn numeric_field_with_decimals(
             let decrement = numeric_stepper_button(
                 ui,
                 Vec2::new(stepper_width, size.y),
-                RemixIcon::ArrowDownS,
+                LucideIcon::ArrowDownS,
                 true,
             );
             let mut response = ui
@@ -1185,7 +1185,7 @@ pub(crate) fn numeric_field_with_decimals(
             let increment = numeric_stepper_button(
                 ui,
                 Vec2::new(stepper_width, size.y),
-                RemixIcon::ArrowUpS,
+                LucideIcon::ArrowUpS,
                 false,
             );
 
@@ -1218,7 +1218,7 @@ fn numeric_field_border(focused: bool, fallback: Color32) -> Stroke {
     }
 }
 
-fn numeric_stepper_button(ui: &mut Ui, size: Vec2, icon: RemixIcon, left_side: bool) -> Response {
+fn numeric_stepper_button(ui: &mut Ui, size: Vec2, icon: LucideIcon, left_side: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let fill = if response.hovered() {
         ui.visuals().widgets.hovered.bg_fill
@@ -1253,14 +1253,14 @@ fn numeric_stepper_button(ui: &mut Ui, size: Vec2, icon: RemixIcon, left_side: b
     response
 }
 
-fn paint_component_icon(ui: &Ui, rect: Rect, icon: RemixIcon, color: Color32) {
+fn paint_component_icon(ui: &Ui, rect: Rect, icon: LucideIcon, color: Color32) {
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
         icon.glyph().to_string(),
         FontId::new(
             14.0,
-            egui::FontFamily::Name(remix_icons::FONT_FAMILY.into()),
+            egui::FontFamily::Name(lucide_icons::FONT_FAMILY.into()),
         ),
         color,
     );

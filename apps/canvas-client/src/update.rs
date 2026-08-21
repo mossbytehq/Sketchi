@@ -1,24 +1,30 @@
 //! Cross-platform release checks for the desktop client.
 
 use std::{
-    io,
-    process::Command,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
+    path::Path,
+    process::{Command, Stdio},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use directories::ProjectDirs;
 use reqwest::{
     StatusCode,
     header::{ACCEPT, USER_AGENT},
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const RELEASES_API_URL: &str =
     "https://api.github.com/repos/mossbytehq/Sketchi/releases?per_page=100";
 const RELEASE_PAGE_PREFIX: &str = "https://github.com/mossbytehq/Sketchi/releases/";
+const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/mossbytehq/Sketchi/releases/download/";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const AUTOMATIC_CHECK_INTERVAL_SECS: u64 = 4 * 60 * 60;
+const UPDATE_RESULT_FILENAME: &str = "update-result";
 
 /// The release stream used when looking for updates.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -55,6 +61,18 @@ pub(crate) struct UpdateCache {
     pub(crate) latest_stable_url: Option<String>,
     /// Edge release page URL.
     pub(crate) latest_edge_url: Option<String>,
+    /// Official update asset URL for the latest stable release.
+    pub(crate) latest_stable_asset_url: Option<String>,
+    /// Official update asset filename for the latest stable release.
+    pub(crate) latest_stable_asset_name: Option<String>,
+    /// Official update asset SHA-256 digest for the latest stable release.
+    pub(crate) latest_stable_asset_digest: Option<String>,
+    /// Official update asset URL for the latest edge release.
+    pub(crate) latest_edge_asset_url: Option<String>,
+    /// Official update asset filename for the latest edge release.
+    pub(crate) latest_edge_asset_name: Option<String>,
+    /// Official update asset SHA-256 digest for the latest edge release.
+    pub(crate) latest_edge_asset_digest: Option<String>,
 }
 
 /// Release information presented by the settings view.
@@ -72,13 +90,19 @@ pub(crate) struct UpdateStatus {
     pub(crate) target: Option<Version>,
     /// Release page for the selected target.
     pub(crate) target_url: Option<String>,
+    /// Download URL for the selected target's platform update asset.
+    pub(crate) target_asset_url: Option<String>,
+    /// Filename for the selected target's platform update asset.
+    pub(crate) target_asset_name: Option<String>,
+    /// SHA-256 digest for the selected target's platform update asset.
+    pub(crate) target_asset_digest: Option<String>,
     /// Whether this installation is ahead of the latest stable release.
     pub(crate) ahead_of_stable: bool,
     /// Whether the cache contains a successful lookup.
     pub(crate) has_result: bool,
 }
 
-/// Errors from a release lookup or browser handoff.
+/// Errors from a release lookup or automatic update installation.
 #[derive(Debug, Error)]
 pub(crate) enum UpdateError {
     /// The HTTP client could not be created or the request failed.
@@ -93,12 +117,20 @@ pub(crate) enum UpdateError {
     /// GitHub returned no usable release entries.
     #[error("no usable releases were found")]
     NoReleases,
-    /// The release URL was not one owned by Sketchi.
-    #[error("refusing to open an untrusted release URL")]
-    InvalidReleaseUrl,
-    /// The operating system could not launch its browser.
-    #[error("could not open the release page: {0}")]
-    Browser(#[source] io::Error),
+    /// The release asset was not a supported official Sketchi update.
+    #[error("the release does not contain a supported automatic update asset")]
+    UnsupportedAsset,
+    /// The update could not be downloaded or staged.
+    #[error("could not stage the update: {0}")]
+    Io(#[from] io::Error),
+    /// The current installation directory cannot be modified by the updater.
+    #[error(
+        "automatic updates require a user-writable installation directory ({0}); use your package manager to update this installation"
+    )]
+    InstallLocation(String),
+    /// The downloaded update did not match GitHub's advertised digest.
+    #[error("the downloaded update failed its SHA-256 verification")]
+    ChecksumMismatch,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +139,21 @@ struct GitHubRelease {
     html_url: String,
     prerelease: bool,
     draft: bool,
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+    digest: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ReleaseAsset {
+    name: String,
+    url: String,
+    digest: Option<String>,
 }
 
 /// Checks GitHub Releases and returns a cache suitable for persistence.
@@ -127,8 +174,8 @@ pub(crate) fn check() -> Result<UpdateCache, UpdateError> {
     }
     let releases = response.error_for_status()?.json::<Vec<GitHubRelease>>()?;
 
-    let mut latest_stable: Option<(Version, String)> = None;
-    let mut latest_edge: Option<(Version, String)> = None;
+    let mut latest_stable: Option<(Version, String, Option<ReleaseAsset>)> = None;
+    let mut latest_edge: Option<(Version, String, Option<ReleaseAsset>)> = None;
     for release in releases {
         if release.draft || !release.html_url.starts_with(RELEASE_PAGE_PREFIX) {
             continue;
@@ -136,7 +183,8 @@ pub(crate) fn check() -> Result<UpdateCache, UpdateError> {
         let Some(version) = parse_tag(&release.tag_name) else {
             continue;
         };
-        let entry = (version.clone(), release.html_url);
+        let asset = auto_update_asset(&release).and_then(release_asset);
+        let entry = (version.clone(), release.html_url, asset);
         if latest_edge
             .as_ref()
             .is_none_or(|current| entry.0 > current.0)
@@ -161,8 +209,26 @@ pub(crate) fn check() -> Result<UpdateCache, UpdateError> {
         checked_at_epoch: Some(now_epoch()),
         latest_stable: latest_stable.as_ref().map(|item| item.0.to_string()),
         latest_edge: latest_edge.as_ref().map(|item| item.0.to_string()),
-        latest_stable_url: latest_stable.map(|item| item.1),
-        latest_edge_url: latest_edge.map(|item| item.1),
+        latest_stable_url: latest_stable.as_ref().map(|item| item.1.clone()),
+        latest_edge_url: latest_edge.as_ref().map(|item| item.1.clone()),
+        latest_stable_asset_url: latest_stable
+            .as_ref()
+            .and_then(|item| item.2.as_ref().map(|asset| asset.url.clone())),
+        latest_stable_asset_name: latest_stable
+            .as_ref()
+            .and_then(|item| item.2.as_ref().map(|asset| asset.name.clone())),
+        latest_stable_asset_digest: latest_stable
+            .as_ref()
+            .and_then(|item| item.2.as_ref().and_then(|asset| asset.digest.clone())),
+        latest_edge_asset_url: latest_edge
+            .as_ref()
+            .and_then(|item| item.2.as_ref().map(|asset| asset.url.clone())),
+        latest_edge_asset_name: latest_edge
+            .as_ref()
+            .and_then(|item| item.2.as_ref().map(|asset| asset.name.clone())),
+        latest_edge_asset_digest: latest_edge
+            .as_ref()
+            .and_then(|item| item.2.as_ref().and_then(|asset| asset.digest.clone())),
     })
 }
 
@@ -172,11 +238,25 @@ pub(crate) fn status(cache: &UpdateCache, channel: UpdateChannel) -> UpdateStatu
         Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| Version::new(0, 0, 0));
     let latest_stable = parse_optional_version(cache.latest_stable.as_deref());
     let latest_edge = parse_optional_version(cache.latest_edge.as_deref());
-    let (candidate, target_url) = match channel {
-        UpdateChannel::Stable => (latest_stable.clone(), cache.latest_stable_url.clone()),
-        UpdateChannel::Edge => (latest_edge.clone(), cache.latest_edge_url.clone()),
-    };
+    let (candidate, target_url, target_asset_url, target_asset_name, target_asset_digest) =
+        match channel {
+            UpdateChannel::Stable => (
+                latest_stable.clone(),
+                cache.latest_stable_url.clone(),
+                cache.latest_stable_asset_url.clone(),
+                cache.latest_stable_asset_name.clone(),
+                cache.latest_stable_asset_digest.clone(),
+            ),
+            UpdateChannel::Edge => (
+                latest_edge.clone(),
+                cache.latest_edge_url.clone(),
+                cache.latest_edge_asset_url.clone(),
+                cache.latest_edge_asset_name.clone(),
+                cache.latest_edge_asset_digest.clone(),
+            ),
+        };
     let target = candidate.filter(|version| version > &current);
+    let has_target = target.is_some();
     let ahead_of_stable = !current.pre.is_empty()
         && latest_stable
             .as_ref()
@@ -188,7 +268,10 @@ pub(crate) fn status(cache: &UpdateCache, channel: UpdateChannel) -> UpdateStatu
         latest_edge,
         channel,
         target: target.clone(),
-        target_url: target.and(target_url),
+        target_url: target.clone().and(target_url),
+        target_asset_url: has_target.then_some(target_asset_url).flatten(),
+        target_asset_name: has_target.then_some(target_asset_name).flatten(),
+        target_asset_digest: has_target.then_some(target_asset_digest).flatten(),
         ahead_of_stable,
         has_result: cache.checked_at_epoch.is_some(),
     }
@@ -201,33 +284,341 @@ pub(crate) fn is_check_due(timestamp: Option<u64>) -> bool {
     })
 }
 
-/// Opens a known Sketchi release page using the platform's default browser.
-pub(crate) fn open_release_url(url: &str) -> Result<(), UpdateError> {
-    if !url.starts_with(RELEASE_PAGE_PREFIX) {
-        return Err(UpdateError::InvalidReleaseUrl);
+/// Downloads and starts the platform-specific update handoff.
+pub(crate) fn install_update(
+    url: &str,
+    name: &str,
+    expected_digest: Option<&str>,
+) -> Result<(), UpdateError> {
+    if !url.starts_with(RELEASE_DOWNLOAD_PREFIX) || !is_supported_asset_name(name) {
+        return Err(UpdateError::UnsupportedAsset);
     }
 
-    let mut command = if cfg!(target_os = "windows") {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", url]);
-        command
-    } else if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        command.arg(url);
-        command
+    #[cfg(target_os = "windows")]
+    return install_windows_update(url, name, expected_digest);
+
+    #[cfg(target_os = "linux")]
+    return install_linux_update(url, name, expected_digest);
+
+    #[allow(unreachable_code)]
+    Err(UpdateError::UnsupportedAsset)
+}
+
+fn update_result_path() -> Result<std::path::PathBuf, UpdateError> {
+    let directories = ProjectDirs::from("com", "Sketchi", "Sketchi").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not determine the Sketchi data directory",
+        )
+    })?;
+    fs::create_dir_all(directories.data_dir())?;
+    Ok(directories.data_dir().join(UPDATE_RESULT_FILENAME))
+}
+
+fn mark_update_pending() -> Result<std::path::PathBuf, UpdateError> {
+    let path = update_result_path()?;
+    fs::write(&path, "pending\n")?;
+    Ok(path)
+}
+
+fn clear_update_result(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+/// Returns and clears the result written by the previous update handoff.
+pub(crate) fn take_update_result() -> Option<String> {
+    let path = update_result_path().ok()?;
+    let result = fs::read_to_string(&path).ok()?;
+    clear_update_result(&path);
+    let result = result.trim();
+    Some(match result {
+        "success" => String::from("Update completed successfully."),
+        "pending" => String::from("The previous update did not complete. Please try again."),
+        failure if failure.starts_with("failure:") => {
+            format!(
+                "Update failed before restart: {}",
+                failure.trim_start_matches("failure:")
+            )
+        }
+        _ => String::from("The previous update finished with an unknown result."),
+    })
+}
+
+fn auto_update_asset(release: &GitHubRelease) -> Option<&GitHubAsset> {
+    #[cfg(target_os = "windows")]
+    let suffix = if release.prerelease {
+        "-windows-x86_64.zip"
     } else {
-        let mut command = Command::new("xdg-open");
-        command.arg(url);
-        command
+        "-windows-x86_64-setup.exe"
     };
+    #[cfg(target_os = "linux")]
+    let suffix = "-linux-x86_64";
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    let suffix = "";
 
-    #[cfg(windows)]
+    release.assets.iter().find(|asset| {
+        asset.name.ends_with(suffix)
+            && asset
+                .browser_download_url
+                .starts_with(RELEASE_DOWNLOAD_PREFIX)
+    })
+}
+
+fn release_asset(asset: &GitHubAsset) -> Option<ReleaseAsset> {
+    if !asset
+        .browser_download_url
+        .starts_with(RELEASE_DOWNLOAD_PREFIX)
+        || !is_supported_asset_name(&asset.name)
     {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
+        return None;
+    }
+    Some(ReleaseAsset {
+        name: asset.name.clone(),
+        url: asset.browser_download_url.clone(),
+        digest: asset.digest.as_deref().and_then(normalize_digest),
+    })
+}
+
+fn normalize_digest(digest: &str) -> Option<String> {
+    let digest = digest.strip_prefix("sha256:").unwrap_or(digest);
+    (digest.len() == 64
+        && digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()))
+    .then(|| digest.to_ascii_lowercase())
+}
+
+fn is_supported_asset_name(name: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        return name.ends_with("-windows-x86_64-setup.exe")
+            || name.ends_with("-windows-x86_64.zip");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return name.ends_with("-linux-x86_64");
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+fn download_asset(url: &str, destination: &std::path::Path) -> Result<(), UpdateError> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_mins(10))
+        .build()?;
+    let mut response = client
+        .get(url)
+        .header(ACCEPT, "application/octet-stream")
+        .header(USER_AGENT, concat!("Sketchi/", env!("CARGO_PKG_VERSION")))
+        .send()?
+        .error_for_status()?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)?;
+    if let Err(error) = io::copy(&mut response, &mut file) {
+        let _ = fs::remove_file(destination);
+        return Err(UpdateError::Io(error));
+    }
+    file.flush()?;
+    Ok(())
+}
+
+fn ensure_writable_directory(directory: &Path) -> Result<(), UpdateError> {
+    let probe = directory.join(format!(".Sketchi-update-probe-{}", std::process::id()));
+    match OpenOptions::new().create_new(true).write(true).open(&probe) {
+        Ok(file) => {
+            drop(file);
+            fs::remove_file(&probe)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Err(
+            UpdateError::InstallLocation(directory.display().to_string()),
+        ),
+        Err(error) => Err(UpdateError::Io(error)),
+    }
+}
+
+fn verify_digest(path: &std::path::Path, expected_digest: Option<&str>) -> Result<(), UpdateError> {
+    let Some(expected_digest) = expected_digest.and_then(normalize_digest) else {
+        return Ok(());
+    };
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)?;
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected_digest {
+        let _ = fs::remove_file(path);
+        return Err(UpdateError::ChecksumMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_update(
+    url: &str,
+    name: &str,
+    expected_digest: Option<&str>,
+) -> Result<(), UpdateError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let executable = std::env::current_exe()?;
+    let parent = executable.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "current executable has no parent")
+    })?;
+    ensure_writable_directory(parent)?;
+    let staged = parent.join(format!(".Sketchi-update-{}-{name}", std::process::id()));
+    download_asset(url, &staged)?;
+    if let Err(error) = verify_digest(&staged, expected_digest) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    let mut permissions = fs::metadata(&executable)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&staged, permissions)?;
+
+    let mut command = Command::new("sh");
+    let result_path = mark_update_pending()?;
+    command
+        .arg("-c")
+        .arg(
+            "while kill -0 \"$3\" 2>/dev/null; do sleep 0.1; done; \
+             if mv \"$1\" \"$2\"; then \
+                 printf 'success\\n' > \"$4\"; \
+                 exec \"$2\"; \
+             else \
+                 printf 'failure: could not replace the client\\n' > \"$4\"; \
+                 exit 1; \
+             fi",
+        )
+        .arg("sketchi-update")
+        .arg(&staged)
+        .arg(&executable)
+        .arg(std::process::id().to_string())
+        .arg(&result_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Err(error) = command.spawn() {
+        clear_update_result(&result_path);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_update(
+    url: &str,
+    name: &str,
+    expected_digest: Option<&str>,
+) -> Result<(), UpdateError> {
+    use std::os::windows::process::CommandExt;
+
+    let executable = std::env::current_exe()?;
+    let destination =
+        std::env::temp_dir().join(format!("Sketchi-update-{}-{name}", std::process::id()));
+    download_asset(url, &destination)?;
+    verify_digest(&destination, expected_digest)?;
+    if name.ends_with("-setup.exe") {
+        let result_path = update_result_path()?;
+        let script_path =
+            std::env::temp_dir().join(format!("Sketchi-update-{}-setup.ps1", std::process::id()));
+        fs::write(
+            &script_path,
+            r#"param([string]$Installer, [string]$Exe, [int]$ProcessId, [string]$Result)
+$ErrorActionPreference = "Stop"
+try {
+    Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    $install = Start-Process -FilePath $Installer -Wait -PassThru
+    if ($install.ExitCode -ne 0) {
+        throw "installer exited with code $($install.ExitCode)"
+    }
+    [System.IO.File]::WriteAllText($Result, "success")
+    Start-Process -FilePath $Exe
+} catch {
+    [System.IO.File]::WriteAllText($Result, ("failure: " + $_.Exception.Message))
+} finally {
+    Remove-Item -LiteralPath $Installer -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+}"#,
+        )?;
+        fs::write(&result_path, "pending\n")?;
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script_path)
+            .arg(&destination)
+            .arg(&executable)
+            .arg(std::process::id().to_string())
+            .arg(&result_path)
+            .creation_flags(0x0800_0000);
+        if let Err(error) = command.spawn() {
+            clear_update_result(&result_path);
+            return Err(error.into());
+        }
+        return Ok(());
     }
 
-    command.spawn().map(|_| ()).map_err(UpdateError::Browser)
+    let parent = executable.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "current executable has no parent")
+    })?;
+    ensure_writable_directory(parent)?;
+
+    let script_path =
+        std::env::temp_dir().join(format!("Sketchi-update-{}-install.ps1", std::process::id()));
+    let result_path = update_result_path()?;
+    fs::write(
+        &script_path,
+        r#"param([string]$Zip, [string]$Exe, [int]$ProcessId, [string]$Result)
+$ErrorActionPreference = "Stop"
+$parent = Split-Path -Parent $Exe
+$stage = Join-Path $env:TEMP ("Sketchi-update-" + $ProcessId)
+try {
+    Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    Expand-Archive -LiteralPath $Zip -DestinationPath $stage -Force
+    Copy-Item -Path (Join-Path $stage '*') -Destination $parent -Recurse -Force
+    [System.IO.File]::WriteAllText($Result, "success")
+    Start-Process -FilePath $Exe
+} catch {
+    [System.IO.File]::WriteAllText($Result, ("failure: " + $_.Exception.Message))
+} finally {
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+}"#,
+    )?;
+    fs::write(&result_path, "pending\n")?;
+    let mut command = Command::new("powershell.exe");
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script_path)
+        .arg(&destination)
+        .arg(&executable)
+        .arg(std::process::id().to_string())
+        .arg(&result_path)
+        .creation_flags(0x0800_0000);
+    if let Err(error) = command.spawn() {
+        clear_update_result(&result_path);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 /// Formats the cached lookup time for the settings view.
@@ -289,6 +680,7 @@ mod tests {
             latest_edge_url: Some(
                 "https://github.com/mossbytehq/Sketchi/releases/tag/v0.2.0-rc.1".to_owned(),
             ),
+            ..UpdateCache::default()
         };
         let stable = status(&cache, UpdateChannel::Stable);
         assert!(stable.target.is_none());
@@ -319,6 +711,7 @@ mod tests {
             latest_edge_url: Some(format!(
                 "https://github.com/mossbytehq/Sketchi/releases/tag/v{newer_edge}"
             )),
+            ..UpdateCache::default()
         };
         let edge = status(&cache, UpdateChannel::Edge);
         assert_eq!(

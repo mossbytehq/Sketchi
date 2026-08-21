@@ -69,6 +69,33 @@ fn position_undo_and_redo_are_compensating_operations() {
 }
 
 #[test]
+fn undo_history_is_bounded() {
+    let element_id = ElementId::from_u128(12);
+    let mut editor = Editor::new(ClientId::from_u128(1));
+    editor
+        .execute(EditorCommand::Create(Element::rectangle(
+            element_id,
+            Transform::new(Point::default(), Size::new(20.0, 20.0)),
+        )))
+        .unwrap();
+
+    for sequence in 1_u16..=80 {
+        editor
+            .execute(EditorCommand::SetPosition(
+                element_id,
+                Point::new(f32::from(sequence), 0.0),
+            ))
+            .unwrap();
+    }
+
+    let mut undo_count = 0;
+    while editor.undo().is_ok() {
+        undo_count += 1;
+    }
+    assert_eq!(undo_count, 64);
+}
+
+#[test]
 fn local_operations_can_be_transferred_to_the_durable_sync_journal() {
     let client_id = ClientId::from_u128(44);
     let mut editor = Editor::new(client_id);

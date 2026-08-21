@@ -13,7 +13,7 @@ use crate::{
     update::{UpdateCache, UpdateChannel},
 };
 
-const SETTINGS_VERSION: u32 = 2;
+const SETTINGS_VERSION: u32 = 6;
 
 /// Persisted appearance preference.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -39,6 +39,16 @@ pub(crate) enum AutosaveInterval {
     TenMinutes,
     /// Disable automatic saving.
     Never,
+}
+
+/// Local canvas surface preference; it is not part of the shared document.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) enum CanvasBackground {
+    /// Show the subtle navigation grid behind the document.
+    #[default]
+    DotGrid,
+    /// Use only the configured canvas color behind the document.
+    Clean,
 }
 
 /// A serializable keyboard shortcut.
@@ -80,6 +90,8 @@ pub(crate) struct Settings {
     pub(crate) light_canvas_color: [u8; 4],
     /// Dark canvas background RGBA.
     pub(crate) dark_canvas_color: [u8; 4],
+    /// Local canvas surface style.
+    pub(crate) canvas_background: CanvasBackground,
     /// Light-mode palette RGBA colors.
     pub(crate) light_palette: Vec<[u8; 4]>,
     /// Dark-mode palette RGBA colors.
@@ -109,13 +121,22 @@ impl Default for Settings {
             autosave_directory: default_autosave_directory(),
             light_canvas_color: rgba(252, 252, 253, 255),
             dark_canvas_color: rgba(26, 27, 30, 255),
+            canvas_background: CanvasBackground::DotGrid,
             light_palette: [
                 rgba(31, 31, 31, 255),
                 rgba(224, 49, 49, 255),
-                rgba(47, 158, 68, 255),
-                rgba(25, 113, 194, 255),
                 rgba(240, 140, 0, 255),
+                rgba(255, 236, 153, 255),
+                rgba(47, 158, 68, 255),
+                rgba(190, 242, 200, 255),
+                rgba(25, 113, 194, 255),
+                rgba(190, 224, 255, 255),
                 rgba(121, 80, 242, 255),
+                rgba(255, 201, 201, 255),
+                rgba(221, 214, 254, 255),
+                rgba(82, 82, 91, 255),
+                rgba(145, 145, 155, 255),
+                rgba(224, 224, 230, 255),
                 rgba(255, 255, 255, 255),
             ]
             .into_iter()
@@ -123,10 +144,18 @@ impl Default for Settings {
             dark_palette: [
                 rgba(245, 245, 245, 255),
                 rgba(224, 49, 49, 255),
-                rgba(82, 196, 104, 255),
-                rgba(66, 153, 225, 255),
                 rgba(245, 159, 0, 255),
+                rgba(255, 236, 153, 255),
+                rgba(82, 196, 104, 255),
+                rgba(190, 242, 200, 255),
+                rgba(66, 153, 225, 255),
+                rgba(190, 224, 255, 255),
                 rgba(145, 120, 242, 255),
+                rgba(255, 201, 201, 255),
+                rgba(221, 214, 254, 255),
+                rgba(82, 82, 91, 255),
+                rgba(145, 145, 155, 255),
+                rgba(224, 224, 230, 255),
                 rgba(31, 35, 45, 255),
             ]
             .into_iter()
@@ -216,7 +245,7 @@ pub(crate) fn save(settings: &Settings) -> Result<(), SettingsError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Appearance, AutosaveInterval, Settings};
+    use super::{Appearance, AutosaveInterval, CanvasBackground, Settings};
     use crate::update::UpdateChannel;
 
     #[test]
@@ -228,8 +257,9 @@ mod tests {
         assert!(settings.drawing_style.is_none());
         assert_eq!(settings.update_channel, UpdateChannel::Stable);
         assert!(settings.update_cache.checked_at_epoch.is_none());
-        assert_eq!(settings.light_palette.len(), 7);
-        assert_eq!(settings.dark_palette.len(), 7);
+        assert_eq!(settings.canvas_background, CanvasBackground::DotGrid);
+        assert_eq!(settings.light_palette.len(), 15);
+        assert_eq!(settings.dark_palette.len(), 15);
 
         let encoded = serde_json::to_vec(&settings);
         assert!(encoded.is_ok());
@@ -247,5 +277,6 @@ mod tests {
         assert!(settings.remember_drawing_style);
         assert!(settings.drawing_style.is_none());
         assert!(!settings.autosave_directory.is_empty());
+        assert_eq!(settings.canvas_background, CanvasBackground::DotGrid);
     }
 }

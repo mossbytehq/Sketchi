@@ -92,3 +92,15 @@ fn local_server_reports_a_spawn_failure_without_panicking() {
         .expect_err("missing supervised server must fail");
     assert!(matches!(error, SupervisorError::Io(_)));
 }
+
+#[cfg(unix)]
+#[test]
+fn local_server_preserves_child_startup_diagnostics() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "printf 'database failed\\n' >&2; exit 1"]);
+    let error = LocalServer::spawn(command).expect_err("failed server must report diagnostics");
+    assert!(matches!(
+        error,
+        SupervisorError::Startup(message) if message.contains("database failed")
+    ));
+}

@@ -111,6 +111,8 @@ jobs:
           fi
           cargo run --locked --package xtask -- artifact-check --path "$client_stage" --target "${{ matrix.target }}" --kind client
           cargo run --locked --package xtask -- artifact-check --path "$server_stage" --target "${{ matrix.target }}" --kind server
+          cargo run --locked --package xtask -- install-smoke --path "$client_stage" --target "${{ matrix.target }}" --kind client
+          cargo run --locked --package xtask -- install-smoke --path "$server_stage" --target "${{ matrix.target }}" --kind server
       - name: Configure Windows signing
         id: configure_windows_signing
         if: ${{ runner.os == 'Windows' }}

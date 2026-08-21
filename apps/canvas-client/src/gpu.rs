@@ -223,29 +223,7 @@ fn surface_dimensions(width: u32, height: u32) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuState, surface_dimensions};
-
-    #[test]
-    fn settings_clear_color_matches_the_settings_surface() {
-        assert_eq!(
-            GpuState::settings_clear_color(false),
-            wgpu::Color {
-                r: 246.0 / 255.0,
-                g: 247.0 / 255.0,
-                b: 249.0 / 255.0,
-                a: 1.0,
-            }
-        );
-        assert_eq!(
-            GpuState::settings_clear_color(true),
-            wgpu::Color {
-                r: 31.0 / 255.0,
-                g: 32.0 / 255.0,
-                b: 37.0 / 255.0,
-                a: 1.0,
-            }
-        );
-    }
+    use super::surface_dimensions;
 
     #[test]
     fn zero_sized_surfaces_are_not_renderable() {

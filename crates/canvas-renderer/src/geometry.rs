@@ -1,6 +1,6 @@
 //! CPU-side scene extraction and geometric hit testing.
 
-use canvas_core::{Document, Element, ElementId, ElementKind, EmbeddedImage, Point, Rect, Style};
+use canvas_core::{Document, Element, ElementId, ElementKind, Point, Rect, Style};
 
 /// Renderer-ready primitive derived from one document element.
 #[derive(Clone, Debug, PartialEq)]
@@ -97,8 +97,6 @@ pub enum RenderPrimitive {
         rect: Rect,
         /// Element rotation in radians.
         rotation: f32,
-        /// Embedded source image.
-        image: EmbeddedImage,
         /// Visual style, including opacity.
         style: Style,
     },
@@ -207,12 +205,11 @@ fn to_primitive(element: &Element) -> RenderPrimitive {
             points: points_or_bounds(element),
             style: element.style,
         },
-        ElementKind::Image => match element.image.clone() {
-            Some(image) => RenderPrimitive::Image {
+        ElementKind::Image => match element.image {
+            Some(_) => RenderPrimitive::Image {
                 id: element.id,
                 rect,
                 rotation: element.transform.rotation,
-                image,
                 style: element.style,
             },
             None => RenderPrimitive::Rectangle {

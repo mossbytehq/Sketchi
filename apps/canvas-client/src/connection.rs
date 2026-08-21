@@ -22,7 +22,7 @@ use rustls::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 use tokio_tungstenite::{
     Connector, WebSocketStream, connect_async_tls_with_config, tungstenite::Message,
@@ -178,21 +178,35 @@ pub async fn run_reconnecting(
         mut outbound,
         inbound,
         handshake,
+        mut shutdown,
     } = endpoints;
     loop {
         let connector = config.connector()?;
-        if let Ok((socket, _)) =
-            connect_async_tls_with_config(config.endpoint(), None, true, connector).await
-        {
+        let connection = tokio::select! {
+            result = connect_async_tls_with_config(config.endpoint(), None, true, connector) => result,
+            result = shutdown.changed() => {
+                let _ = result;
+                return Ok(());
+            }
+        };
+        if let Ok((socket, _)) = connection {
             backoff.on_connected();
-            match run_socket(socket, &mut outbound, &inbound, &handshake).await {
+            match run_socket(socket, &mut outbound, &inbound, &handshake, &mut shutdown).await {
                 Ok(()) => return Ok(()),
                 Err(ConnectionError::Disconnected | ConnectionError::Transport(_)) => {}
                 Err(error) => return Err(error),
             }
         }
         match backoff.on_disconnect() {
-            ReconnectState::Waiting { delay, .. } => sleep(delay).await,
+            ReconnectState::Waiting { delay, .. } => {
+                tokio::select! {
+                    () = sleep(delay) => {}
+                    result = shutdown.changed() => {
+                        let _ = result;
+                        return Ok(());
+                    }
+                }
+            }
             ReconnectState::Exhausted { .. } => return Err(ConnectionError::ReconnectExhausted),
             ReconnectState::Connected | ReconnectState::Disconnected => {
                 return Err(ConnectionError::ReconnectExhausted);
@@ -206,6 +220,7 @@ async fn run_socket<S>(
     outbound: &mut mpsc::Receiver<ClientMessage>,
     inbound: &mpsc::Sender<ServerMessage>,
     handshake: &Mutex<Vec<ClientMessage>>,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -240,6 +255,10 @@ where
                     Message::Close(_) => return Err(ConnectionError::Disconnected),
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
                 }
+            }
+            result = shutdown.changed() => {
+                let _ = result;
+                return Ok(());
             }
         }
     }
@@ -329,6 +348,7 @@ pub struct ConnectionChannels {
     pub inbound: mpsc::Receiver<ServerMessage>,
     /// Shared handshake replay state used before every transport connection.
     pub handshake: Arc<Mutex<Vec<ClientMessage>>>,
+    shutdown: ShutdownSignal,
 }
 
 /// Network task endpoints used to construct a bounded handoff.
@@ -339,6 +359,20 @@ pub struct NetworkEndpoints {
     pub inbound: mpsc::Sender<ServerMessage>,
     /// Shared handshake replay state used before every transport connection.
     pub handshake: Arc<Mutex<Vec<ClientMessage>>>,
+    /// Cancellation signal owned by the UI session.
+    pub shutdown: watch::Receiver<bool>,
+}
+
+/// Cancellation signal for a collaboration runtime.
+#[derive(Clone, Debug)]
+struct ShutdownSignal {
+    sender: watch::Sender<bool>,
+}
+
+impl ShutdownSignal {
+    fn cancel(&self) {
+        let _ = self.sender.send(true);
+    }
 }
 
 /// Creates bounded channels between the UI and network tasks.
@@ -347,16 +381,22 @@ pub fn bounded_channels() -> (ConnectionChannels, NetworkEndpoints) {
     let (outbound, outbound_receiver) = mpsc::channel(CHANNEL_CAPACITY);
     let (inbound_sender, inbound) = mpsc::channel(CHANNEL_CAPACITY);
     let handshake = Arc::new(Mutex::new(Vec::new()));
+    let (shutdown_sender, shutdown) = watch::channel(false);
+    let shutdown_signal = ShutdownSignal {
+        sender: shutdown_sender,
+    };
     (
         ConnectionChannels {
             outbound,
             inbound,
             handshake: Arc::clone(&handshake),
+            shutdown: shutdown_signal,
         },
         NetworkEndpoints {
             outbound: outbound_receiver,
             inbound: inbound_sender,
             handshake,
+            shutdown,
         },
     )
 }
@@ -559,6 +599,7 @@ pub struct CollaborationClient {
     channels: ConnectionChannels,
     handshake: Arc<Mutex<Vec<ClientMessage>>>,
     runtime: Option<JoinHandle<Result<(), ConnectionError>>>,
+    shutdown: ShutdownSignal,
     synchronization: SyncController,
     room_id: Option<RoomId>,
     capability_token: Option<String>,
@@ -596,11 +637,13 @@ impl CollaborationClient {
             Some(&readiness.certificate_sha256),
         )?;
         let (channels, endpoints) = bounded_channels();
+        let shutdown = channels.shutdown.clone();
         let backoff = ReconnectBackoff::default_policy();
         let mut client = Self {
             handshake: Arc::clone(&channels.handshake),
             channels,
             runtime: None,
+            shutdown,
             synchronization: SyncController::new(journal),
             room_id: None,
             capability_token: None,
@@ -926,7 +969,10 @@ fn handshake_messages(
 
 impl Drop for CollaborationClient {
     fn drop(&mut self) {
-        self.runtime.take();
+        self.shutdown.cancel();
+        if let Some(runtime) = self.runtime.take() {
+            let _ = runtime.join();
+        }
     }
 }
 
@@ -948,6 +994,7 @@ mod tests {
             return;
         };
         let handshake = Arc::clone(&channels.handshake);
+        let shutdown = channels.shutdown.clone();
         let Ok(presence_throttle) = PresenceThrottle::new(Duration::from_millis(50)) else {
             return;
         };
@@ -955,6 +1002,7 @@ mod tests {
             channels,
             handshake,
             runtime: Some(runtime),
+            shutdown,
             synchronization: SyncController::new(journal),
             room_id: None,
             capability_token: None,
@@ -979,6 +1027,36 @@ mod tests {
             Err(ConnectionError::ReconnectExhausted)
         ));
         assert_eq!(client.status, "reconnect attempts exhausted");
+    }
+
+    #[tokio::test]
+    async fn reconnecting_runtime_stops_when_the_client_is_cancelled() {
+        let (channels, endpoints) = bounded_channels();
+        let config_result = ConnectionConfig::new("ws://127.0.0.1:9", None);
+        assert!(config_result.is_ok(), "test endpoint must be valid");
+        let Ok(config) = config_result else {
+            return;
+        };
+        let runtime = tokio::spawn(run_reconnecting(
+            config,
+            endpoints,
+            ReconnectBackoff::default_policy(),
+        ));
+        channels.shutdown.cancel();
+
+        let joined = tokio::time::timeout(Duration::from_secs(1), runtime).await;
+        assert!(
+            joined.is_ok(),
+            "cancellation must stop reconnecting promptly"
+        );
+        let Ok(joined) = joined else {
+            return;
+        };
+        assert!(joined.is_ok(), "runtime task must not panic");
+        let Ok(result) = joined else {
+            return;
+        };
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1055,6 +1133,7 @@ pub enum SyncUpdate {
 pub struct SyncController {
     journal: Journal,
     known_version: VersionVector,
+    pending_cache: Option<Vec<Operation>>,
 }
 
 impl SyncController {
@@ -1064,6 +1143,7 @@ impl SyncController {
         Self {
             journal,
             known_version: VersionVector::default(),
+            pending_cache: None,
         }
     }
 
@@ -1075,6 +1155,12 @@ impl SyncController {
     /// operation.
     pub fn enqueue(&mut self, operation: &Operation) -> Result<(), ConnectionError> {
         self.journal.append(operation)?;
+        if let Some(pending) = &mut self.pending_cache
+            && !pending.iter().any(|candidate| candidate.id == operation.id)
+        {
+            pending.push(operation.clone());
+            pending.sort_unstable_by_key(|candidate| candidate.id);
+        }
         self.known_version.merge(&operation.deps);
         self.known_version.observe(operation.id);
         Ok(())
@@ -1088,6 +1174,14 @@ impl SyncController {
     /// batch.
     pub fn enqueue_all(&mut self, operations: &[Operation]) -> Result<(), ConnectionError> {
         self.journal.append_all(operations)?;
+        if let Some(pending) = &mut self.pending_cache {
+            for operation in operations {
+                if !pending.iter().any(|candidate| candidate.id == operation.id) {
+                    pending.push(operation.clone());
+                }
+            }
+            pending.sort_unstable_by_key(|candidate| candidate.id);
+        }
         for operation in operations {
             self.known_version.merge(&operation.deps);
             self.known_version.observe(operation.id);
@@ -1100,8 +1194,11 @@ impl SyncController {
     /// # Errors
     ///
     /// Returns [`ConnectionError::Storage`] when the journal cannot be read.
-    pub fn pending_operations(&self) -> Result<Vec<Operation>, ConnectionError> {
-        Ok(self.journal.load()?)
+    pub fn pending_operations(&mut self) -> Result<Vec<Operation>, ConnectionError> {
+        if self.pending_cache.is_none() {
+            self.pending_cache = Some(self.journal.load()?);
+        }
+        Ok(self.pending_cache.clone().unwrap_or_default())
     }
 
     /// Returns the number of durable operations still awaiting acknowledgement.
@@ -1109,8 +1206,12 @@ impl SyncController {
     /// # Errors
     ///
     /// Returns [`ConnectionError::Storage`] when the journal cannot be read.
-    pub fn pending_count(&self) -> Result<usize, ConnectionError> {
-        Ok(self.journal.pending_count()?)
+    pub fn pending_count(&mut self) -> Result<usize, ConnectionError> {
+        if let Some(pending) = &self.pending_cache {
+            Ok(pending.len())
+        } else {
+            Ok(self.journal.pending_count()?)
+        }
     }
 
     /// Builds deterministic, protocol-sized replay messages.
@@ -1126,7 +1227,7 @@ impl SyncController {
     /// [`ConnectionError::RequestIdExhausted`] if IDs would wrap, or
     /// [`ConnectionError::Storage`] when the journal cannot be read.
     pub fn replay_pending(
-        &self,
+        &mut self,
         room_id: RoomId,
         first_request_id: u64,
         batch_size: usize,
@@ -1138,7 +1239,7 @@ impl SyncController {
             return Err(ConnectionError::InvalidRequestId);
         }
 
-        let pending = self.journal.load()?;
+        let pending = self.pending_operations()?;
         pending
             .chunks(batch_size)
             .enumerate()
@@ -1166,8 +1267,11 @@ impl SyncController {
     /// # Errors
     ///
     /// Returns [`ConnectionError::Storage`] when the journal cannot be updated.
-    pub fn acknowledge(&self, operation_ids: &[OperationId]) -> Result<(), ConnectionError> {
+    pub fn acknowledge(&mut self, operation_ids: &[OperationId]) -> Result<(), ConnectionError> {
         self.journal.remove(operation_ids)?;
+        if let Some(pending) = &mut self.pending_cache {
+            pending.retain(|operation| !operation_ids.contains(&operation.id));
+        }
         Ok(())
     }
 
@@ -1190,7 +1294,7 @@ impl SyncController {
             }
             ServerMessage::Snapshot { snapshot, .. } => {
                 self.known_version = snapshot.version_vector.clone();
-                for operation in self.journal.load()? {
+                for operation in self.pending_operations()? {
                     self.known_version.merge(&operation.deps);
                     self.known_version.observe(operation.id);
                 }

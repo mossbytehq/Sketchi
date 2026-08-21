@@ -27,13 +27,13 @@ use crate::{
     components::{
         STANDARD_CONTROL_SIZE, button, color_picker_editor, color_picker_trigger, color_swatch,
         dropdown_field_sized, numeric_field, numeric_field_with_decimals, range_slider,
-        sized_text_field,
+        sized_text_field, themed_checkbox,
     },
     connection::{CollaborationView, format_room_invite},
     editor::Editor,
     images::{embedded_image_from_rgba, embedded_image_with_rgba},
+    lucide_icons::{self, LucideIcon as Icon},
     preview::{DropPreviewDecode, DropPreviewDecodeError, PreviewCancellation, PreviewWorker},
-    remix_icons::{self, RemixIcon as Icon},
     selection::{
         SelectionHandle, angle_delta, element_bounds, group_resized_element, marquee_intersects,
         padded_selection_corners, padded_selection_handle_at, padded_selection_handle_position,
@@ -50,10 +50,13 @@ use crate::{
 
 const DARK_CANVAS: Color32 = Color32::from_rgb(26, 27, 30);
 const LIGHT_CANVAS: Color32 = Color32::from_rgb(246, 247, 249);
+const LIGHT_GRID_DOT: Color32 = Color32::from_rgb(220, 222, 227);
+const DARK_GRID_DOT: Color32 = Color32::from_rgb(45, 47, 54);
 const ACCENT: Color32 = Color32::from_rgb(91, 87, 214);
 const MOSSBYTE_AGENCY_URL: &str = "https://mossbyteagency.com/";
 const MOSSBYTE_AGENCY_BUTTON_WIDTH: f32 = 136.0;
 const MOSSBYTE_AGENCY_ROW_GAP: f32 = 12.0;
+const COMPACT_STROKE_PRESET_COUNT: usize = 7;
 const MOSSBYTE_AGENCY_COPY_MIN_WIDTH: f32 = 220.0;
 const MOSSBYTE_AGENCY_ROW_HEIGHT: f32 = 72.0;
 const LIGHT_PANEL: Color32 = Color32::from_rgb(255, 255, 255);
@@ -92,7 +95,115 @@ const COLLABORATION_AVATAR_COLORS: [Color32; 8] = [
     Color32::from_rgb(130, 103, 54),
 ];
 
-const STROKE_COLORS: [Color32; 7] = [
+const STROKE_COLORS: [Color32; 15] = [
+    Color32::from_rgb(31, 31, 31),
+    Color32::from_rgb(224, 49, 49),
+    Color32::from_rgb(240, 140, 0),
+    Color32::from_rgb(255, 236, 153),
+    Color32::from_rgb(47, 158, 68),
+    Color32::from_rgb(190, 242, 200),
+    Color32::from_rgb(25, 113, 194),
+    Color32::from_rgb(190, 224, 255),
+    Color32::from_rgb(121, 80, 242),
+    Color32::from_rgb(255, 201, 201),
+    Color32::from_rgb(221, 214, 254),
+    Color32::from_rgb(82, 82, 91),
+    Color32::from_rgb(145, 145, 155),
+    Color32::from_rgb(224, 224, 230),
+    Color32::from_rgb(255, 255, 255),
+];
+
+const DARK_PALETTE: [Color32; 15] = [
+    Color32::from_rgb(245, 245, 245),
+    Color32::from_rgb(224, 49, 49),
+    Color32::from_rgb(245, 159, 0),
+    Color32::from_rgb(255, 236, 153),
+    Color32::from_rgb(82, 196, 104),
+    Color32::from_rgb(190, 242, 200),
+    Color32::from_rgb(66, 153, 225),
+    Color32::from_rgb(190, 224, 255),
+    Color32::from_rgb(145, 120, 242),
+    Color32::from_rgb(255, 201, 201),
+    Color32::from_rgb(221, 214, 254),
+    Color32::from_rgb(82, 82, 91),
+    Color32::from_rgb(145, 145, 155),
+    Color32::from_rgb(224, 224, 230),
+    Color32::from_rgb(31, 35, 45),
+];
+
+const PREVIOUS_STROKE_COLORS: [Color32; 15] = [
+    Color32::from_rgb(31, 31, 31),
+    Color32::from_rgb(82, 82, 91),
+    Color32::from_rgb(145, 145, 155),
+    Color32::from_rgb(224, 224, 230),
+    Color32::from_rgb(255, 255, 255),
+    Color32::from_rgb(224, 49, 49),
+    Color32::from_rgb(240, 140, 0),
+    Color32::from_rgb(255, 236, 153),
+    Color32::from_rgb(47, 158, 68),
+    Color32::from_rgb(190, 242, 200),
+    Color32::from_rgb(25, 113, 194),
+    Color32::from_rgb(190, 224, 255),
+    Color32::from_rgb(121, 80, 242),
+    Color32::from_rgb(255, 201, 201),
+    Color32::from_rgb(221, 214, 254),
+];
+
+const PREVIOUS_DARK_PALETTE: [Color32; 15] = [
+    Color32::from_rgb(245, 245, 245),
+    Color32::from_rgb(31, 35, 45),
+    Color32::from_rgb(82, 82, 91),
+    Color32::from_rgb(145, 145, 155),
+    Color32::from_rgb(224, 224, 230),
+    Color32::from_rgb(224, 49, 49),
+    Color32::from_rgb(245, 159, 0),
+    Color32::from_rgb(255, 236, 153),
+    Color32::from_rgb(82, 196, 104),
+    Color32::from_rgb(190, 242, 200),
+    Color32::from_rgb(66, 153, 225),
+    Color32::from_rgb(190, 224, 255),
+    Color32::from_rgb(145, 120, 242),
+    Color32::from_rgb(255, 201, 201),
+    Color32::from_rgb(221, 214, 254),
+];
+
+const PREVIOUS_ORDERED_DARK_PALETTE: [Color32; 15] = [
+    Color32::from_rgb(224, 49, 49),
+    Color32::from_rgb(245, 159, 0),
+    Color32::from_rgb(255, 236, 153),
+    Color32::from_rgb(82, 196, 104),
+    Color32::from_rgb(190, 242, 200),
+    Color32::from_rgb(66, 153, 225),
+    Color32::from_rgb(190, 224, 255),
+    Color32::from_rgb(145, 120, 242),
+    Color32::from_rgb(255, 201, 201),
+    Color32::from_rgb(221, 214, 254),
+    Color32::from_rgb(245, 245, 245),
+    Color32::from_rgb(31, 35, 45),
+    Color32::from_rgb(82, 82, 91),
+    Color32::from_rgb(145, 145, 155),
+    Color32::from_rgb(224, 224, 230),
+];
+
+const INTERMEDIATE_DARK_PALETTE: [Color32; 15] = [
+    Color32::from_rgb(245, 245, 245),
+    Color32::from_rgb(224, 49, 49),
+    Color32::from_rgb(245, 159, 0),
+    Color32::from_rgb(255, 236, 153),
+    Color32::from_rgb(82, 196, 104),
+    Color32::from_rgb(190, 242, 200),
+    Color32::from_rgb(66, 153, 225),
+    Color32::from_rgb(190, 224, 255),
+    Color32::from_rgb(145, 120, 242),
+    Color32::from_rgb(255, 201, 201),
+    Color32::from_rgb(221, 214, 254),
+    Color32::from_rgb(31, 35, 45),
+    Color32::from_rgb(82, 82, 91),
+    Color32::from_rgb(145, 145, 155),
+    Color32::from_rgb(224, 224, 230),
+];
+
+const LEGACY_STROKE_COLORS: [Color32; 15] = [
     Color32::from_rgb(31, 31, 31),
     Color32::from_rgb(224, 49, 49),
     Color32::from_rgb(47, 158, 68),
@@ -100,7 +211,37 @@ const STROKE_COLORS: [Color32; 7] = [
     Color32::from_rgb(240, 140, 0),
     Color32::from_rgb(121, 80, 242),
     Color32::from_rgb(255, 255, 255),
+    Color32::from_rgb(82, 82, 91),
+    Color32::from_rgb(145, 145, 155),
+    Color32::from_rgb(224, 224, 230),
+    Color32::from_rgb(190, 242, 200),
+    Color32::from_rgb(190, 224, 255),
+    Color32::from_rgb(255, 236, 153),
+    Color32::from_rgb(255, 201, 201),
+    Color32::from_rgb(221, 214, 254),
 ];
+
+const LEGACY_DARK_PALETTE: [Color32; 15] = [
+    Color32::from_rgb(245, 245, 245),
+    Color32::from_rgb(224, 49, 49),
+    Color32::from_rgb(82, 196, 104),
+    Color32::from_rgb(66, 153, 225),
+    Color32::from_rgb(245, 159, 0),
+    Color32::from_rgb(145, 120, 242),
+    Color32::from_rgb(31, 35, 45),
+    Color32::from_rgb(82, 82, 91),
+    Color32::from_rgb(145, 145, 155),
+    Color32::from_rgb(224, 224, 230),
+    Color32::from_rgb(190, 242, 200),
+    Color32::from_rgb(190, 224, 255),
+    Color32::from_rgb(255, 236, 153),
+    Color32::from_rgb(255, 201, 201),
+    Color32::from_rgb(221, 214, 254),
+];
+
+fn stroke_preset_count() -> usize {
+    COMPACT_STROKE_PRESET_COUNT
+}
 
 const FILL_COLORS: [Color32; 6] = [
     Color32::from_rgb(255, 255, 255),
@@ -148,8 +289,9 @@ pub(crate) struct WorkspaceUi {
     autosave_directory: String,
     light_canvas_color: Color32,
     dark_canvas_color: Color32,
-    light_palette: [Color32; 7],
-    dark_palette: [Color32; 7],
+    canvas_background: settings::CanvasBackground,
+    light_palette: [Color32; 15],
+    dark_palette: [Color32; 15],
     stabilization: f32,
     pressure_sensitivity: f32,
     remember_drawing_style: bool,
@@ -160,6 +302,9 @@ pub(crate) struct WorkspaceUi {
     update_checked_in_session: bool,
     update_error: Option<String>,
     update_receiver: Option<Receiver<Result<UpdateCache, String>>>,
+    update_installing: bool,
+    update_install_receiver: Option<Receiver<Result<(), String>>>,
+    update_restart_requested: bool,
     capturing_keybind: Option<KeybindAction>,
     status: String,
     collaboration_popup: Option<CollaborationPopup>,
@@ -296,6 +441,7 @@ struct DecodedImage {
 
 struct ImageTexture {
     fingerprint: u64,
+    document_revision: u64,
     texture: egui::TextureHandle,
 }
 
@@ -791,16 +937,9 @@ impl Default for WorkspaceUi {
             autosave_directory: settings::Settings::default().autosave_directory,
             light_canvas_color: LIGHT_CANVAS,
             dark_canvas_color: DARK_CANVAS,
+            canvas_background: settings::CanvasBackground::DotGrid,
             light_palette: STROKE_COLORS,
-            dark_palette: [
-                Color32::from_rgb(245, 245, 245),
-                Color32::from_rgb(224, 49, 49),
-                Color32::from_rgb(82, 196, 104),
-                Color32::from_rgb(66, 153, 225),
-                Color32::from_rgb(245, 159, 0),
-                Color32::from_rgb(145, 120, 242),
-                Color32::from_rgb(31, 35, 45),
-            ],
+            dark_palette: DARK_PALETTE,
             stabilization: 0.5,
             pressure_sensitivity: 0.5,
             remember_drawing_style: true,
@@ -811,6 +950,9 @@ impl Default for WorkspaceUi {
             update_checked_in_session: false,
             update_error: None,
             update_receiver: None,
+            update_installing: false,
+            update_install_receiver: None,
+            update_restart_requested: false,
             capturing_keybind: None,
             status: String::from("Select a tool to start drawing"),
             collaboration_popup: None,
@@ -855,10 +997,6 @@ impl WorkspaceUi {
         self.drop_preview_decode = None;
     }
 
-    pub(crate) const fn settings_dark_mode(&self) -> bool {
-        self.dark_mode
-    }
-
     /// Creates workspace UI state from persisted preferences.
     pub(crate) fn from_settings(settings: &settings::Settings) -> Self {
         let mut workspace = Self::default();
@@ -885,7 +1023,7 @@ impl WorkspaceUi {
             );
         }
         settings::Settings {
-            version: 2,
+            version: 6,
             appearance: match self.appearance {
                 AppearanceMode::System => settings::Appearance::System,
                 AppearanceMode::Light => settings::Appearance::Light,
@@ -901,6 +1039,7 @@ impl WorkspaceUi {
             autosave_directory: self.autosave_directory.clone(),
             light_canvas_color: self.light_canvas_color.to_array(),
             dark_canvas_color: self.dark_canvas_color.to_array(),
+            canvas_background: self.canvas_background,
             light_palette: self.light_palette.iter().map(Color32::to_array).collect(),
             dark_palette: self.dark_palette.iter().map(Color32::to_array).collect(),
             stabilization: self.stabilization,
@@ -946,8 +1085,27 @@ impl WorkspaceUi {
             persisted.dark_canvas_color[2],
             persisted.dark_canvas_color[3],
         );
-        apply_palette(&mut self.light_palette, &persisted.light_palette);
-        apply_palette(&mut self.dark_palette, &persisted.dark_palette);
+        self.canvas_background = persisted.canvas_background;
+        apply_palette_with_default_migration(
+            &mut self.light_palette,
+            &persisted.light_palette,
+            persisted.version,
+            &LEGACY_STROKE_COLORS,
+            &PREVIOUS_STROKE_COLORS,
+            None,
+            None,
+            STROKE_COLORS,
+        );
+        apply_palette_with_default_migration(
+            &mut self.dark_palette,
+            &persisted.dark_palette,
+            persisted.version,
+            &LEGACY_DARK_PALETTE,
+            &PREVIOUS_DARK_PALETTE,
+            Some(&PREVIOUS_ORDERED_DARK_PALETTE),
+            Some(&INTERMEDIATE_DARK_PALETTE),
+            DARK_PALETTE,
+        );
         self.stabilization = bounded_input_setting(persisted.stabilization);
         self.pressure_sensitivity = bounded_input_setting(persisted.pressure_sensitivity);
         self.remember_drawing_style = persisted.remember_drawing_style;
@@ -1021,6 +1179,38 @@ impl WorkspaceUi {
         }
     }
 
+    /// Polls the background update installation without blocking the UI thread.
+    pub(crate) fn poll_update_install(&mut self) -> bool {
+        let Some(receiver) = self.update_install_receiver.as_ref() else {
+            return false;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(())) => {
+                self.update_installing = false;
+                self.update_install_receiver = None;
+                self.update_error = Some(String::from(
+                    "Update handoff started. Sketchi will restart to finish the update.",
+                ));
+                self.update_restart_requested = true;
+                true
+            }
+            Ok(Err(error)) => {
+                self.update_error = Some(error);
+                self.update_installing = false;
+                self.update_install_receiver = None;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.update_error =
+                    Some(String::from("The update installation stopped unexpectedly"));
+                self.update_installing = false;
+                self.update_install_receiver = None;
+                true
+            }
+        }
+    }
+
     /// Starts a release lookup on a worker thread.
     pub(crate) fn start_update_check(&mut self) {
         if self.update_checking {
@@ -1049,18 +1239,54 @@ impl WorkspaceUi {
         self.update_checking
     }
 
+    /// Shows a result reported by the previous update handoff.
+    pub(crate) fn set_update_message(&mut self, message: String) {
+        self.update_error = Some(message);
+    }
+
     /// Returns the current status derived from the cached release data.
     pub(crate) fn update_status(&self) -> update::UpdateStatus {
         update::status(&self.update_cache, self.update_channel)
     }
 
-    fn open_update_release(&mut self) {
-        let Some(url) = self.update_status().target_url else {
+    fn install_update(&mut self) {
+        if self.update_installing {
+            return;
+        }
+        let status = self.update_status();
+        let (Some(url), Some(name)) = (status.target_asset_url, status.target_asset_name) else {
+            self.update_error = Some(String::from(
+                "This release does not contain an automatic update for your platform.",
+            ));
             return;
         };
-        if let Err(error) = update::open_release_url(&url) {
-            self.update_error = Some(error.to_string());
+        let digest = status.target_asset_digest;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.update_installing = true;
+        self.update_error = None;
+        self.update_install_receiver = Some(receiver);
+        let worker = std::thread::Builder::new()
+            .name(String::from("sketchi-update-install"))
+            .spawn(move || {
+                let result = update::install_update(&url, &name, digest.as_deref())
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            });
+        if let Err(error) = worker {
+            self.update_installing = false;
+            self.update_install_receiver = None;
+            self.update_error = Some(format!("Could not start the update installation: {error}"));
         }
+    }
+
+    /// Returns whether the updater has asked the application to exit and restart.
+    pub(crate) fn take_update_restart_request(&mut self) -> bool {
+        std::mem::take(&mut self.update_restart_requested)
+    }
+
+    /// Returns whether the update installer is currently running.
+    pub(crate) const fn update_installing(&self) -> bool {
+        self.update_installing
     }
 
     /// Sets whether the last native-window geometry should be restored.
@@ -1078,6 +1304,12 @@ impl WorkspaceUi {
         self.settings_open
     }
 
+    /// Returns the active settings appearance mode for the native window.
+    pub(crate) const fn settings_dark_mode(&self) -> bool {
+        self.dark_mode
+    }
+
+    /// Returns whether the native settings window should be open.
     /// Closes the native settings window and abandons an in-progress shortcut capture.
     pub(crate) fn close_settings(&mut self) {
         self.settings_open = false;
@@ -1124,6 +1356,7 @@ impl WorkspaceUi {
             .clone_from(&defaults.autosave_directory);
         self.light_canvas_color = defaults.light_canvas_color;
         self.dark_canvas_color = defaults.dark_canvas_color;
+        self.canvas_background = defaults.canvas_background;
         self.light_palette = defaults.light_palette;
         self.dark_palette = defaults.dark_palette;
         self.stabilization = defaults.stabilization;
@@ -1285,19 +1518,20 @@ impl WorkspaceUi {
                 self.handle_dropped_images(context, editor, camera, canvas_rect);
                 self.handle_clipboard_image(context, editor, camera, canvas_rect);
                 self.prepare_drop_preview(context);
-                let input_document = editor.document().clone();
                 if !navigation_handled {
-                    self.handle_canvas_input(ui, &response, &input_document, editor, tools, camera);
+                    self.handle_canvas_input(ui, &response, editor, tools, camera);
                 }
                 let cursor = if navigation_handled && ui.input(|input| input.pointer.middle_down())
                 {
                     CursorIcon::Grabbing
                 } else {
-                    self.canvas_cursor(&input_document, &response, *camera, dragging)
+                    self.canvas_cursor(editor.document(), &response, *camera, dragging)
                 };
                 let response = response.on_hover_cursor(cursor);
                 let painter = ui.painter_at(canvas_rect);
-                paint_dot_grid(&painter, canvas_rect, *camera, self.dark_mode);
+                if self.canvas_background == settings::CanvasBackground::DotGrid {
+                    paint_dot_grid(&painter, canvas_rect, *camera, self.dark_mode);
+                }
                 if self.drop_hovered.is_some() {
                     paint_drop_target(&painter, canvas_rect, self.dark_mode);
                 }
@@ -1335,6 +1569,7 @@ impl WorkspaceUi {
                         .and_then(|text_edit| text_edit.element_id),
                     &mut self.decoded_images,
                     &mut self.image_textures,
+                    editor.revision(),
                 );
                 self.paint_drop_preview(context, &painter, *camera, canvas_rect);
                 if let Some(text_edit) = self.text_edit.as_ref() {
@@ -1349,6 +1584,7 @@ impl WorkspaceUi {
                         *camera,
                         &mut self.decoded_images,
                         &mut self.image_textures,
+                        editor.revision(),
                     );
                 }
                 if !selection_preview.is_empty() {
@@ -1360,6 +1596,7 @@ impl WorkspaceUi {
                             *camera,
                             &mut self.decoded_images,
                             &mut self.image_textures,
+                            editor.revision(),
                         );
                     }
                     let elements = selection_preview.iter().collect::<Vec<_>>();
@@ -1757,10 +1994,11 @@ impl WorkspaceUi {
         if std::mem::take(&mut self.clipboard_paste_requested).is_none() {
             return;
         }
-        if !self.element_clipboard.is_empty() {
+        if self.text_edit.is_some() || context.wants_keyboard_input() {
             return;
         }
-        if self.text_edit.is_some() || context.wants_keyboard_input() {
+        if !self.element_clipboard.is_empty() {
+            self.paste_copied_elements(editor);
             return;
         }
 
@@ -1831,10 +2069,10 @@ impl WorkspaceUi {
         };
 
         for event in events {
+            if insert_text_event(&mut text_edit.text, &mut text_edit.cursor, &event) {
+                continue;
+            }
             match event {
-                egui::Event::Text(text) => {
-                    insert_text_at_cursor(&mut text_edit.text, &mut text_edit.cursor, &text);
-                }
                 egui::Event::Key {
                     key: egui::Key::Backspace,
                     pressed: true,
@@ -2027,7 +2265,6 @@ impl WorkspaceUi {
         &mut self,
         ui: &mut egui::Ui,
         response: &egui::Response,
-        document: &Document,
         editor: &mut Editor,
         tools: &mut ToolController,
         camera: &mut Camera,
@@ -2039,7 +2276,13 @@ impl WorkspaceUi {
         if self.active_tool == Tool::Select {
             let shift = ui.input(|input| input.modifiers.shift);
             let press_origin = ui.input(|input| input.pointer.press_origin());
-            self.handle_selection_input(response, document, editor, camera, shift, press_origin);
+            let gesture = {
+                let document = editor.document();
+                self.handle_selection_input(response, document, camera, shift, press_origin)
+            };
+            if let Some(gesture) = gesture {
+                self.commit_selection_gesture(gesture, editor);
+            }
             return;
         }
 
@@ -2048,12 +2291,14 @@ impl WorkspaceUi {
                 && let Some(position) = response.interact_pointer_pos()
             {
                 let world_position = screen_to_world(*camera, position);
-                let text_target = self
-                    .renderer
-                    .hit_test(document, world_position, selection_tolerance(camera.zoom()))
-                    .and_then(|element_id| document.element(element_id))
-                    .filter(|element| element.kind == ElementKind::Text)
-                    .cloned();
+                let text_target = {
+                    let document = editor.document();
+                    self.renderer
+                        .hit_test(document, world_position, selection_tolerance(camera.zoom()))
+                        .and_then(|element_id| document.element(element_id))
+                        .filter(|element| element.kind == ElementKind::Text)
+                        .cloned()
+                };
                 if let Some(element) = text_target {
                     self.begin_text_edit(Some(&element));
                 } else {
@@ -2155,11 +2400,10 @@ impl WorkspaceUi {
         &mut self,
         response: &egui::Response,
         document: &Document,
-        editor: &mut Editor,
         camera: &Camera,
         shift: bool,
         press_origin: Option<Pos2>,
-    ) {
+    ) -> Option<SelectionGesture> {
         let text_edit_target = if response.double_clicked() {
             response.interact_pointer_pos().and_then(|position| {
                 let world_position = screen_to_world(*camera, position);
@@ -2186,7 +2430,7 @@ impl WorkspaceUi {
 
         if let Some(element) = text_edit_target {
             self.begin_text_edit(Some(&element));
-            return;
+            return None;
         }
 
         if response.drag_started()
@@ -2221,7 +2465,7 @@ impl WorkspaceUi {
                         current_angle: angle,
                     });
                     self.status = String::from("Rotating object");
-                    return;
+                    return None;
                 }
                 if let Some(handle) = padded_selection_handle_at(
                     &element,
@@ -2242,7 +2486,7 @@ impl WorkspaceUi {
                         ),
                     });
                     self.status = String::from("Resizing object");
-                    return;
+                    return None;
                 }
             }
 
@@ -2271,7 +2515,7 @@ impl WorkspaceUi {
                     ),
                 });
                 self.status = String::from("Resizing selection");
-                return;
+                return None;
             }
 
             let hit = self.renderer.hit_test(document, world_position, tolerance);
@@ -2381,23 +2625,20 @@ impl WorkspaceUi {
                     ..
                 } => *current_angle = pointer_angle(*center, world_position),
             }
-            self.commit_selection_gesture(gesture, document, editor);
+            return Some(gesture);
         }
+        None
     }
 
     #[allow(clippy::too_many_lines)]
-    fn commit_selection_gesture(
-        &mut self,
-        gesture: SelectionGesture,
-        document: &Document,
-        editor: &mut Editor,
-    ) {
+    fn commit_selection_gesture(&mut self, gesture: SelectionGesture, editor: &mut Editor) {
         match gesture {
             SelectionGesture::Marquee {
                 start,
                 current,
                 additive,
             } => {
+                let document = editor.document();
                 let marquee = marquee_rect(start, current);
                 let matches = document
                     .elements()
@@ -2573,7 +2814,7 @@ impl WorkspaceUi {
         }
     }
 
-    fn active_palette(&self) -> [Color32; 7] {
+    fn active_palette(&self) -> [Color32; 15] {
         if self.dark_mode {
             self.dark_palette
         } else {
@@ -3390,12 +3631,15 @@ impl WorkspaceUi {
                             );
                         }
                         if !collaboration.server_available && popup == CollaborationPopup::Create {
+                            let message = if collaboration.status == "Not connected" {
+                                "The local collaboration server is unavailable."
+                            } else {
+                                collaboration.status.as_str()
+                            };
                             ui.label(
-                                egui::RichText::new(
-                                    "The local collaboration server is unavailable.",
-                                )
-                                .size(11.0)
-                                .color(Color32::from_rgb(220, 80, 80)),
+                                egui::RichText::new(message)
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(220, 80, 80)),
                             );
                         }
                     });
@@ -3462,7 +3706,6 @@ impl WorkspaceUi {
             (SettingsPage::About, "About", Icon::Information),
         ];
         context.set_visuals(settings_visuals(self.dark_mode));
-        let visuals_mode = self.dark_mode;
         self.handle_keybind_input(context, editor, tools);
         let root_stroke = Stroke::new(
             1.0_f32,
@@ -3479,9 +3722,6 @@ impl WorkspaceUi {
             se: SETTINGS_ROOT_RADIUS,
         };
         egui::CentralPanel::default()
-            // Paint the border explicitly inside the panel clip. A CentralPanel frame
-            // at the exact content bounds can have its outside half clipped, most
-            // noticeably on the right edge of a native settings window.
             .frame(settings_window_frame(self.dark_mode).stroke(Stroke::NONE))
             .show(context, |ui| {
                 let root_rect = ui.max_rect();
@@ -3554,7 +3794,9 @@ impl WorkspaceUi {
                                         .color(text_color(self.dark_mode)),
                                 );
                                 ui.add_space(8.0);
-                                ui.checkbox(
+                                themed_checkbox(
+                                    ui,
+                                    crate::theme::ThemeTokens::for_dark_mode(self.dark_mode),
                                     &mut self.restore_session,
                                     "Restore previous session on start",
                                 );
@@ -3563,20 +3805,20 @@ impl WorkspaceUi {
                                     ui,
                                     "Time interval for automatic saving",
                                     |ui| {
-                                    settings_dropdown_field(
-                                        ui,
-                                        "sketchi.autosave_interval",
-                                        self.autosave_interval.label(),
-                                        |ui| {
-                                            for interval in AutosaveInterval::ALL {
-                                                ui.selectable_value(
-                                                    &mut self.autosave_interval,
-                                                    interval,
-                                                    interval.label(),
-                                                );
-                                            }
-                                        },
-                                    );
+                                        settings_dropdown_field(
+                                            ui,
+                                            "sketchi.autosave_interval",
+                                            self.autosave_interval.label(),
+                                            |ui| {
+                                                for interval in AutosaveInterval::ALL {
+                                                    ui.selectable_value(
+                                                        &mut self.autosave_interval,
+                                                        interval,
+                                                        interval.label(),
+                                                    );
+                                                }
+                                            },
+                                        );
                                     },
                                 );
                                 ui.add_space(10.0);
@@ -3602,7 +3844,9 @@ impl WorkspaceUi {
                                         .color(text_color(self.dark_mode)),
                                 );
                                 ui.add_space(8.0);
-                                ui.checkbox(
+                                themed_checkbox(
+                                    ui,
+                                    crate::theme::ThemeTokens::for_dark_mode(self.dark_mode),
                                     &mut self.remember_drawing_style,
                                     "Remember last-used drawing style",
                                 );
@@ -3670,6 +3914,33 @@ impl WorkspaceUi {
                                     );
                                 });
                                 ui.add_space(8.0);
+                                settings_stacked_field(ui, "Canvas surface", |ui| {
+                                    let surface_label = match self.canvas_background {
+                                        settings::CanvasBackground::DotGrid => "Dot grid",
+                                        settings::CanvasBackground::Clean => "Clean whiteboard",
+                                    };
+                                    settings_dropdown_field(
+                                        ui,
+                                        "sketchi.canvas_surface",
+                                        surface_label,
+                                        |ui| {
+                                            for (surface, label) in [
+                                                (settings::CanvasBackground::DotGrid, "Dot grid"),
+                                                (
+                                                    settings::CanvasBackground::Clean,
+                                                    "Clean whiteboard",
+                                                ),
+                                            ] {
+                                                ui.selectable_value(
+                                                    &mut self.canvas_background,
+                                                    surface,
+                                                    label,
+                                                );
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.add_space(8.0);
                                 let light_color = settings_color_row(
                                     ui,
                                     "Light background color",
@@ -3695,6 +3966,7 @@ impl WorkspaceUi {
                             });
                             ui.add_space(12.0);
                             settings_group_frame(self.dark_mode).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
                                 ui.label(
                                     egui::RichText::new("Color Palette")
                                         .strong()
@@ -3987,6 +4259,8 @@ impl WorkspaceUi {
                                 ui.add_space(12.0);
                                 let summary = if self.update_checking {
                                     "Checking for updates…"
+                                } else if self.update_installing {
+                                    "Installing update…"
                                 } else if update_status.target.is_some() {
                                     if update_status.channel == UpdateChannel::Edge {
                                         "Edge update available"
@@ -4035,10 +4309,12 @@ impl WorkspaceUi {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Min),
                                         |ui| {
-                                            if button(
+                                            if update_check_button(
                                                 ui,
                                                 if self.update_checking {
                                                     "Checking…"
+                                                } else if self.update_installing {
+                                                    "Installing…"
                                                 } else {
                                                     "Check now"
                                                 },
@@ -4048,6 +4324,7 @@ impl WorkspaceUi {
                                                 } else {
                                                     Color32::from_rgb(245, 246, 249)
                                                 },
+                                                self.update_checking,
                                             )
                                             .clicked()
                                             {
@@ -4079,15 +4356,24 @@ impl WorkspaceUi {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
+                                                let can_install = update_status
+                                                    .target_asset_url
+                                                    .is_some()
+                                                    && !self.update_installing;
                                                 if button(
                                                     ui,
-                                                    "Open release",
-                                                    Vec2::new(120.0, STANDARD_CONTROL_SIZE.y),
+                                                    if self.update_installing {
+                                                        "Installing…"
+                                                    } else {
+                                                        "Install update"
+                                                    },
+                                                    Vec2::new(132.0, STANDARD_CONTROL_SIZE.y),
                                                     Color32::from_rgb(54, 125, 75),
                                                 )
                                                 .clicked()
+                                                    && can_install
                                                 {
-                                                    self.open_update_release();
+                                                    self.install_update();
                                                 }
                                             },
                                         );
@@ -4162,11 +4448,9 @@ impl WorkspaceUi {
                     root_stroke,
                     StrokeKind::Inside,
                 );
-        });
+                    });
 
-        if visuals_mode != self.dark_mode {
-            context.set_visuals(settings_visuals(self.dark_mode));
-        }
+        context.set_visuals(sketchi_visuals(self.dark_mode));
         self.settings_page = selected_page;
     }
 
@@ -4299,7 +4583,9 @@ impl WorkspaceUi {
 
     #[allow(clippy::too_many_lines)]
     fn show_properties(&mut self, context: &egui::Context, editor: &mut Editor) {
-        if self.active_tool == Tool::Select && self.selected.is_empty() {
+        if self.active_tool == Tool::Pan
+            || (self.active_tool == Tool::Select && self.selected.is_empty())
+        {
             return;
         }
 
@@ -4328,6 +4614,15 @@ impl WorkspaceUi {
                 .next()
                 .and_then(|id| document.element(*id))
                 .is_some_and(|element| element.kind == ElementKind::Image);
+        let freehand_properties = self.active_tool == Tool::Freehand
+            || (self.selected.len() == 1
+                && self
+                    .selected
+                    .iter()
+                    .next()
+                    .and_then(|id| document.element(*id))
+                    .is_some_and(|element| element.kind == ElementKind::Freehand));
+        let stroke_preset_limit = stroke_preset_count();
         let panel_height = (context.content_rect().height() - 104.0).max(280.0);
         egui::Area::new(Id::new("sketchi.properties"))
             .fixed_pos(egui::pos2(16.0, 76.0))
@@ -4361,7 +4656,7 @@ impl WorkspaceUi {
                                 section_label(ui, "Stroke", self.dark_mode);
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 4.0;
-                                    for color in palette.into_iter().take(5) {
+                                    for color in palette.into_iter().take(stroke_preset_limit) {
                                         if color_swatch(
                                             ui,
                                             Some(color),
@@ -4393,7 +4688,11 @@ impl WorkspaceUi {
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 6.0;
                                     for (family, icon, label) in [
-                                        (TextFontFamily::Handwritten, Icon::Freehand, "Hand-drawn"),
+                                        (
+                                            TextFontFamily::Handwritten,
+                                            Icon::HandDrawn,
+                                            "Hand-drawn",
+                                        ),
                                         (TextFontFamily::Sans, Icon::FontSans, "Normal"),
                                         (TextFontFamily::Monospace, Icon::Code, "Code"),
                                     ] {
@@ -4511,7 +4810,7 @@ impl WorkspaceUi {
                                 section_label(ui, "Stroke", self.dark_mode);
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 4.0;
-                                    for color in palette {
+                                    for color in palette.into_iter().take(stroke_preset_limit) {
                                         if color_swatch(
                                             ui,
                                             Some(color),
@@ -4627,7 +4926,7 @@ impl WorkspaceUi {
                                 section_label(ui, "Stroke", self.dark_mode);
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 4.0;
-                                    for color in palette {
+                                    for color in palette.into_iter().take(stroke_preset_limit) {
                                         if color_swatch(
                                             ui,
                                             Some(color),
@@ -4653,46 +4952,53 @@ impl WorkspaceUi {
                                     }
                                 });
 
-                                ui.add_space(10.0);
-                                section_label(ui, "Background", self.dark_mode);
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    if color_swatch(ui, None, style.fill.is_none(), self.dark_mode)
-                                        .on_hover_text("Transparent")
-                                        .clicked()
-                                    {
-                                        patch.fill = Some(None);
-                                        changed = true;
-                                    }
-                                    for color in FILL_COLORS {
+                                if !freehand_properties {
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Background", self.dark_mode);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
                                         if color_swatch(
                                             ui,
-                                            Some(color),
-                                            style
-                                                .fill
-                                                .is_some_and(|fill| to_color32(fill) == color),
+                                            None,
+                                            style.fill.is_none(),
                                             self.dark_mode,
                                         )
+                                        .on_hover_text("Transparent")
                                         .clicked()
                                         {
-                                            patch.fill = Some(Some(to_core_color(color)));
+                                            patch.fill = Some(None);
                                             changed = true;
                                         }
-                                    }
-                                    let custom = style
-                                        .fill
-                                        .map_or(Color32::from_rgb(221, 214, 254), to_color32);
-                                    ui.separator();
-                                    let response = color_swatch(
-                                        ui,
-                                        Some(custom),
-                                        self.color_picker == Some(ColorPickerTarget::Fill),
-                                        self.dark_mode,
-                                    );
-                                    if response.clicked() {
-                                        color_target = Some(ColorPickerTarget::Fill);
-                                    }
-                                });
+                                        for color in FILL_COLORS {
+                                            if color_swatch(
+                                                ui,
+                                                Some(color),
+                                                style
+                                                    .fill
+                                                    .is_some_and(|fill| to_color32(fill) == color),
+                                                self.dark_mode,
+                                            )
+                                            .clicked()
+                                            {
+                                                patch.fill = Some(Some(to_core_color(color)));
+                                                changed = true;
+                                            }
+                                        }
+                                        let custom = style
+                                            .fill
+                                            .map_or(Color32::from_rgb(221, 214, 254), to_color32);
+                                        ui.separator();
+                                        let response = color_swatch(
+                                            ui,
+                                            Some(custom),
+                                            self.color_picker == Some(ColorPickerTarget::Fill),
+                                            self.dark_mode,
+                                        );
+                                        if response.clicked() {
+                                            color_target = Some(ColorPickerTarget::Fill);
+                                        }
+                                    });
+                                }
 
                                 ui.add_space(10.0);
                                 section_label(ui, "Fill", self.dark_mode);
@@ -4764,50 +5070,54 @@ impl WorkspaceUi {
                                     }
                                 });
 
-                                ui.add_space(10.0);
-                                section_label(ui, "Sloppiness", self.dark_mode);
-                                ui.horizontal(|ui| {
-                                    for (sloppiness, icon, label) in [
-                                        (Sloppiness::Architect, Icon::PenNib, "Architect"),
-                                        (Sloppiness::Artist, Icon::QuillPen, "Artist"),
-                                        (Sloppiness::Cartoonist, Icon::Brush, "Cartoonist"),
-                                    ] {
-                                        if property_choice(
-                                            ui,
-                                            icon,
-                                            label,
-                                            style.sloppiness == sloppiness,
-                                            self.dark_mode,
-                                        )
-                                        .clicked()
-                                        {
-                                            patch.sloppiness = Some(sloppiness);
-                                            changed = true;
+                                if !freehand_properties {
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Sloppiness", self.dark_mode);
+                                    ui.horizontal(|ui| {
+                                        for (sloppiness, icon, label) in [
+                                            (Sloppiness::Architect, Icon::PenNib, "Architect"),
+                                            (Sloppiness::Artist, Icon::QuillPen, "Artist"),
+                                            (Sloppiness::Cartoonist, Icon::Brush, "Cartoonist"),
+                                        ] {
+                                            if property_choice(
+                                                ui,
+                                                icon,
+                                                label,
+                                                style.sloppiness == sloppiness,
+                                                self.dark_mode,
+                                            )
+                                            .clicked()
+                                            {
+                                                patch.sloppiness = Some(sloppiness);
+                                                changed = true;
+                                            }
                                         }
-                                    }
-                                });
+                                    });
+                                }
 
-                                ui.add_space(10.0);
-                                section_label(ui, "Edges", self.dark_mode);
-                                ui.horizontal(|ui| {
-                                    for (edges, icon, label) in [
-                                        (EdgeStyle::Sharp, Icon::Rectangle, "Sharp"),
-                                        (EdgeStyle::Rounded, Icon::Rounded, "Rounded"),
-                                    ] {
-                                        if property_choice(
-                                            ui,
-                                            icon,
-                                            label,
-                                            style.edges == edges,
-                                            self.dark_mode,
-                                        )
-                                        .clicked()
-                                        {
-                                            patch.edges = Some(edges);
-                                            changed = true;
+                                if !freehand_properties {
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Edges", self.dark_mode);
+                                    ui.horizontal(|ui| {
+                                        for (edges, icon, label) in [
+                                            (EdgeStyle::Sharp, Icon::Rectangle, "Sharp"),
+                                            (EdgeStyle::Rounded, Icon::Rounded, "Rounded"),
+                                        ] {
+                                            if property_choice(
+                                                ui,
+                                                icon,
+                                                label,
+                                                style.edges == edges,
+                                                self.dark_mode,
+                                            )
+                                            .clicked()
+                                            {
+                                                patch.edges = Some(edges);
+                                                changed = true;
+                                            }
                                         }
-                                    }
-                                });
+                                    });
+                                }
                             }
 
                             ui.add_space(10.0);
@@ -5806,7 +6116,7 @@ fn settings_nav_item(
         Stroke::NONE,
         StrokeKind::Inside,
     );
-    paint_remix_icon(
+    paint_lucide_icon(
         ui.painter(),
         icon,
         Rect::from_center_size(
@@ -6381,20 +6691,104 @@ fn icon_button(
     } else {
         text_color(dark_mode)
     };
-    paint_remix_icon(ui.painter(), icon, rect, icon_color);
+    paint_lucide_icon(ui.painter(), icon, rect, icon_color);
     response.on_hover_text(tooltip)
 }
 
-fn paint_remix_icon(painter: &Painter, icon: Icon, rect: Rect, color: Color32) {
+#[allow(clippy::cast_possible_truncation)]
+fn update_check_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    size: Vec2,
+    fill: Color32,
+    spinning: bool,
+) -> egui::Response {
+    let response = ui.add_sized(
+        size,
+        egui::Button::new("")
+            .fill(fill)
+            .corner_radius(CornerRadius::same(SETTINGS_CONTROL_RADIUS)),
+    );
+    let text_color = ui.visuals().text_color();
+    let text_font = egui::TextStyle::Button.resolve(ui.style());
+    let text_galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), text_font, text_color);
+
+    let icon_font = FontId::new(
+        16.0,
+        egui::FontFamily::Name(lucide_icons::FONT_FAMILY.into()),
+    );
+    let icon_galley =
+        ui.painter()
+            .layout_no_wrap(Icon::RefreshCcw.glyph().to_string(), icon_font, text_color);
+    let gap = 6.0;
+    let content_width = icon_galley.size().x + gap + text_galley.size().x;
+    let content_left = response.rect.center().x - content_width * 0.5;
+    let icon_rect = Rect::from_min_size(
+        Pos2::new(
+            content_left,
+            response.rect.center().y - icon_galley.size().y * 0.5,
+        ),
+        icon_galley.size(),
+    );
+    paint_rotating_lucide_icon(
+        ui.painter(),
+        Icon::RefreshCcw,
+        icon_rect,
+        text_color,
+        if spinning {
+            ui.input(|input| input.time as f32 * 4.0)
+        } else {
+            0.0
+        },
+    );
+    ui.painter().galley(
+        Pos2::new(
+            content_left + icon_galley.size().x + gap,
+            response.rect.center().y - text_galley.size().y * 0.5,
+        ),
+        text_galley,
+        text_color,
+    );
+    if spinning {
+        ui.ctx().request_repaint();
+    }
+
+    response
+}
+
+fn paint_lucide_icon(painter: &Painter, icon: Icon, rect: Rect, color: Color32) {
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
         icon.glyph().to_string(),
         FontId::new(
             18.0,
-            egui::FontFamily::Name(remix_icons::FONT_FAMILY.into()),
+            egui::FontFamily::Name(lucide_icons::FONT_FAMILY.into()),
         ),
         color,
+    );
+}
+
+fn paint_rotating_lucide_icon(
+    painter: &Painter,
+    icon: Icon,
+    rect: Rect,
+    color: Color32,
+    angle: f32,
+) {
+    let galley = painter.layout_no_wrap(
+        icon.glyph().to_string(),
+        FontId::new(
+            16.0,
+            egui::FontFamily::Name(lucide_icons::FONT_FAMILY.into()),
+        ),
+        color,
+    );
+    let position = rect.center() - galley.size() * 0.5;
+    painter.add(
+        TextShape::new(position, galley, color).with_angle_and_anchor(angle, Align2::CENTER_CENTER),
     );
 }
 
@@ -6411,12 +6805,21 @@ fn next_settings_color(current: Color32) -> Color32 {
     let colors = [
         LIGHT_CANVAS,
         DARK_CANVAS,
-        Color32::from_rgb(31, 31, 31),
-        Color32::from_rgb(224, 49, 49),
-        Color32::from_rgb(47, 158, 68),
-        Color32::from_rgb(25, 113, 194),
-        Color32::from_rgb(240, 140, 0),
-        Color32::from_rgb(121, 80, 242),
+        STROKE_COLORS[0],
+        STROKE_COLORS[1],
+        STROKE_COLORS[2],
+        STROKE_COLORS[3],
+        STROKE_COLORS[4],
+        STROKE_COLORS[5],
+        STROKE_COLORS[6],
+        STROKE_COLORS[7],
+        STROKE_COLORS[8],
+        STROKE_COLORS[9],
+        STROKE_COLORS[10],
+        STROKE_COLORS[11],
+        STROKE_COLORS[12],
+        STROKE_COLORS[13],
+        STROKE_COLORS[14],
     ];
     let index = colors
         .iter()
@@ -6428,9 +6831,112 @@ fn next_settings_color(current: Color32) -> Color32 {
         .unwrap_or(current)
 }
 
-fn apply_palette(target: &mut [Color32; 7], persisted: &[[u8; 4]]) {
+fn apply_palette(target: &mut [Color32; 15], persisted: &[[u8; 4]]) {
     for (target, color) in target.iter_mut().zip(persisted.iter()) {
         *target = Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_palette_with_default_migration(
+    target: &mut [Color32; 15],
+    persisted: &[[u8; 4]],
+    version: u32,
+    legacy_default: &[Color32; 15],
+    previous_default: &[Color32; 15],
+    ordered_previous_default: Option<&[Color32; 15]>,
+    intermediate_previous_default: Option<&[Color32; 15]>,
+    current_default: [Color32; 15],
+) {
+    let is_legacy_default = version < 3
+        && (persisted.len() == 7 || persisted.len() == legacy_default.len())
+        && persisted
+            .iter()
+            .zip(legacy_default)
+            .all(|(persisted, expected)| *persisted == expected.to_array());
+    let is_previous_default = persisted.len() == previous_default.len()
+        && persisted
+            .iter()
+            .zip(previous_default)
+            .all(|(persisted, expected)| *persisted == expected.to_array());
+    let is_ordered_previous_default = ordered_previous_default.is_some_and(|expected| {
+        persisted.len() == expected.len()
+            && persisted
+                .iter()
+                .zip(expected)
+                .all(|(persisted, expected)| *persisted == expected.to_array())
+    });
+    let previous_red = previous_default.get(5).map(Color32::to_array);
+    let previous_neutral_tail = previous_default.get(10..);
+    let is_previous_layout = persisted.len() == previous_default.len()
+        && persisted.get(5).copied() == previous_red
+        && persisted.get(10..).is_some_and(|colors| {
+            previous_neutral_tail.is_some_and(|expected_colors| {
+                colors
+                    .iter()
+                    .zip(expected_colors)
+                    .all(|(persisted, expected)| *persisted == expected.to_array())
+            })
+        });
+    let is_ordered_previous_layout = ordered_previous_default.is_some_and(|expected| {
+        persisted.len() == expected.len()
+            && persisted.get(10).copied() == expected.get(10).map(Color32::to_array)
+            && persisted.get(11..).is_some_and(|colors| {
+                expected.get(11..).is_some_and(|expected_colors| {
+                    colors
+                        .iter()
+                        .zip(expected_colors)
+                        .all(|(persisted, expected)| *persisted == expected.to_array())
+                })
+            })
+    });
+    let is_intermediate_previous_layout = intermediate_previous_default.is_some_and(|expected| {
+        persisted.len() == expected.len()
+            && persisted.first().copied() == expected.first().map(Color32::to_array)
+            && persisted.get(11..).is_some_and(|colors| {
+                expected.get(11..).is_some_and(|expected_colors| {
+                    colors
+                        .iter()
+                        .zip(expected_colors)
+                        .all(|(persisted, expected)| *persisted == expected.to_array())
+                })
+            })
+    });
+    if is_legacy_default || is_previous_default || is_ordered_previous_default {
+        *target = current_default;
+    } else if is_previous_layout {
+        let reordered = persisted
+            .get(..1)
+            .into_iter()
+            .flatten()
+            .chain(persisted.get(5..).into_iter().flatten())
+            .chain(persisted.get(1..5).into_iter().flatten())
+            .copied()
+            .collect::<Vec<_>>();
+        apply_palette(target, &reordered);
+    } else if is_ordered_previous_layout {
+        let reordered = persisted
+            .get(10..11)
+            .into_iter()
+            .flatten()
+            .chain(persisted.get(..10).into_iter().flatten())
+            .chain(persisted.get(12..).into_iter().flatten())
+            .chain(persisted.get(11..12).into_iter().flatten())
+            .copied()
+            .collect::<Vec<_>>();
+        apply_palette(target, &reordered);
+    } else if is_intermediate_previous_layout {
+        let reordered = persisted
+            .get(..11)
+            .into_iter()
+            .flatten()
+            .chain(persisted.get(12..).into_iter().flatten())
+            .chain(persisted.get(11..12).into_iter().flatten())
+            .copied()
+            .collect::<Vec<_>>();
+        apply_palette(target, &reordered);
+    } else {
+        apply_palette(target, persisted);
     }
 }
 
@@ -6463,7 +6969,7 @@ fn property_choice(
     dark_mode: bool,
 ) -> egui::Response {
     let (rect, response) = choice_card(ui, selected, dark_mode);
-    paint_remix_icon(
+    paint_lucide_icon(
         ui.painter(),
         icon,
         Rect::from_center_size(
@@ -6530,7 +7036,7 @@ fn text_size_choice(
 
 fn custom_text_size_choice(ui: &mut egui::Ui, selected: bool, dark_mode: bool) -> egui::Response {
     let (rect, response) = text_choice_card(ui, Vec2::splat(32.0), selected, dark_mode);
-    paint_remix_icon(
+    paint_lucide_icon(
         ui.painter(),
         Icon::CustomSize,
         Rect::from_center_size(rect.center(), Vec2::splat(18.0)),
@@ -6579,7 +7085,7 @@ fn text_property_icon_choice(
     dark_mode: bool,
 ) -> egui::Response {
     let (rect, response) = text_choice_card(ui, Vec2::splat(32.0), selected, dark_mode);
-    paint_remix_icon(
+    paint_lucide_icon(
         ui.painter(),
         icon,
         rect,
@@ -6700,9 +7206,9 @@ fn paint_dot_grid(painter: &Painter, canvas: Rect, camera: Camera, dark_mode: bo
     let start_x = (top_left.x / step).floor() * step;
     let start_y = (top_left.y / step).floor() * step;
     let dot_color = if dark_mode {
-        Color32::from_rgb(58, 60, 67)
+        DARK_GRID_DOT
     } else {
-        Color32::from_rgb(191, 194, 201)
+        LIGHT_GRID_DOT
     };
     let mut x = start_x;
     while x <= bottom_right.x + step {
@@ -6765,6 +7271,7 @@ fn paint_document(
     editing_element_id: Option<ElementId>,
     decoded_images: &mut HashMap<ElementId, DecodedImage>,
     image_textures: &mut HashMap<ElementId, ImageTexture>,
+    document_revision: u64,
 ) {
     image_textures.retain(|id, _| {
         document
@@ -6792,6 +7299,7 @@ fn paint_document(
             camera,
             decoded_images,
             image_textures,
+            document_revision,
         );
     }
 }
@@ -6807,7 +7315,7 @@ fn next_z_index(document: &Document) -> i64 {
 fn text_font_id(style: &Style, zoom: f32) -> FontId {
     let font_family = match style.font_family {
         TextFontFamily::Handwritten => {
-            egui::FontFamily::Name(remix_icons::HANDWRITTEN_FONT_FAMILY.into())
+            egui::FontFamily::Name(lucide_icons::HANDWRITTEN_FONT_FAMILY.into())
         }
         TextFontFamily::Monospace => egui::FontFamily::Monospace,
         TextFontFamily::Sans | TextFontFamily::Serif => egui::FontFamily::Proportional,
@@ -6887,6 +7395,14 @@ fn insert_text_at_cursor(text: &mut String, cursor: &mut usize, inserted: &str) 
     let byte_index = char_cursor_to_byte_index(text, character_cursor);
     text.insert_str(byte_index, inserted);
     *cursor = character_cursor.saturating_add(inserted.chars().count());
+}
+
+fn insert_text_event(text: &mut String, cursor: &mut usize, event: &egui::Event) -> bool {
+    let (egui::Event::Text(inserted) | egui::Event::Paste(inserted)) = event else {
+        return false;
+    };
+    insert_text_at_cursor(text, cursor, inserted);
+    true
 }
 
 fn previous_char_cursor(cursor: usize) -> usize {
@@ -6986,6 +7502,7 @@ fn paint_element(
     camera: Camera,
     decoded_images: &mut HashMap<ElementId, DecodedImage>,
     image_textures: &mut HashMap<ElementId, ImageTexture>,
+    document_revision: u64,
 ) {
     let min = camera.world_to_screen(element.transform.position);
     let size = Vec2::new(
@@ -7225,6 +7742,7 @@ fn paint_element(
             element.transform.rotation,
             decoded_images,
             image_textures,
+            document_revision,
         ),
     }
 }
@@ -7277,7 +7795,7 @@ fn rotated_text_origin(position: Pos2, rect: Rect, rotation: f32) -> Pos2 {
     rotate_screen_point(position, rect.center(), rotation)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn paint_image(
     painter: &Painter,
     element: &Element,
@@ -7287,6 +7805,7 @@ fn paint_image(
     rotation: f32,
     decoded_images: &mut HashMap<ElementId, DecodedImage>,
     image_textures: &mut HashMap<ElementId, ImageTexture>,
+    document_revision: u64,
 ) {
     let Some(image) = element.image.as_ref() else {
         paint_image_placeholder(
@@ -7300,10 +7819,11 @@ fn paint_image(
         );
         return;
     };
-    let fingerprint = image_fingerprint(image);
-    let needs_upload = image_textures
-        .get(&element.id)
-        .is_none_or(|cached| cached.fingerprint != fingerprint);
+    let cached = image_textures.get(&element.id);
+    let fingerprint = cached
+        .filter(|cached| cached.document_revision == document_revision)
+        .map_or_else(|| image_fingerprint(image), |cached| cached.fingerprint);
+    let needs_upload = cached.is_none_or(|cached| cached.fingerprint != fingerprint);
     if needs_upload {
         image_textures.remove(&element.id);
         let (width, height, rgba) = if let Some(decoded) = decoded_images.remove(&element.id) {
@@ -7336,9 +7856,12 @@ fn paint_image(
             element.id,
             ImageTexture {
                 fingerprint,
+                document_revision,
                 texture,
             },
         );
+    } else if let Some(cached) = image_textures.get_mut(&element.id) {
+        cached.document_revision = document_revision;
     }
     let Some(texture) = image_textures
         .get(&element.id)
@@ -8358,26 +8881,29 @@ mod tests {
     use crate::editor::Editor;
 
     use super::{
-        CONTROL_CORNER_RADIUS, ColorPickerTarget, CustomFontSizeState, DARK_BORDER, ElementAction,
-        KeyBinding, KeybindAction, Keybinds, LIGHT_BORDER, LIGHT_CANVAS, LIGHT_MUTED, LayerAction,
-        MOSSBYTE_AGENCY_BUTTON_WIDTH, MOSSBYTE_AGENCY_ROW_GAP, MOSSBYTE_AGENCY_URL, PreparedImage,
+        COMPACT_STROKE_PRESET_COUNT, CONTROL_CORNER_RADIUS, ColorPickerTarget, CustomFontSizeState,
+        DARK_BORDER, DARK_PALETTE, ElementAction, INTERMEDIATE_DARK_PALETTE, KeyBinding,
+        KeybindAction, Keybinds, LEGACY_DARK_PALETTE, LEGACY_STROKE_COLORS, LIGHT_BORDER,
+        LIGHT_CANVAS, LIGHT_MUTED, LayerAction, MOSSBYTE_AGENCY_BUTTON_WIDTH,
+        MOSSBYTE_AGENCY_ROW_GAP, MOSSBYTE_AGENCY_URL, PREVIOUS_DARK_PALETTE,
+        PREVIOUS_ORDERED_DARK_PALETTE, PREVIOUS_STROKE_COLORS, PreparedImage,
         SETTINGS_CARD_BORDER_DARK, SETTINGS_CARD_DARK, SETTINGS_CONTROL_DARK,
         SETTINGS_CONTROL_RADIUS, SETTINGS_ROOT_DARK, SETTINGS_ROOT_RADIUS, STROKE_COLORS,
-        WorkspaceUi, apply_text_resize_font_size, char_cursor_to_byte_index,
-        collaboration_avatar_center_x, collaboration_avatar_stack_width,
+        WorkspaceUi, apply_palette_with_default_migration, apply_text_resize_font_size,
+        char_cursor_to_byte_index, collaboration_avatar_center_x, collaboration_avatar_stack_width,
         collaboration_display_name_is_valid, collaboration_participant_avatar_colors,
         collaboration_participant_initial, collaboration_popup_should_dismiss,
         collaboration_primary_button, collaboration_text_field, color_picker_patch,
         confirmation_frame, custom_font_size_selected, delete_previous_word, fill_choice_patch,
-        grid_step_for_zoom, insert_text_at_cursor, key_binding_label,
+        grid_step_for_zoom, insert_text_at_cursor, insert_text_event, key_binding_label,
         mossbyte_agency_credit_layout, next_char_cursor, next_word_cursor, next_z_index,
         padded_selection_bounds, platform_label, preset_font_size_selected, previous_char_cursor,
         previous_word_cursor, reordered_layer_ids, resolve_drop_screen_position,
         rotated_text_origin, selection_drag_position, selection_handle_cursor_tolerance,
         selection_handle_drag_tolerance, settings_group_frame, settings_keybind_card_frame,
         settings_visuals, settings_window_frame, sloppiness_amplitude, sloppy_polyline,
-        text_create_command, text_update_command, to_core_color, zoom_delta_for_scroll,
-        zoom_percent,
+        stroke_preset_count, text_create_command, text_update_command, to_core_color,
+        zoom_delta_for_scroll, zoom_percent,
     };
 
     use crate::selection::SelectionHandle;
@@ -8534,6 +9060,166 @@ mod tests {
         };
         assert!((first - second).abs() < f32::EPSILON);
         assert!(swatch_lefts.next().is_none());
+    }
+
+    #[test]
+    fn stroke_palette_is_limited_to_seven_presets_for_every_tool() {
+        assert_eq!(stroke_preset_count(), 7);
+        assert_eq!(
+            STROKE_COLORS
+                .into_iter()
+                .take(stroke_preset_count())
+                .count(),
+            COMPACT_STROKE_PRESET_COUNT
+        );
+    }
+
+    #[test]
+    fn legacy_default_palette_is_reorganized_without_overwriting_custom_colors() {
+        let legacy = LEGACY_STROKE_COLORS
+            .iter()
+            .map(Color32::to_array)
+            .collect::<Vec<_>>();
+        let mut migrated = STROKE_COLORS;
+
+        apply_palette_with_default_migration(
+            &mut migrated,
+            &legacy,
+            2,
+            &LEGACY_STROKE_COLORS,
+            &PREVIOUS_STROKE_COLORS,
+            None,
+            None,
+            STROKE_COLORS,
+        );
+
+        assert_eq!(migrated, STROKE_COLORS);
+        assert_eq!(migrated[0], Color32::from_rgb(31, 31, 31));
+        assert_eq!(migrated[1], Color32::from_rgb(224, 49, 49));
+        assert_eq!(migrated[11], Color32::from_rgb(82, 82, 91));
+
+        let custom_color = Color32::from_rgb(12, 34, 56);
+        let custom_legacy = std::iter::once(custom_color.to_array())
+            .chain(legacy.into_iter().skip(1))
+            .collect::<Vec<_>>();
+        let mut preserved = STROKE_COLORS;
+        apply_palette_with_default_migration(
+            &mut preserved,
+            &custom_legacy,
+            2,
+            &LEGACY_STROKE_COLORS,
+            &PREVIOUS_STROKE_COLORS,
+            None,
+            None,
+            STROKE_COLORS,
+        );
+
+        assert_eq!(preserved[0], custom_color);
+    }
+
+    #[test]
+    fn previous_default_palette_migrates_to_anchor_first() {
+        let previous = PREVIOUS_STROKE_COLORS
+            .iter()
+            .map(Color32::to_array)
+            .collect::<Vec<_>>();
+        let mut migrated = STROKE_COLORS;
+
+        apply_palette_with_default_migration(
+            &mut migrated,
+            &previous,
+            5,
+            &LEGACY_STROKE_COLORS,
+            &PREVIOUS_STROKE_COLORS,
+            None,
+            None,
+            STROKE_COLORS,
+        );
+
+        assert_eq!(migrated, STROKE_COLORS);
+        assert_eq!(migrated[0], Color32::from_rgb(31, 31, 31));
+        assert_eq!(migrated[1], Color32::from_rgb(224, 49, 49));
+        assert_eq!(migrated[11], Color32::from_rgb(82, 82, 91));
+    }
+
+    #[test]
+    fn partially_customized_previous_palette_keeps_colors_when_reordered() {
+        let mut previous = PREVIOUS_STROKE_COLORS
+            .map(|color| color.to_array())
+            .to_vec();
+        if let Some(slot) = previous.get_mut(1) {
+            *slot = Color32::from_rgb(145, 145, 155).to_array();
+        }
+        if let Some(slot) = previous.get_mut(6) {
+            *slot = Color32::from_rgb(255, 236, 153).to_array();
+        }
+        let mut migrated = STROKE_COLORS;
+
+        apply_palette_with_default_migration(
+            &mut migrated,
+            &previous,
+            5,
+            &LEGACY_STROKE_COLORS,
+            &PREVIOUS_STROKE_COLORS,
+            None,
+            None,
+            STROKE_COLORS,
+        );
+
+        assert_eq!(migrated[0], Color32::from_rgb(31, 31, 31));
+        assert_eq!(migrated[1], Color32::from_rgb(224, 49, 49));
+        assert_eq!(migrated[2], Color32::from_rgb(255, 236, 153));
+        assert_eq!(migrated[11], Color32::from_rgb(145, 145, 155));
+    }
+
+    #[test]
+    fn previously_ordered_dark_palette_migrates_to_white_first() {
+        let previous = PREVIOUS_ORDERED_DARK_PALETTE
+            .iter()
+            .map(Color32::to_array)
+            .collect::<Vec<_>>();
+        let mut migrated = DARK_PALETTE;
+
+        apply_palette_with_default_migration(
+            &mut migrated,
+            &previous,
+            5,
+            &LEGACY_DARK_PALETTE,
+            &PREVIOUS_DARK_PALETTE,
+            Some(&PREVIOUS_ORDERED_DARK_PALETTE),
+            Some(&INTERMEDIATE_DARK_PALETTE),
+            DARK_PALETTE,
+        );
+
+        assert_eq!(migrated, DARK_PALETTE);
+        assert_eq!(migrated[0], Color32::from_rgb(245, 245, 245));
+        assert_eq!(migrated[1], Color32::from_rgb(224, 49, 49));
+        assert_eq!(migrated[11], Color32::from_rgb(82, 82, 91));
+        assert_eq!(migrated[14], Color32::from_rgb(31, 35, 45));
+    }
+
+    #[test]
+    fn intermediate_dark_palette_moves_black_to_the_end() {
+        let previous = INTERMEDIATE_DARK_PALETTE
+            .iter()
+            .map(Color32::to_array)
+            .collect::<Vec<_>>();
+        let mut migrated = DARK_PALETTE;
+
+        apply_palette_with_default_migration(
+            &mut migrated,
+            &previous,
+            6,
+            &LEGACY_DARK_PALETTE,
+            &PREVIOUS_DARK_PALETTE,
+            Some(&PREVIOUS_ORDERED_DARK_PALETTE),
+            Some(&INTERMEDIATE_DARK_PALETTE),
+            DARK_PALETTE,
+        );
+
+        assert_eq!(migrated, DARK_PALETTE);
+        assert_eq!(migrated[11], Color32::from_rgb(82, 82, 91));
+        assert_eq!(migrated[14], Color32::from_rgb(31, 35, 45));
     }
 
     #[test]
@@ -8821,7 +9507,7 @@ mod tests {
         workspace.cancel_settings();
 
         assert!(workspace.restore_session_enabled());
-        assert!(!workspace.settings_open());
+        assert!(!workspace.settings_open);
     }
 
     #[test]
@@ -9197,6 +9883,26 @@ mod tests {
     }
 
     #[test]
+    fn canvas_background_preference_round_trips_without_shared_state() {
+        let workspace = WorkspaceUi {
+            canvas_background: crate::settings::CanvasBackground::Clean,
+            ..WorkspaceUi::default()
+        };
+
+        let snapshot = workspace.settings_snapshot();
+        let restored = WorkspaceUi::from_settings(&snapshot);
+
+        assert_eq!(
+            snapshot.canvas_background,
+            crate::settings::CanvasBackground::Clean
+        );
+        assert_eq!(
+            restored.canvas_background,
+            crate::settings::CanvasBackground::Clean
+        );
+    }
+
+    #[test]
     fn default_element_stroke_remains_two_pixels() {
         assert!((Style::default().stroke_width - 2.0).abs() < f32::EPSILON);
     }
@@ -9319,6 +10025,21 @@ mod tests {
 
         assert_eq!(text, "aX\nYb");
         assert_eq!(cursor, 4);
+    }
+
+    #[test]
+    fn text_editor_paste_preserves_the_character_cursor() {
+        let mut text = String::from("ab");
+        let mut cursor = 1;
+
+        assert!(insert_text_event(
+            &mut text,
+            &mut cursor,
+            &egui::Event::Paste(String::from("pasted")),
+        ));
+
+        assert_eq!(text, "apastedb");
+        assert_eq!(cursor, 7);
     }
 
     #[test]

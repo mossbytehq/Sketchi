@@ -1,6 +1,8 @@
 #![allow(missing_docs)]
 
-use std::{env, error::Error, fs, path::PathBuf};
+use std::{env, error::Error, fs, io::Write, path::PathBuf};
+
+use flate2::{Compression, write::GzEncoder};
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-env-changed=SKETCHI_EMBED_SERVER");
@@ -20,16 +22,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .into());
             }
             println!("cargo:rerun-if-changed={}", server.display());
-            let path = server.to_string_lossy().to_string();
+            let compressed_path = generated.with_extension("server.gz");
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+            encoder.write_all(&fs::read(&server)?)?;
+            let compressed = encoder.finish()?;
+            fs::write(&compressed_path, compressed)?;
+            let path = compressed_path.to_string_lossy().to_string();
             format!(
                 concat!(
                     "#[allow(missing_docs)]\n",
-                    "pub static EMBEDDED_SERVER: &[u8] = include_bytes!({:?});\n"
+                    "pub static EMBEDDED_SERVER_GZIP: &[u8] = include_bytes!({:?});\n"
                 ),
                 path
             )
         }
-        None => "#[allow(missing_docs)]\npub static EMBEDDED_SERVER: &[u8] = &[];\n".to_owned(),
+        None => {
+            "#[allow(missing_docs)]\npub static EMBEDDED_SERVER_GZIP: &[u8] = &[];\n".to_owned()
+        }
     };
 
     fs::write(generated, source)?;

@@ -1,13 +1,14 @@
-# Remix Icon
+# Lucide Icons
 
-`remixicon.ttf` is the Remix Icon font used by Sketchi's native toolbar and
-properties controls.
+Sketchi uses the Lucide icon font supplied by the pinned `lucide-icons` crate
+for its native toolbar and properties controls.
 
-- Project: <https://github.com/Remix-Design/RemixIcon>
-- Website: <https://remixicon.com/>
-- License: <https://github.com/Remix-Design/RemixIcon/blob/master/License>
+- Project: <https://github.com/lucide-icons/lucide>
+- Website: <https://lucide.dev/>
+- License: <https://github.com/lucide-icons/lucide/blob/main/LICENSE>
 
-The application selects only the glyphs it needs from the bundled font.
+The application selects only the glyphs it needs through the semantic icon
+mapping in `src/lucide_icons.rs`.
 
 `Virgil.ttf` is the open-source handwriting font from
 <https://github.com/excalidraw/virgil>, licensed under the SIL Open Font

@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "canvas-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arboard",
  "canvas-core",
@@ -678,9 +678,11 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "flate2",
  "futures-util",
  "glam",
  "image",
+ "lucide-icons",
  "reqwest",
  "rfd",
  "rusqlite",
@@ -702,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "canvas-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "glam",
@@ -715,7 +717,7 @@ dependencies = [
 
 [[package]]
 name = "canvas-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "canvas-core",
  "serde",
@@ -726,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "canvas-renderer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "canvas-core",
  "glam",
@@ -735,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "canvas-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2171,6 +2173,12 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "lucide-icons"
+version = "0.575.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fe5ef57a7e2a313b5d15a2fe306a44acfe290247d5ff46af1780d1250b716fe"
 
 [[package]]
 name = "malloc_buf"
@@ -5225,10 +5233,13 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "semver",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 

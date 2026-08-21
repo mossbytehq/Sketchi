@@ -13,13 +13,15 @@ use std::{
     env,
     fmt::Write as _,
     fs,
-    io::Read,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Parser)]
@@ -35,6 +37,8 @@ enum CommandKind {
     Check,
     /// Check workspace/tag versions and optional built binaries.
     VersionCheck(VersionCheckArgs),
+    /// Set the workspace version and optionally update an existing GitHub release state.
+    SetVersion(SetVersionArgs),
     /// Stage a client package containing the server sidecar.
     Package(StageArgs),
     /// Stage a server-only package.
@@ -58,6 +62,25 @@ struct VersionCheckArgs {
     /// Optional server binary to invoke with --version.
     #[arg(long)]
     server: Option<PathBuf>,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Args)]
+struct SetVersionArgs {
+    /// Modify all packages in the workspace.
+    #[arg(long)]
+    workspace: bool,
+    /// Stable Cargo version to write to the workspace manifest.
+    version: String,
+    /// Mark the existing GitHub release as a draft.
+    #[arg(long = "d", conflicts_with_all = ["release_candidate", "latest"])]
+    draft: bool,
+    /// Mark the existing GitHub release as a pre-release.
+    #[arg(long = "rc", conflicts_with_all = ["draft", "latest"])]
+    release_candidate: bool,
+    /// Mark the existing GitHub release as the latest stable release.
+    #[arg(long = "r", conflicts_with_all = ["draft", "release_candidate"])]
+    latest: bool,
 }
 
 #[derive(Debug, Args)]
@@ -131,6 +154,12 @@ impl PackageKind {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ReadinessSmoke {
+    endpoint: String,
+    certificate_sha256: String,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let root = repository_root()?;
@@ -139,6 +168,7 @@ fn main() -> Result<()> {
             println!("Sketchi workspace checks are provided by Cargo and CI.");
         }
         Some(CommandKind::VersionCheck(args)) => run_version_check(&root, args)?,
+        Some(CommandKind::SetVersion(args)) => run_set_version(&root, &args)?,
         Some(CommandKind::Package(args)) => {
             validate_format(&args.format, &args.target)?;
             let staged = run_stage(&root, &args, PackageKind::Client)?;
@@ -226,6 +256,117 @@ fn run_version_check(root: &Path, args: VersionCheckArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitHubReleaseState {
+    Draft,
+    ReleaseCandidate,
+    Latest,
+}
+
+impl GitHubReleaseState {
+    const fn gh_args(self) -> [&'static str; 3] {
+        match self {
+            Self::Draft => ["--draft=true", "--prerelease=false", "--latest=false"],
+            Self::ReleaseCandidate => ["--draft=false", "--prerelease=true", "--latest=false"],
+            Self::Latest => ["--draft=false", "--prerelease=false", "--latest=true"],
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::ReleaseCandidate => "pre-release",
+            Self::Latest => "latest stable",
+        }
+    }
+}
+
+fn run_set_version(root: &Path, args: &SetVersionArgs) -> Result<()> {
+    if !args.workspace {
+        bail!("set-version currently requires --workspace");
+    }
+    let parsed = semver::Version::parse(&args.version)
+        .with_context(|| format!("invalid semantic version {:?}", args.version))?;
+    if !parsed.pre.is_empty() {
+        bail!("set-version expects a stable Cargo version; use --rc to mark the GitHub release");
+    }
+
+    let release_state = match (args.draft, args.release_candidate, args.latest) {
+        (true, false, false) => Some(GitHubReleaseState::Draft),
+        (false, true, false) => Some(GitHubReleaseState::ReleaseCandidate),
+        (false, false, true) => Some(GitHubReleaseState::Latest),
+        (false, false, false) => None,
+        _ => unreachable!("clap enforces release-state flag conflicts"),
+    };
+    if let Some(state) = release_state {
+        update_github_release_state(&args.version, state)?;
+    }
+    write_workspace_version(root, &args.version)?;
+    println!("workspace version set to {}", args.version);
+    if let Some(state) = release_state {
+        println!("GitHub release v{} set to {}", args.version, state.label());
+    }
+    Ok(())
+}
+
+fn update_github_release_state(version: &str, state: GitHubReleaseState) -> Result<()> {
+    let tag = format!("v{version}");
+    let output = Command::new("gh")
+        .args(["release", "edit", &tag])
+        .args(state.gh_args())
+        .output()
+        .with_context(|| {
+            format!(
+                "run gh to set GitHub release {tag} to {}; install and authenticate GitHub CLI",
+                state.label()
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "could not set GitHub release {tag} to {}: {}",
+            state.label(),
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+fn write_workspace_version(root: &Path, version: &str) -> Result<()> {
+    let path = root.join("Cargo.toml");
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("read workspace manifest at {}", path.display()))?;
+    let had_final_newline = contents.ends_with('\n');
+    let mut in_workspace_package = false;
+    let mut replaced = false;
+    let mut lines = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_workspace_package = trimmed == "[workspace.package]";
+        }
+        if in_workspace_package && trimmed.starts_with("version") {
+            let indentation = &line[..line.len() - line.trim_start().len()];
+            lines.push(format!("{indentation}version = \"{version}\""));
+            replaced = true;
+        } else {
+            lines.push(line.to_owned());
+        }
+    }
+    if !replaced {
+        bail!(
+            "[workspace.package] version is missing from {}",
+            path.display()
+        );
+    }
+    let mut updated = lines.join("\n");
+    if had_final_newline {
+        updated.push('\n');
+    }
+    fs::write(&path, updated).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
 fn run_stage(root: &Path, args: &StageArgs, kind: PackageKind) -> Result<PathBuf> {
     let version = read_workspace_version(root)?;
     let target_dir = path_from_root(root, &args.target_dir);
@@ -261,7 +402,66 @@ fn run_install_smoke(root: &Path, args: &InstallSmokeArgs) -> Result<()> {
             stderr.trim()
         );
     }
+    smoke_test_server(&server)?;
     println!("install smoke passed: {} {version}", path.display());
+    Ok(())
+}
+
+fn smoke_test_server(server: &Path) -> Result<()> {
+    let database = env::temp_dir().join(format!(
+        "sketchi-install-smoke-{}.sqlite3",
+        std::process::id()
+    ));
+    let mut child = Command::new(server)
+        .args(["--ready", "--bind", "127.0.0.1:0", "--database"])
+        .arg(&database)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("start readiness smoke server at {}", server.display()))?;
+
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(&database);
+        bail!("readiness smoke server did not expose stdout");
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout)
+            .read_line(&mut line)
+            .map(|bytes| (bytes, line));
+        let _ = sender.send(result);
+    });
+    let readiness = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .context("timed out waiting for server readiness")
+        .and_then(|result| result.context("could not read server readiness"));
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_file(&database);
+
+    let (bytes, line) = readiness?;
+    if bytes == 0 {
+        bail!("server exited without a readiness line");
+    }
+    let readiness: ReadinessSmoke = serde_json::from_str(&line)
+        .with_context(|| format!("invalid server readiness JSON: {}", line.trim()))?;
+    if !readiness.endpoint.starts_with("wss://") {
+        bail!(
+            "server readiness endpoint is not secure WebSocket: {}",
+            readiness.endpoint
+        );
+    }
+    if readiness.certificate_sha256.len() != 64
+        || !readiness
+            .certificate_sha256
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        bail!("server readiness certificate pin is invalid");
+    }
     Ok(())
 }
 
@@ -861,6 +1061,39 @@ mod tests {
         assert!(validate_tag("0.2.0", "0.1.0").is_err());
 
         fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn workspace_version_writer_changes_only_the_workspace_package_version() {
+        let root = test_directory("set-version");
+        write_file(
+            &root.join("Cargo.toml"),
+            "[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\nmembers = []\n",
+        );
+
+        write_workspace_version(&root, "0.2.0").expect("write workspace version");
+
+        assert_eq!(
+            fs::read_to_string(root.join("Cargo.toml")).expect("read updated manifest"),
+            "[workspace.package]\nversion = \"0.2.0\"\nedition = \"2024\"\n\n[workspace]\nmembers = []\n"
+        );
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn github_release_state_maps_to_explicit_flags() {
+        assert_eq!(
+            GitHubReleaseState::Draft.gh_args(),
+            ["--draft=true", "--prerelease=false", "--latest=false"]
+        );
+        assert_eq!(
+            GitHubReleaseState::ReleaseCandidate.gh_args(),
+            ["--draft=false", "--prerelease=true", "--latest=false"]
+        );
+        assert_eq!(
+            GitHubReleaseState::Latest.gh_args(),
+            ["--draft=false", "--prerelease=false", "--latest=true"]
+        );
     }
 
     #[test]

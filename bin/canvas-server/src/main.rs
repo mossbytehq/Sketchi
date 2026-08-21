@@ -50,6 +50,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Rustls has multiple crypto providers in the dependency graph. Install
+    // the provider explicitly before constructing any TLS configuration.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let args = Args::parse();
     let generated_readiness =
         args.ready && args.certificate.is_none() && args.private_key.is_none();

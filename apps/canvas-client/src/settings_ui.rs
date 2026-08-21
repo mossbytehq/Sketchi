@@ -92,7 +92,7 @@ pub(super) fn settings_visuals(dark_mode: bool) -> egui::Visuals {
 pub(super) fn settings_palette_row(
     ui: &mut egui::Ui,
     label: &str,
-    palette: &[Color32; 7],
+    palette: &[Color32; 15],
     dark_mode: bool,
 ) -> Option<usize> {
     let width = ui.available_width();

@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
@@ -33,6 +34,9 @@ use tokio_rustls::TlsAcceptor;
 use tower::{ServiceExt, service_fn};
 
 use crate::room::{CreatedRoom, RoomError, RoomManager};
+
+const CREATE_REQUEST_CACHE_CAPACITY: usize = 1024;
+const CREATE_REQUEST_RETENTION: Duration = Duration::from_mins(10);
 
 /// Errors returned by the HTTP/WebSocket server.
 #[derive(Debug, Error)]
@@ -77,12 +81,18 @@ struct SessionPeer {
     outbound: Arc<AsyncMutex<()>>,
 }
 
+struct CreateRequestRecord {
+    request_id: u64,
+    created: CreatedRoom,
+    stored_at: Instant,
+}
+
 /// Shared state for HTTP health and WebSocket sessions.
 #[derive(Clone)]
 pub struct ServerState {
     manager: Arc<AsyncMutex<RoomManager>>,
     sessions: Arc<AsyncMutex<BTreeMap<SessionId, SessionPeer>>>,
-    create_requests: Arc<AsyncMutex<BTreeMap<ClientId, (u64, CreatedRoom)>>>,
+    create_requests: Arc<AsyncMutex<BTreeMap<ClientId, CreateRequestRecord>>>,
     server_version: String,
 }
 
@@ -752,15 +762,40 @@ async fn create_room_for_request(
     request_id: u64,
 ) -> Result<CreatedRoom, RoomError> {
     let mut requests = state.create_requests.lock().await;
-    if let Some((stored_request_id, created)) = requests.get(&client_id)
-        && *stored_request_id == request_id
+    let now = Instant::now();
+    prune_create_requests(&mut requests, now);
+    if let Some(record) = requests.get(&client_id)
+        && record.request_id == request_id
     {
-        return Ok(created.clone());
+        return Ok(record.created.clone());
     }
 
     let created = state.manager.lock().await.create_room()?;
-    requests.insert(client_id, (request_id, created.clone()));
+    while requests.len() >= CREATE_REQUEST_CACHE_CAPACITY {
+        let Some(oldest_client) = requests
+            .iter()
+            .min_by_key(|(_, record)| record.stored_at)
+            .map(|(client_id, _)| *client_id)
+        else {
+            break;
+        };
+        requests.remove(&oldest_client);
+    }
+    requests.insert(
+        client_id,
+        CreateRequestRecord {
+            request_id,
+            created: created.clone(),
+            stored_at: now,
+        },
+    );
     Ok(created)
+}
+
+fn prune_create_requests(requests: &mut BTreeMap<ClientId, CreateRequestRecord>, now: Instant) {
+    requests.retain(|_, record| {
+        now.saturating_duration_since(record.stored_at) < CREATE_REQUEST_RETENTION
+    });
 }
 
 async fn peer_client(state: &ServerState, session_id: SessionId) -> Option<ClientId> {
@@ -1106,6 +1141,40 @@ mod tests {
         let first = next_message(&mut receiver).await;
         let second = next_message(&mut second_receiver).await;
         assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn expired_create_request_entries_are_pruned() {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::store::RoomStore::open_in_memory().expect("in-memory store"),
+        ));
+        let state = ServerState::new(RoomManager::new(store));
+        let client_id = ClientId::from_u128(43);
+        let created = state.manager.lock().await.create_room().expect("room");
+        state.create_requests.lock().await.insert(
+            client_id,
+            CreateRequestRecord {
+                request_id: 1,
+                created,
+                stored_at: Instant::now()
+                    .checked_sub(CREATE_REQUEST_RETENTION + Duration::from_secs(1))
+                    .expect("test instant"),
+            },
+        );
+
+        let replacement = create_room_for_request(&state, client_id, 2)
+            .await
+            .expect("replacement room");
+        let requests = state.create_requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests.get(&client_id).map(|record| record.request_id),
+            Some(2)
+        );
+        assert_eq!(
+            requests.get(&client_id).map(|record| &record.created),
+            Some(&replacement)
+        );
     }
 
     #[test]

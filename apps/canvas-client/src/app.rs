@@ -23,13 +23,13 @@ use crate::connection::{
 };
 use crate::editor::Editor;
 use crate::gpu::GpuState;
-use crate::remix_icons;
+use crate::lucide_icons;
 use crate::storage;
 use crate::supervisor::LocalServer;
 use crate::tools::{Tool, ToolController};
 use crate::ui::WorkspaceUi;
 use crate::window_state::WindowState;
-use crate::{settings, window_state};
+use crate::{settings, update, window_state};
 
 /// Application state shared by the winit event loop and renderer.
 pub struct AppState {
@@ -56,6 +56,7 @@ pub struct DesktopShell {
     /// GPU instance used by the eventual surface renderer.
     pub wgpu_instance: wgpu::Instance,
     local_server: Option<LocalServer>,
+    local_server_error: Option<String>,
 }
 
 impl DesktopShell {
@@ -76,19 +77,19 @@ impl DesktopShell {
         let event_loop =
             EventLoop::new().map_err(|error| AppError::EventLoop(error.to_string()))?;
         let egui = egui::Context::default();
-        remix_icons::install(&egui);
-        let local_server = match LocalServer::spawn_default() {
+        lucide_icons::install(&egui);
+        let (local_server, local_server_error) = match LocalServer::spawn_default() {
             Ok(server) => {
                 tracing::info!(
                     process_id = server.id(),
                     endpoint = %server.readiness().endpoint,
                     "local collaboration server ready"
                 );
-                Some(server)
+                (Some(server), None)
             }
             Err(error) => {
                 tracing::warn!(error = %error, "Sketchi local server unavailable");
-                None
+                (None, Some(error.to_string()))
             }
         };
         Ok(Self {
@@ -96,6 +97,7 @@ impl DesktopShell {
             egui,
             wgpu_instance: wgpu::Instance::new(&wgpu::InstanceDescriptor::default()),
             local_server,
+            local_server_error,
         })
     }
 
@@ -106,6 +108,7 @@ impl DesktopShell {
             egui,
             wgpu_instance,
             local_server,
+            local_server_error,
         } = self;
         let saved_window_state = match window_state::load() {
             Ok(state) => state,
@@ -123,6 +126,9 @@ impl DesktopShell {
         };
         let settings_state = saved_settings.clone().unwrap_or_default();
         let mut ui = WorkspaceUi::from_settings(&settings_state);
+        if let Some(update_result) = update::take_update_result() {
+            ui.set_update_message(update_result);
+        }
         let restore_session = saved_window_state
             .as_ref()
             .is_none_or(|state| state.restore_session);
@@ -171,7 +177,7 @@ impl DesktopShell {
             autosave_retry_at: None,
             modifiers: ModifiersState::default(),
             collaboration: None,
-            collaboration_error: None,
+            collaboration_error: local_server_error,
         };
         let result = event_loop.run_app(&mut application);
         if let Err(error) = result {
@@ -316,8 +322,13 @@ impl ApplicationHandler for DesktopApplication {
         if let Some(window) = &self.window
             && let Some(egui_state) = &mut self.egui_state
         {
-            let response = egui_state.on_window_event(window.as_ref(), &event);
-            if should_request_redraw(&event, response.repaint, paste_requested, drop_event) {
+            let egui_repaint = if paste_requested {
+                queue_text_clipboard_paste(egui_state);
+                false
+            } else {
+                egui_state.on_window_event(window.as_ref(), &event).repaint
+            };
+            if should_request_redraw(&event, egui_repaint, paste_requested, drop_event) {
                 window.request_redraw();
             }
         }
@@ -449,6 +460,18 @@ impl ApplicationHandler for DesktopApplication {
                 window.request_redraw();
             }
         }
+        if self.ui.poll_update_install() {
+            if let Some(window) = &self.settings_window {
+                window.request_redraw();
+            }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+        if self.ui.take_update_restart_request() {
+            event_loop.exit();
+            return;
+        }
         self.save_window_state(false);
         self.save_settings(false);
         self.maybe_autosave();
@@ -463,7 +486,9 @@ impl ApplicationHandler for DesktopApplication {
         let next_update_poll = self
             .ui
             .update_checking()
-            .then(|| Instant::now() + Duration::from_millis(100));
+            .then_some(())
+            .or_else(|| self.ui.update_installing().then_some(()))
+            .map(|()| Instant::now() + Duration::from_millis(100));
         let next_collaboration_poll = self
             .collaboration
             .is_some()
@@ -677,11 +702,7 @@ impl DesktopApplication {
             );
             match GpuState::new(window.clone(), &self.wgpu_instance) {
                 Ok(gpu) => {
-                    // The settings renderer is recreated when the window is
-                    // reopened. Reinstalling the fonts invalidates the
-                    // retained egui atlas so the next frame uploads it to
-                    // this new renderer.
-                    remix_icons::install(&self.settings_egui);
+                    lucide_icons::install(&self.settings_egui);
                     tracing::info!(
                         width = window.inner_size().width,
                         height = window.inner_size().height,
@@ -721,10 +742,21 @@ impl DesktopApplication {
         let Some(window) = self.settings_window.clone() else {
             return;
         };
-        let repaint = self
-            .settings_egui_state
-            .as_mut()
-            .is_some_and(|egui_state| egui_state.on_window_event(window.as_ref(), event).repaint);
+        let paste_requested = matches!(
+            event,
+            WindowEvent::KeyboardInput {
+                event: key_event,
+                ..
+            } if is_clipboard_paste(key_event, self.modifiers)
+        );
+        let repaint = self.settings_egui_state.as_mut().is_some_and(|egui_state| {
+            if paste_requested {
+                queue_text_clipboard_paste(egui_state);
+                false
+            } else {
+                egui_state.on_window_event(window.as_ref(), event).repaint
+            }
+        });
         match event {
             WindowEvent::CloseRequested => {
                 tracing::info!("settings window close requested");
@@ -737,9 +769,7 @@ impl DesktopApplication {
                 }
                 window.request_redraw();
             }
-            WindowEvent::ScaleFactorChanged { .. } => {
-                window.request_redraw();
-            }
+            WindowEvent::ScaleFactorChanged { .. } => window.request_redraw(),
             WindowEvent::ThemeChanged(theme) => {
                 self.ui.set_system_dark_mode(*theme == Theme::Dark);
                 if let Some(main_window) = &self.window {
@@ -1049,6 +1079,22 @@ fn is_clipboard_paste(event: &KeyEvent, modifiers: ModifiersState) -> bool {
     is_v && (modifiers.control_key() || modifiers.super_key())
 }
 
+fn queue_text_clipboard_paste(egui_state: &mut egui_winit::State) {
+    let Ok(mut clipboard) = arboard::Clipboard::new() else {
+        return;
+    };
+    let Ok(contents) = clipboard.get_text() else {
+        return;
+    };
+    let contents = contents.replace("\r\n", "\n");
+    if !contents.is_empty() {
+        egui_state
+            .egui_input_mut()
+            .events
+            .push(egui::Event::Paste(contents));
+    }
+}
+
 fn should_request_redraw(
     event: &WindowEvent,
     egui_repaint: bool,
@@ -1063,7 +1109,7 @@ fn should_request_redraw(
 #[cfg(test)]
 mod tests {
     use super::{
-        WindowButtons, normalized_display_name, remix_icons, settings_window_buttons,
+        WindowButtons, lucide_icons, normalized_display_name, settings_window_buttons,
         should_request_redraw,
     };
     use winit::event::WindowEvent;
@@ -1108,7 +1154,7 @@ mod tests {
     #[test]
     fn settings_context_emits_the_first_font_atlas_upload() {
         let context = egui::Context::default();
-        remix_icons::install(&context);
+        lucide_icons::install(&context);
 
         let output = context.run(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
@@ -1130,7 +1176,7 @@ mod tests {
                 .contains(&egui::TextureId::Managed(0))
         );
 
-        remix_icons::install(&context);
+        lucide_icons::install(&context);
         let reopened_output = context.run(egui::RawInput::default(), |context| {
             egui::CentralPanel::default().show(context, |ui| {
                 ui.label("Settings reopened");

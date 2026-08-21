@@ -10,6 +10,11 @@ use canvas_protocol::ServerMessage;
 
 use crate::connection::{ConnectionError, SyncController};
 
+/// Maximum number of compensating edits retained for undo and redo.
+const MAX_UNDO_ENTRIES: usize = 64;
+/// Maximum exact operation payloads retained by the client CRDT.
+const CRDT_OPERATION_RETENTION: usize = 256;
+
 /// Errors raised by local command execution.
 #[derive(Debug, Error)]
 pub enum EditorError {
@@ -46,6 +51,7 @@ struct HistoryEntry {
 pub struct Editor {
     client_id: canvas_core::ClientId,
     next_sequence: u64,
+    revision: u64,
     crdt: CrdtDocument,
     pending: Vec<Operation>,
     undo: Vec<HistoryEntry>,
@@ -59,6 +65,7 @@ impl Editor {
         Self {
             client_id,
             next_sequence: 1,
+            revision: 0,
             crdt: CrdtDocument::new(),
             pending: Vec::new(),
             undo: Vec::new(),
@@ -98,6 +105,10 @@ impl Editor {
         let operation = self.apply_command(command.clone())?;
         if let Some(inverse) = inverse {
             self.undo.push(HistoryEntry { command, inverse });
+            let excess = self.undo.len().saturating_sub(MAX_UNDO_ENTRIES);
+            if excess > 0 {
+                self.undo.drain(..excess);
+            }
             self.redo.clear();
         }
         Ok(operation.id)
@@ -110,7 +121,9 @@ impl Editor {
     /// Returns [`EditorError::Core`] when the shared CRDT rejects the operation.
     pub fn apply_remote(&mut self, operation: &Operation) -> Result<(), EditorError> {
         self.crdt.apply(operation)?;
+        self.crdt.compact_seen_operations(CRDT_OPERATION_RETENTION);
         self.advance_local_sequence(operation);
+        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 
@@ -128,7 +141,9 @@ impl Editor {
         for operation in operations {
             crdt.apply(operation)?;
         }
+        crdt.compact_seen_operations(CRDT_OPERATION_RETENTION);
         self.crdt = crdt;
+        self.revision = self.revision.saturating_add(1);
         for operation in operations {
             self.advance_local_sequence(operation);
         }
@@ -161,7 +176,9 @@ impl Editor {
         for operation in pending_operations {
             crdt.apply(operation)?;
         }
+        crdt.compact_seen_operations(CRDT_OPERATION_RETENTION);
         self.crdt = crdt;
+        self.revision = self.revision.saturating_add(1);
         self.next_sequence = self
             .crdt
             .version_vector()
@@ -234,6 +251,12 @@ impl Editor {
         self.crdt.document_ref()
     }
 
+    /// Returns the monotonically increasing document revision.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Returns queued local operations awaiting acknowledgement.
     #[must_use]
     pub fn pending_operations(&self) -> &[Operation] {
@@ -283,6 +306,8 @@ impl Editor {
         let deps = self.crdt.version_vector().clone();
         let operation = command.into_operation(operation_id, timestamp, deps);
         self.crdt.apply(&operation)?;
+        self.crdt.compact_seen_operations(CRDT_OPERATION_RETENTION);
+        self.revision = self.revision.saturating_add(1);
         self.pending.push(operation.clone());
         Ok(operation)
     }
