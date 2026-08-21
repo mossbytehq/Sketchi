@@ -282,7 +282,27 @@ pub(crate) fn color_swatch(
     selected: bool,
     dark_mode: bool,
 ) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
+    paint_color_swatch(ui, color, selected, dark_mode, Sense::click())
+}
+
+/// A non-interactive color swatch used for settings previews.
+pub(crate) fn color_swatch_preview(
+    ui: &mut Ui,
+    color: Option<Color32>,
+    selected: bool,
+    dark_mode: bool,
+) -> Response {
+    paint_color_swatch(ui, color, selected, dark_mode, Sense::hover())
+}
+
+fn paint_color_swatch(
+    ui: &mut Ui,
+    color: Option<Color32>,
+    selected: bool,
+    dark_mode: bool,
+    sense: Sense,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(26.0), sense);
     let (frame_rect, frame_radius) = swatch_frame_geometry(rect);
     let fill = color.unwrap_or(Color32::TRANSPARENT);
     let transparent = color.is_none() || fill.a() == 0;

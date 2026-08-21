@@ -26,8 +26,8 @@ use self::settings_ui::{settings_palette_row, settings_visuals};
 use crate::{
     components::{
         STANDARD_CONTROL_SIZE, button, color_picker_editor, color_picker_trigger, color_swatch,
-        dropdown_field_sized, numeric_field, numeric_field_with_decimals, range_slider,
-        sized_text_field, themed_checkbox,
+        color_swatch_preview, dropdown_field_sized, numeric_field, numeric_field_with_decimals,
+        range_slider, sized_text_field, themed_checkbox,
     },
     connection::{CollaborationView, format_room_invite},
     editor::Editor,
@@ -2781,15 +2781,6 @@ impl WorkspaceUi {
         }
     }
 
-    fn update_draft_palette_color(&mut self, previous: Color32, next: Color32) {
-        if self.selected.is_empty() && to_color32(self.draft_style.stroke) == previous {
-            let stroke = to_core_color(next);
-            self.draft_style.stroke = stroke;
-            self.new_object_style.stroke = stroke;
-            self.drawing_style_loaded = true;
-        }
-    }
-
     fn canvas_cursor(
         &self,
         document: &Document,
@@ -3918,28 +3909,19 @@ impl WorkspaceUi {
                                     );
                                 });
                                 ui.add_space(8.0);
-                                let light_color = settings_color_row(
+                                settings_color_row(
                                     ui,
                                     "Light background color",
                                     self.light_canvas_color,
                                     self.dark_mode,
                                 );
-                                    if light_color.clicked() {
-                                        self.light_canvas_color = next_settings_color(
-                                            self.light_canvas_color,
-                                        );
-                                    }
                                 ui.add_space(8.0);
-                                let dark_color = settings_color_row(
+                                settings_color_row(
                                     ui,
                                     "Dark background color",
                                     self.dark_canvas_color,
                                     self.dark_mode,
                                 );
-                                    if dark_color.clicked() {
-                                        self.dark_canvas_color =
-                                            next_settings_color(self.dark_canvas_color);
-                                    }
                             });
                             ui.add_space(12.0);
                             settings_group_frame(self.dark_mode).show(ui, |ui| {
@@ -3950,31 +3932,19 @@ impl WorkspaceUi {
                                         .color(text_color(self.dark_mode)),
                                 );
                                 ui.add_space(8.0);
-                                if let Some(index) = settings_palette_row(
+                                settings_palette_row(
                                     ui,
                                     "Light Mode",
                                     &self.light_palette,
                                     self.dark_mode,
-                                ) && let Some(color) = self.light_palette.get(index).copied() {
-                                    let next = next_settings_color(color);
-                                    if let Some(slot) = self.light_palette.get_mut(index) {
-                                        *slot = next;
-                                    }
-                                    self.update_draft_palette_color(color, next);
-                                }
+                                );
                                 ui.add_space(10.0);
-                                if let Some(index) = settings_palette_row(
+                                settings_palette_row(
                                     ui,
                                     "Dark Mode",
                                     &self.dark_palette,
                                     self.dark_mode,
-                                ) && let Some(color) = self.dark_palette.get(index).copied() {
-                                    let next = next_settings_color(color);
-                                    if let Some(slot) = self.dark_palette.get_mut(index) {
-                                        *slot = next;
-                                    }
-                                    self.update_draft_palette_color(color, next);
-                                }
+                                );
                             });
                         }
                         SettingsPage::Keybinds => {
@@ -6054,7 +6024,7 @@ fn settings_color_row(
                 .truncate()
                 .halign(egui::Align::LEFT),
         );
-        color_swatch(ui, Some(color), false, dark_mode)
+        color_swatch_preview(ui, Some(color), false, dark_mode)
     })
     .inner
 }
@@ -6821,36 +6791,6 @@ fn section_label(ui: &mut egui::Ui, label: &str, dark_mode: bool) {
             .color(muted_color(dark_mode)),
     );
     ui.add_space(4.0);
-}
-
-fn next_settings_color(current: Color32) -> Color32 {
-    let colors = [
-        LIGHT_CANVAS,
-        DARK_CANVAS,
-        STROKE_COLORS[0],
-        STROKE_COLORS[1],
-        STROKE_COLORS[2],
-        STROKE_COLORS[3],
-        STROKE_COLORS[4],
-        STROKE_COLORS[5],
-        STROKE_COLORS[6],
-        STROKE_COLORS[7],
-        STROKE_COLORS[8],
-        STROKE_COLORS[9],
-        STROKE_COLORS[10],
-        STROKE_COLORS[11],
-        STROKE_COLORS[12],
-        STROKE_COLORS[13],
-        STROKE_COLORS[14],
-    ];
-    let index = colors
-        .iter()
-        .position(|color| *color == current)
-        .unwrap_or(0);
-    colors
-        .get((index + 1) % colors.len())
-        .copied()
-        .unwrap_or(current)
 }
 
 fn apply_palette(target: &mut [Color32; 15], persisted: &[[u8; 4]]) {

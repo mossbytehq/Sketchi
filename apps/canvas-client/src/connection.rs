@@ -977,6 +977,9 @@ impl CollaborationClient {
         room_id: RoomId,
         state: PresenceState,
     ) -> Result<(), ConnectionError> {
+        if !self.is_synchronized_for_current_connection() {
+            return Ok(());
+        }
         if let Some(message) = self.presence_throttle.offer(room_id, state, Instant::now()) {
             self.send(message)?;
         }
@@ -984,6 +987,9 @@ impl CollaborationClient {
     }
 
     fn flush_presence(&mut self) -> Result<(), ConnectionError> {
+        if !self.is_synchronized_for_current_connection() {
+            return Ok(());
+        }
         if let Some(message) = self.presence_throttle.flush(Instant::now()) {
             self.send(message)?;
         }
@@ -1170,6 +1176,66 @@ mod tests {
                 .is_ok()
         );
         assert!(client.poll().is_ok_and(|messages| messages.is_empty()));
+    }
+
+    #[test]
+    fn presence_is_not_queued_before_current_connection_syncs() {
+        let (channels, mut endpoints) = bounded_channels();
+        let journal = Journal::open_in_memory();
+        assert!(journal.is_ok());
+        let Ok(journal) = journal else {
+            return;
+        };
+        let Ok(presence_throttle) = PresenceThrottle::new(Duration::from_millis(50)) else {
+            return;
+        };
+        let connection_generation = Arc::clone(&channels.connection_generation);
+        let mut client = CollaborationClient {
+            channels,
+            handshake: Arc::new(Mutex::new(Vec::new())),
+            runtime: None,
+            shutdown: ShutdownSignal {
+                sender: watch::channel(false).0,
+            },
+            synchronization: SyncController::new(journal),
+            room_id: Some(RoomId::from_u128(1)),
+            capability_token: Some(String::from("capability-token")),
+            readiness: ReadyMessage {
+                endpoint: String::from("wss://127.0.0.1:3000/ws"),
+                certificate_sha256: "ab".repeat(32),
+            },
+            next_request_id: 1,
+            sent_operations: BTreeSet::new(),
+            status: String::from("Joining"),
+            server_available: true,
+            client_id: canvas_core::ClientId::from_u128(1),
+            display_name: String::from("Test user"),
+            participants: BTreeMap::new(),
+            presence: BTreeMap::new(),
+            presence_throttle,
+            create_request_id: None,
+            connection_generation,
+            welcome_generation: None,
+            sync_generation: None,
+        };
+        let state = PresenceState {
+            client_id: canvas_core::ClientId::from_u128(1),
+            cursor: None,
+            selected_elements: Vec::new(),
+            active_tool: canvas_protocol::ToolKind::Select,
+        };
+
+        for _ in 0..(CHANNEL_CAPACITY * 2) {
+            assert!(
+                client
+                    .offer_presence(RoomId::from_u128(1), state.clone())
+                    .is_ok()
+            );
+        }
+        assert!(matches!(
+            endpoints.outbound.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
