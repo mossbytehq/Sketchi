@@ -1,6 +1,6 @@
 //! Reusable egui controls shared by Sketchi's settings and property panels.
 
-use std::{hash::Hash, ops::RangeInclusive};
+use std::{fmt::Debug, hash::Hash, ops::RangeInclusive};
 
 use egui::epaint::Hsva;
 use egui::{
@@ -545,7 +545,7 @@ fn paint_gradient_strip(ui: &Ui, rect: Rect, segments: usize, color_at: impl Fn(
 #[allow(dead_code)]
 pub(crate) fn dropdown_field(
     ui: &mut Ui,
-    id: impl Hash,
+    id: impl Hash + Debug,
     selected_text: impl Into<WidgetText>,
     add_options: impl FnOnce(&mut Ui),
 ) -> InnerResponse<Option<()>> {
@@ -555,7 +555,7 @@ pub(crate) fn dropdown_field(
 /// A combo-box field with an intentional custom width for wider forms.
 pub(crate) fn dropdown_field_sized(
     ui: &mut Ui,
-    id: impl Hash,
+    id: impl Hash + Debug,
     selected_text: impl Into<WidgetText>,
     width: f32,
     add_options: impl FnOnce(&mut Ui),
@@ -683,7 +683,7 @@ fn themed_checkbox_style(theme: ThemeTokens, checked: bool, _focused: bool) -> T
 pub(crate) fn themed_dropdown_field_sized(
     ui: &mut Ui,
     theme: ThemeTokens,
-    id: impl Hash,
+    id: impl Hash + Debug,
     selected_text: impl Into<WidgetText>,
     width: f32,
     add_options: impl FnOnce(&mut Ui),

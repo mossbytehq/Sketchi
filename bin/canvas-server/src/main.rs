@@ -17,6 +17,7 @@ use canvas_server::{
     websocket::{ServerState, serve_http, serve_tls, serve_tls_with_readiness},
 };
 use clap::Parser;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -125,13 +126,13 @@ fn load_tls_config(
     private_key_path: &PathBuf,
 ) -> Result<(rustls::ServerConfig, String)> {
     let mut certificate_reader = BufReader::new(File::open(certificate_path)?);
-    let certificates = rustls_pemfile::certs(&mut certificate_reader)
+    let certificates = CertificateDer::pem_reader_iter(&mut certificate_reader)
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let certificate = certificates.first().context("certificate missing")?;
     let pin = LoopbackCertificate::pin_for_der(certificate.as_ref());
     let mut key_reader = BufReader::new(File::open(private_key_path)?);
     let private_key =
-        rustls_pemfile::private_key(&mut key_reader)?.context("private key missing")?;
+        PrivateKeyDer::from_pem_reader(&mut key_reader).context("private key missing")?;
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)?;

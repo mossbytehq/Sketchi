@@ -1461,36 +1461,36 @@ impl WorkspaceUi {
     /// Draws the canvas, toolbars, properties, and local editor controls.
     pub(crate) fn show(
         &mut self,
-        context: &egui::Context,
+        ui: &mut egui::Ui,
         editor: &mut Editor,
         tools: &mut ToolController,
         camera: &mut Camera,
         collaboration: &CollaborationView,
     ) -> CollaborationAction {
-        self.preview_worker.set_repaint_context(context);
+        self.preview_worker.set_repaint_context(ui.ctx());
         tools.set_input_settings(self.stabilization, self.pressure_sensitivity);
         if self.appearance == AppearanceMode::System {
             self.dark_mode = self.system_dark_mode.unwrap_or(false);
         }
-        context.set_visuals(sketchi_visuals(self.dark_mode));
+        ui.ctx().set_visuals(sketchi_visuals(self.dark_mode));
 
-        self.handle_keybind_input(context, editor, tools);
-        self.show_canvas(context, editor, tools, camera, &collaboration.presence);
-        self.show_text_editor(context, editor, camera);
-        let collaboration_action = self.show_file_actions(context, editor, collaboration);
-        self.show_tool_palette(context, tools);
-        self.show_history(context, editor);
-        self.show_properties(context, editor);
-        self.show_color_picker(context, editor);
-        self.show_zoom_controls(context, camera);
-        self.show_status(context, editor, camera);
+        self.handle_keybind_input(ui.ctx(), editor, tools);
+        self.show_canvas(ui, editor, tools, camera, &collaboration.presence);
+        self.show_text_editor(ui.ctx(), editor, camera);
+        let collaboration_action = self.show_file_actions(ui.ctx(), editor, collaboration);
+        self.show_tool_palette(ui.ctx(), tools);
+        self.show_history(ui.ctx(), editor);
+        self.show_properties(ui.ctx(), editor);
+        self.show_color_picker(ui.ctx(), editor);
+        self.show_zoom_controls(ui.ctx(), camera);
+        self.show_status(ui.ctx(), editor, camera);
         collaboration_action
     }
 
     #[allow(clippy::too_many_lines)]
     fn show_canvas(
         &mut self,
-        context: &egui::Context,
+        ui: &mut egui::Ui,
         editor: &mut Editor,
         tools: &mut ToolController,
         camera: &mut Camera,
@@ -1503,7 +1503,7 @@ impl WorkspaceUi {
         };
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(canvas_color))
-            .show(context, |ui| {
+            .show(ui, |ui| {
                 let canvas_rect = ui.max_rect();
                 camera.set_viewport(Size::new(canvas_rect.width(), canvas_rect.height()));
                 let response = ui.interact(
@@ -1514,10 +1514,10 @@ impl WorkspaceUi {
                 let navigation_handled =
                     self.handle_canvas_navigation(ui, &response, tools, camera, canvas_rect);
                 let dragging = response.dragged() || ui.input(|input| input.pointer.middle_down());
-                self.sync_egui_drop_input(context);
-                self.handle_dropped_images(context, editor, camera, canvas_rect);
-                self.handle_clipboard_image(context, editor, camera, canvas_rect);
-                self.prepare_drop_preview(context);
+                self.sync_egui_drop_input(ui.ctx());
+                self.handle_dropped_images(ui.ctx(), editor, camera, canvas_rect);
+                self.handle_clipboard_image(ui.ctx(), editor, camera, canvas_rect);
+                self.prepare_drop_preview(ui.ctx());
                 if !navigation_handled {
                     self.handle_canvas_input(ui, &response, editor, tools, camera);
                 }
@@ -1571,7 +1571,7 @@ impl WorkspaceUi {
                     &mut self.image_textures,
                     editor.revision(),
                 );
-                self.paint_drop_preview(context, &painter, *camera, canvas_rect);
+                self.paint_drop_preview(ui.ctx(), &painter, *camera, canvas_rect);
                 if let Some(text_edit) = self.text_edit.as_ref() {
                     paint_text_edit_preview(&painter, text_edit, *camera);
                 }
@@ -1994,7 +1994,7 @@ impl WorkspaceUi {
         if std::mem::take(&mut self.clipboard_paste_requested).is_none() {
             return;
         }
-        if self.text_edit.is_some() || context.wants_keyboard_input() {
+        if self.text_edit.is_some() || context.egui_wants_keyboard_input() {
             return;
         }
         if !self.element_clipboard.is_empty() {
@@ -2980,7 +2980,7 @@ impl WorkspaceUi {
             return;
         }
 
-        if self.settings_open || context.wants_keyboard_input() {
+        if self.settings_open || context.egui_wants_keyboard_input() {
             return;
         }
 
@@ -3676,7 +3676,7 @@ impl WorkspaceUi {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn show_settings_window(
         &mut self,
-        context: &egui::Context,
+        ui: &mut egui::Ui,
         editor: &mut Editor,
         tools: &mut ToolController,
     ) {
@@ -3685,7 +3685,7 @@ impl WorkspaceUi {
         }
 
         if self.poll_update_check() {
-            context.request_repaint();
+            ui.ctx().request_repaint();
         }
 
         if self.appearance == AppearanceMode::System {
@@ -3696,7 +3696,7 @@ impl WorkspaceUi {
             self.update_checked_in_session = true;
             if update::is_check_due(self.update_cache.checked_at_epoch) {
                 self.start_update_check();
-                context.request_repaint();
+                ui.ctx().request_repaint();
             }
         }
         let pages = [
@@ -3705,8 +3705,8 @@ impl WorkspaceUi {
             (SettingsPage::Input, "Input", Icon::InputMethod),
             (SettingsPage::About, "About", Icon::Information),
         ];
-        context.set_visuals(settings_visuals(self.dark_mode));
-        self.handle_keybind_input(context, editor, tools);
+        ui.ctx().set_visuals(settings_visuals(self.dark_mode));
+        self.handle_keybind_input(ui.ctx(), editor, tools);
         let root_stroke = Stroke::new(
             1.0_f32,
             if self.dark_mode {
@@ -3723,7 +3723,7 @@ impl WorkspaceUi {
         };
         egui::CentralPanel::default()
             .frame(settings_window_frame(self.dark_mode).stroke(Stroke::NONE))
-            .show(context, |ui| {
+            .show(ui, |ui| {
                 let root_rect = ui.max_rect();
                 let settings_body_width = ui.available_width();
                 let settings_body_height = ui.available_height();
@@ -4142,7 +4142,7 @@ impl WorkspaceUi {
                                 "Release"
                             };
                             settings_group_frame(self.dark_mode).show(ui, |ui| {
-                                show_mossbyte_agency_credit(ui, context, self.dark_mode);
+                                    show_mossbyte_agency_credit(ui, self.dark_mode);
                             });
                             ui.add_space(12.0);
                             settings_group_frame(self.dark_mode).show(ui, |ui| {
@@ -4450,7 +4450,7 @@ impl WorkspaceUi {
                 );
                     });
 
-        context.set_visuals(sketchi_visuals(self.dark_mode));
+        ui.ctx().set_visuals(sketchi_visuals(self.dark_mode));
         self.settings_page = selected_page;
     }
 
@@ -4469,7 +4469,7 @@ impl WorkspaceUi {
                     input.pointer.button_pressed(PointerButton::Middle),
                     input.pointer.button_released(PointerButton::Middle),
                     input.pointer.delta(),
-                    input.raw_scroll_delta,
+                    input.smooth_scroll_delta,
                     input.pointer.hover_pos(),
                 )
             });
@@ -5768,7 +5768,7 @@ fn settings_group_frame(dark_mode: bool) -> egui::Frame {
         .inner_margin(Margin::same(8))
 }
 
-fn show_mossbyte_agency_credit(ui: &mut egui::Ui, context: &egui::Context, dark_mode: bool) {
+fn show_mossbyte_agency_credit(ui: &mut egui::Ui, dark_mode: bool) {
     let available_width = ui.available_width();
     ui.set_width(available_width);
     let (horizontal, copy_width, button_width) = mossbyte_agency_credit_layout(available_width);
@@ -5777,7 +5777,8 @@ fn show_mossbyte_agency_credit(ui: &mut egui::Ui, context: &egui::Context, dark_
             mossbyte_agency_credit_copy(ui, dark_mode);
             ui.add_space(12.0);
             if mossbyte_agency_visit_button(ui, dark_mode, button_width).clicked() {
-                context.open_url(egui::OpenUrl::new_tab(MOSSBYTE_AGENCY_URL));
+                ui.ctx()
+                    .open_url(egui::OpenUrl::new_tab(MOSSBYTE_AGENCY_URL));
             }
         });
         return;
@@ -5795,7 +5796,8 @@ fn show_mossbyte_agency_credit(ui: &mut egui::Ui, context: &egui::Context, dark_
                 |ui| mossbyte_agency_credit_copy(ui, dark_mode),
             );
             if visit_clicked {
-                context.open_url(egui::OpenUrl::new_tab(MOSSBYTE_AGENCY_URL));
+                ui.ctx()
+                    .open_url(egui::OpenUrl::new_tab(MOSSBYTE_AGENCY_URL));
             }
         },
     );
@@ -5962,7 +5964,7 @@ fn settings_stacked_field(ui: &mut egui::Ui, label: &str, add_control: impl FnOn
 
 fn settings_dropdown_field(
     ui: &mut egui::Ui,
-    id: impl std::hash::Hash,
+    id: impl std::hash::Hash + std::fmt::Debug,
     selected_text: &str,
     add_options: impl FnOnce(&mut egui::Ui),
 ) {

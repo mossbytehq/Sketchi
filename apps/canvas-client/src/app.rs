@@ -95,7 +95,9 @@ impl DesktopShell {
         Ok(Self {
             event_loop,
             egui,
-            wgpu_instance: wgpu::Instance::new(&wgpu::InstanceDescriptor::default()),
+            wgpu_instance: wgpu::Instance::new(
+                wgpu::InstanceDescriptor::new_without_display_handle(),
+            ),
             local_server,
             local_server_error,
         })
@@ -374,10 +376,10 @@ impl ApplicationHandler for DesktopApplication {
                 };
                 let raw_input = egui_state.take_egui_input(window.as_ref());
                 let context = self.egui.clone();
-                let full_output = context.run(raw_input, |context| {
+                let full_output = context.run_ui(raw_input, |ui| {
                     let collaboration = self.collaboration_view();
                     let action = self.ui.show(
-                        context,
+                        ui,
                         &mut self.editor,
                         &mut self.tools,
                         &mut self.camera,
@@ -389,7 +391,7 @@ impl ApplicationHandler for DesktopApplication {
                     {
                         let presence =
                             self.ui
-                                .local_presence(context, self.camera, self.editor.client_id());
+                                .local_presence(ui.ctx(), self.camera, self.editor.client_id());
                         if let Err(error) = collaboration.offer_presence(room_id, presence) {
                             self.collaboration_error = Some(error.to_string());
                         }
@@ -426,19 +428,17 @@ impl ApplicationHandler for DesktopApplication {
                             tracing::info!("first GPU frame presented");
                         }
                     }
-                    Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                    Err(
+                        crate::gpu::GpuSurfaceError::Lost | crate::gpu::GpuSurfaceError::Outdated,
+                    ) => {
                         tracing::warn!("GPU surface lost or outdated; reconfiguring");
                         gpu.reconfigure();
                         window.request_redraw();
                     }
-                    Err(wgpu::SurfaceError::Timeout) => {
+                    Err(crate::gpu::GpuSurfaceError::Timeout) => {
                         tracing::warn!("GPU surface frame timed out");
                     }
-                    Err(wgpu::SurfaceError::OutOfMemory) => {
-                        tracing::error!("GPU surface is out of memory");
-                        event_loop.exit();
-                    }
-                    Err(wgpu::SurfaceError::Other) => {
+                    Err(crate::gpu::GpuSurfaceError::Other) => {
                         tracing::error!("GPU surface returned an unspecified error");
                     }
                 }
@@ -788,7 +788,7 @@ impl DesktopApplication {
         }
     }
 
-    fn render_settings_window(&mut self, event_loop: &ActiveEventLoop) {
+    fn render_settings_window(&mut self, _event_loop: &ActiveEventLoop) {
         let Some(window) = self.settings_window.clone() else {
             return;
         };
@@ -800,9 +800,9 @@ impl DesktopApplication {
             egui_state.take_egui_input(window.as_ref())
         };
         let context = self.settings_egui.clone();
-        let full_output = context.run(raw_input, |context| {
+        let full_output = context.run_ui(raw_input, |ui| {
             self.ui
-                .show_settings_window(context, &mut self.editor, &mut self.tools);
+                .show_settings_window(ui, &mut self.editor, &mut self.tools);
         });
         self.sync_settings_preferences();
         if let Some(egui_state) = &mut self.settings_egui_state {
@@ -823,19 +823,15 @@ impl DesktopApplication {
                     tracing::info!("first settings GPU frame presented");
                 }
             }
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            Err(crate::gpu::GpuSurfaceError::Lost | crate::gpu::GpuSurfaceError::Outdated) => {
                 tracing::warn!("settings GPU surface lost or outdated; reconfiguring");
                 gpu.reconfigure();
                 window.request_redraw();
             }
-            Err(wgpu::SurfaceError::Timeout) => {
+            Err(crate::gpu::GpuSurfaceError::Timeout) => {
                 tracing::warn!("settings GPU surface frame timed out");
             }
-            Err(wgpu::SurfaceError::OutOfMemory) => {
-                tracing::error!("settings GPU surface is out of memory");
-                event_loop.exit();
-            }
-            Err(wgpu::SurfaceError::Other) => {
+            Err(crate::gpu::GpuSurfaceError::Other) => {
                 tracing::error!("settings GPU surface returned an unspecified error");
             }
         }
@@ -1156,8 +1152,8 @@ mod tests {
         let context = egui::Context::default();
         lucide_icons::install(&context);
 
-        let output = context.run(egui::RawInput::default(), |context| {
-            egui::CentralPanel::default().show(context, |ui| {
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.label("Settings");
             });
         });
@@ -1177,8 +1173,8 @@ mod tests {
         );
 
         lucide_icons::install(&context);
-        let reopened_output = context.run(egui::RawInput::default(), |context| {
-            egui::CentralPanel::default().show(context, |ui| {
+        let reopened_output = context.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.label("Settings reopened");
             });
         });

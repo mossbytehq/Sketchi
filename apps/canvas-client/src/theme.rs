@@ -322,7 +322,7 @@ mod tests {
 
         theme.apply_to_context(&context);
 
-        let visuals = context.style().visuals.clone();
+        let visuals = context.global_style().visuals.clone();
         assert!(!visuals.dark_mode);
         for widget in [
             visuals.widgets.noninteractive,

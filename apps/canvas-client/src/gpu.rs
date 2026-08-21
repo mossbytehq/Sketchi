@@ -23,6 +23,19 @@ pub(crate) enum GpuError {
     Runtime(#[from] std::io::Error),
 }
 
+/// Surface acquisition outcomes returned by the current wgpu frame API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GpuSurfaceError {
+    /// The surface must be configured again before the next frame.
+    Outdated,
+    /// The surface was lost and needs to be configured again.
+    Lost,
+    /// The frame acquisition timed out.
+    Timeout,
+    /// The frame could not be acquired for another reason.
+    Other,
+}
+
 /// The wgpu presentation state owned by the native client shell.
 pub(crate) struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -139,8 +152,17 @@ impl GpuState {
         context: &egui::Context,
         full_output: egui::FullOutput,
         clear_color: wgpu::Color,
-    ) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
+    ) -> Result<(), GpuSurfaceError> {
+        let output = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(output)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
+            wgpu::CurrentSurfaceTexture::Timeout => return Err(GpuSurfaceError::Timeout),
+            wgpu::CurrentSurfaceTexture::Outdated => return Err(GpuSurfaceError::Outdated),
+            wgpu::CurrentSurfaceTexture::Lost => return Err(GpuSurfaceError::Lost),
+            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(GpuSurfaceError::Other);
+            }
+        };
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -199,6 +221,7 @@ impl GpuState {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             self.egui_renderer.render(
                 &mut render_pass.forget_lifetime(),
