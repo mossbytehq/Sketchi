@@ -599,8 +599,8 @@ try {
     fs::write(&result_path, "pending\n")?;
     let mut command = windows_powershell_command(&script_path);
     command
-        .arg(&destination)
-        .arg(&executable)
+        .arg(destination)
+        .arg(executable)
         .arg(std::process::id().to_string())
         .arg(&result_path);
     spawn_windows_update_command(command, &result_path)
