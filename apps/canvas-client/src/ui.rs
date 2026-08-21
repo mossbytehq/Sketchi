@@ -84,6 +84,8 @@ const SETTINGS_DIVIDER_LIGHT: Color32 = Color32::from_rgb(225, 227, 232);
 const COLLABORATION_AVATAR_SIZE: f32 = 22.0;
 const COLLABORATION_AVATAR_OVERLAP: f32 = 7.0;
 const COLLABORATION_MAX_PARTICIPANTS: usize = 4;
+const COLLABORATION_COPY_BUTTON_WIDTH: f32 = 40.0;
+const COLLABORATION_CONTROL_GAP: f32 = 8.0;
 const COLLABORATION_AVATAR_COLORS: [Color32; 8] = [
     Color32::from_rgb(91, 87, 214),
     Color32::from_rgb(205, 78, 96),
@@ -3463,6 +3465,7 @@ impl WorkspaceUi {
         };
         let has_custom_endpoint = !self.collaboration_endpoint.trim().is_empty()
             || !self.collaboration_certificate_sha256.trim().is_empty();
+        let mut copy_invite_clicked = false;
         let popup_response = egui::Area::new(Id::new("sketchi.collaboration_popup"))
             .anchor(Align2::RIGHT_TOP, egui::vec2(-16.0, 76.0))
             .order(egui::Order::Foreground)
@@ -3516,20 +3519,38 @@ impl WorkspaceUi {
                                         },
                                     );
                                     ui.horizontal(|ui| {
-                                        ui.add_sized(
-                                            Vec2::new(226.0, STANDARD_CONTROL_SIZE.y),
-                                            egui::TextEdit::singleline(&mut invite)
-                                                .interactive(false)
-                                                .margin(Margin::symmetric(8, 0)),
-                                        );
-                                        if collaboration_secondary_button(
+                                        ui.spacing_mut().item_spacing.x = COLLABORATION_CONTROL_GAP;
+                                        let field_width =
+                                            collaboration_invite_field_width(ui.available_width());
+                                        collaboration_invite_field(
                                             ui,
-                                            "Copy",
+                                            &mut invite,
+                                            field_width,
+                                            self.dark_mode,
+                                        );
+                                        let copy_response = collaboration_secondary_icon_button(
+                                            ui,
+                                            Icon::Clipboard,
                                             self.dark_mode,
                                         )
-                                        .clicked()
-                                        {
-                                            context.copy_text(invite);
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .on_hover_text("Copy invite");
+                                        if copy_response.clicked_by(PointerButton::Primary) {
+                                            copy_invite_clicked = true;
+                                            match arboard::Clipboard::new().and_then(
+                                                |mut clipboard| clipboard.set_text(&invite),
+                                            ) {
+                                                Ok(()) => {
+                                                    self.status = String::from("Invite copied");
+                                                }
+                                                Err(error) => {
+                                                    tracing::debug!(
+                                                        error = %error,
+                                                        "native clipboard unavailable for invite"
+                                                    );
+                                                    context.copy_text(invite);
+                                                }
+                                            }
                                         }
                                     });
                                     if let Some(endpoint) = &endpoint {
@@ -3654,7 +3675,7 @@ impl WorkspaceUi {
                 popup_rect,
             )
         });
-        if outside_click {
+        if outside_click && !copy_invite_clicked {
             self.collaboration_popup = None;
         }
         action
@@ -3774,6 +3795,9 @@ impl WorkspaceUi {
                                         .id_salt(("sketchi.settings.content", selected_page))
                                         .max_height(page_content_height)
                                         .auto_shrink([false, false])
+                                        .scroll_bar_visibility(
+                                            settings_scroll_bar_visibility(),
+                                        )
                                         .show(ui, |ui| {
                                             ui.set_width(page_width);
                                             match selected_page {
@@ -5768,6 +5792,10 @@ fn settings_group_frame(dark_mode: bool) -> egui::Frame {
         .inner_margin(Margin::same(8))
 }
 
+fn settings_scroll_bar_visibility() -> egui::containers::scroll_area::ScrollBarVisibility {
+    egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden
+}
+
 fn show_mossbyte_agency_credit(ui: &mut egui::Ui, dark_mode: bool) {
     let available_width = ui.available_width();
     ui.set_width(available_width);
@@ -6375,6 +6403,43 @@ fn collaboration_display_name_is_valid(name: &str) -> bool {
     !name.trim().is_empty()
 }
 
+fn collaboration_invite_field_width(available_width: f32) -> f32 {
+    (available_width - COLLABORATION_CONTROL_GAP - COLLABORATION_COPY_BUTTON_WIDTH).max(0.0)
+}
+
+fn collaboration_invite_field(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    width: f32,
+    dark_mode: bool,
+) -> egui::Response {
+    let fill = if dark_mode {
+        SETTINGS_CONTROL_DARK
+    } else {
+        Color32::from_rgb(248, 249, 251)
+    };
+    let border = if dark_mode {
+        SETTINGS_CARD_BORDER_DARK
+    } else {
+        SETTINGS_CARD_BORDER_LIGHT
+    };
+    ui.scope(|ui| {
+        let visuals = ui.visuals_mut();
+        visuals.text_edit_bg_color = Some(fill);
+        visuals.widgets.noninteractive.bg_fill = fill;
+        visuals.widgets.noninteractive.weak_bg_fill = fill;
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, border);
+        ui.add_sized(
+            Vec2::new(width, STANDARD_CONTROL_SIZE.y),
+            egui::TextEdit::singleline(value)
+                .interactive(false)
+                .margin(Margin::symmetric(8, 0))
+                .vertical_align(egui::Align::Center),
+        )
+    })
+    .inner
+}
+
 fn collaboration_text_field(
     ui: &mut egui::Ui,
     value: &mut String,
@@ -6435,9 +6500,9 @@ fn collaboration_primary_button(ui: &mut egui::Ui, label: &str) -> egui::Respons
     .inner
 }
 
-fn collaboration_secondary_button(
+fn collaboration_secondary_icon_button(
     ui: &mut egui::Ui,
-    label: &str,
+    icon: Icon,
     dark_mode: bool,
 ) -> egui::Response {
     let fill = if dark_mode {
@@ -6450,9 +6515,13 @@ fn collaboration_secondary_button(
     } else {
         SETTINGS_CARD_BORDER_LIGHT
     };
+    let icon_text = egui::RichText::new(icon.glyph().to_string()).font(FontId::new(
+        16.0,
+        egui::FontFamily::Name(lucide_icons::FONT_FAMILY.into()),
+    ));
     ui.add_sized(
-        Vec2::new(64.0, STANDARD_CONTROL_SIZE.y),
-        egui::Button::new(label)
+        Vec2::new(40.0, STANDARD_CONTROL_SIZE.y),
+        egui::Button::new(icon_text)
             .fill(fill)
             .stroke(Stroke::new(1.0_f32, border))
             .corner_radius(CornerRadius::same(SETTINGS_CONTROL_RADIUS)),
@@ -8883,29 +8952,30 @@ mod tests {
     use crate::editor::Editor;
 
     use super::{
-        COMPACT_STROKE_PRESET_COUNT, CONTROL_CORNER_RADIUS, ColorPickerTarget, CustomFontSizeState,
-        DARK_BORDER, DARK_PALETTE, ElementAction, INTERMEDIATE_DARK_PALETTE, KeyBinding,
-        KeybindAction, Keybinds, LEGACY_DARK_PALETTE, LEGACY_STROKE_COLORS, LIGHT_BORDER,
-        LIGHT_CANVAS, LIGHT_MUTED, LayerAction, MOSSBYTE_AGENCY_BUTTON_WIDTH,
-        MOSSBYTE_AGENCY_ROW_GAP, MOSSBYTE_AGENCY_URL, PREVIOUS_DARK_PALETTE,
-        PREVIOUS_ORDERED_DARK_PALETTE, PREVIOUS_STROKE_COLORS, PreparedImage,
-        SETTINGS_CARD_BORDER_DARK, SETTINGS_CARD_DARK, SETTINGS_CONTROL_DARK,
+        COLLABORATION_CONTROL_GAP, COLLABORATION_COPY_BUTTON_WIDTH, COMPACT_STROKE_PRESET_COUNT,
+        CONTROL_CORNER_RADIUS, ColorPickerTarget, CustomFontSizeState, DARK_BORDER, DARK_PALETTE,
+        ElementAction, INTERMEDIATE_DARK_PALETTE, KeyBinding, KeybindAction, Keybinds,
+        LEGACY_DARK_PALETTE, LEGACY_STROKE_COLORS, LIGHT_BORDER, LIGHT_CANVAS, LIGHT_MUTED,
+        LayerAction, MOSSBYTE_AGENCY_BUTTON_WIDTH, MOSSBYTE_AGENCY_ROW_GAP, MOSSBYTE_AGENCY_URL,
+        PREVIOUS_DARK_PALETTE, PREVIOUS_ORDERED_DARK_PALETTE, PREVIOUS_STROKE_COLORS,
+        PreparedImage, SETTINGS_CARD_BORDER_DARK, SETTINGS_CARD_DARK, SETTINGS_CONTROL_DARK,
         SETTINGS_CONTROL_RADIUS, SETTINGS_ROOT_DARK, SETTINGS_ROOT_RADIUS, STROKE_COLORS,
         WorkspaceUi, apply_palette_with_default_migration, apply_text_resize_font_size,
         char_cursor_to_byte_index, collaboration_avatar_center_x, collaboration_avatar_stack_width,
-        collaboration_display_name_is_valid, collaboration_participant_avatar_colors,
-        collaboration_participant_initial, collaboration_popup_should_dismiss,
-        collaboration_primary_button, collaboration_text_field, color_picker_patch,
-        confirmation_frame, custom_font_size_selected, delete_previous_word, fill_choice_patch,
-        grid_step_for_zoom, insert_text_at_cursor, insert_text_event, key_binding_label,
-        mossbyte_agency_credit_layout, next_char_cursor, next_word_cursor, next_z_index,
-        padded_selection_bounds, platform_label, preset_font_size_selected, previous_char_cursor,
-        previous_word_cursor, reordered_layer_ids, resolve_drop_screen_position,
-        rotated_text_origin, selection_drag_position, selection_handle_cursor_tolerance,
-        selection_handle_drag_tolerance, settings_group_frame, settings_keybind_card_frame,
-        settings_visuals, settings_window_frame, sloppiness_amplitude, sloppy_polyline,
-        stroke_preset_count, text_create_command, text_update_command, to_core_color,
-        zoom_delta_for_scroll, zoom_percent,
+        collaboration_display_name_is_valid, collaboration_invite_field_width,
+        collaboration_participant_avatar_colors, collaboration_participant_initial,
+        collaboration_popup_should_dismiss, collaboration_primary_button, collaboration_text_field,
+        color_picker_patch, confirmation_frame, custom_font_size_selected, delete_previous_word,
+        fill_choice_patch, grid_step_for_zoom, insert_text_at_cursor, insert_text_event,
+        key_binding_label, mossbyte_agency_credit_layout, next_char_cursor, next_word_cursor,
+        next_z_index, padded_selection_bounds, platform_label, preset_font_size_selected,
+        previous_char_cursor, previous_word_cursor, reordered_layer_ids,
+        resolve_drop_screen_position, rotated_text_origin, selection_drag_position,
+        selection_handle_cursor_tolerance, selection_handle_drag_tolerance, settings_group_frame,
+        settings_keybind_card_frame, settings_scroll_bar_visibility, settings_visuals,
+        settings_window_frame, sloppiness_amplitude, sloppy_polyline, stroke_preset_count,
+        text_create_command, text_update_command, to_core_color, zoom_delta_for_scroll,
+        zoom_percent,
     };
 
     use crate::selection::SelectionHandle;
@@ -9252,6 +9322,19 @@ mod tests {
     }
 
     #[test]
+    fn collaboration_invite_field_fills_remaining_popup_width() {
+        let field_width = collaboration_invite_field_width(280.0);
+
+        assert!((field_width - 232.0).abs() < f32::EPSILON);
+        assert!(
+            (field_width + COLLABORATION_CONTROL_GAP + COLLABORATION_COPY_BUTTON_WIDTH - 280.0)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!(collaboration_invite_field_width(40.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn mossbyte_agency_credit_uses_the_configured_https_url() {
         assert_eq!(MOSSBYTE_AGENCY_URL, "https://mossbyteagency.com/");
     }
@@ -9398,6 +9481,14 @@ mod tests {
         assert_eq!(
             settings_window_frame(true).stroke,
             Stroke::new(1.0_f32, DARK_BORDER)
+        );
+    }
+
+    #[test]
+    fn settings_scrollbar_is_hidden() {
+        assert_eq!(
+            settings_scroll_bar_visibility(),
+            egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden
         );
     }
 

@@ -46,6 +46,7 @@ pub(crate) enum LucideIcon {
     LayerSendBackward,
     LayerSendToBack,
     Duplicate,
+    Clipboard,
     Delete,
     Link,
     AlignItemBottom,
@@ -103,13 +104,14 @@ impl LucideIcon {
             Self::ZoomIn => Icon::ZoomIn,
             Self::FillNone => Icon::CircleOff,
             Self::FillSolid => Icon::PaintBucket,
-            Self::LayerBringForward => Icon::Layers2,
-            Self::LayerBringToFront => Icon::BringToFront,
-            Self::LayerSendBackward => Icon::Layers,
-            Self::LayerSendToBack => Icon::SendToBack,
+            Self::LayerBringForward => Icon::LayerArrowUp,
+            Self::LayerBringToFront => Icon::LayersArrowUp,
+            Self::LayerSendBackward => Icon::LayerArrowDown,
+            Self::LayerSendToBack => Icon::LayersArrowDown,
             Self::Duplicate => Icon::Copy,
+            Self::Clipboard => Icon::Clipboard,
             Self::Delete => Icon::Trash2,
-            Self::Link => Icon::Link2,
+            Self::Link => Icon::Link,
             Self::AlignItemBottom => Icon::AlignEndVertical,
             Self::AlignItemHorizontalCenter => Icon::AlignCenterHorizontal,
             Self::AlignItemLeft => Icon::AlignStartHorizontal,
@@ -203,6 +205,32 @@ mod tests {
     fn collaboration_icons_use_lucide_glyphs() {
         assert_eq!(LucideIcon::Router.glyph(), Icon::Network.unicode());
         assert_eq!(LucideIcon::Connector.glyph(), Icon::Waypoints.unicode());
+    }
+
+    #[test]
+    fn clipboard_action_uses_the_clipboard_glyph() {
+        assert_eq!(LucideIcon::Clipboard.glyph(), Icon::Clipboard.unicode());
+    }
+
+    #[test]
+    fn layer_and_link_actions_use_directional_glyphs() {
+        assert_eq!(
+            LucideIcon::LayerSendToBack.glyph(),
+            Icon::LayersArrowDown.unicode()
+        );
+        assert_eq!(
+            LucideIcon::LayerSendBackward.glyph(),
+            Icon::LayerArrowDown.unicode()
+        );
+        assert_eq!(
+            LucideIcon::LayerBringForward.glyph(),
+            Icon::LayerArrowUp.unicode()
+        );
+        assert_eq!(
+            LucideIcon::LayerBringToFront.glyph(),
+            Icon::LayersArrowUp.unicode()
+        );
+        assert_eq!(LucideIcon::Link.glyph(), Icon::Link.unicode());
     }
 
     #[test]
