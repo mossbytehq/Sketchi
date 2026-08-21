@@ -445,6 +445,7 @@ fn is_supported_asset_name(name: &str) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
 fn has_extension(name: &str, extension: &str) -> bool {
     Path::new(name)
         .extension()
