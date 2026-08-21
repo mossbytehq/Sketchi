@@ -425,10 +425,14 @@ impl Drop for LocalServer {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::process::Command;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
-    use super::{command_output_with_timeout, output_matches_client_version};
+    #[cfg(unix)]
+    use super::command_output_with_timeout;
+    use super::output_matches_client_version;
 
     #[test]
     fn sidecar_version_must_match_the_client() {

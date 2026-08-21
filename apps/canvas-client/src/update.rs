@@ -4,9 +4,15 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::Path,
-    process::{Command, Stdio},
+    process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 use directories::ProjectDirs;
 use reqwest::{
@@ -315,6 +321,7 @@ fn update_result_path() -> Result<std::path::PathBuf, UpdateError> {
     Ok(directories.data_dir().join(UPDATE_RESULT_FILENAME))
 }
 
+#[cfg(target_os = "linux")]
 fn mark_update_pending() -> Result<std::path::PathBuf, UpdateError> {
     let path = update_result_path()?;
     fs::write(&path, "pending\n")?;
@@ -512,20 +519,26 @@ fn install_windows_update(
     name: &str,
     expected_digest: Option<&str>,
 ) -> Result<(), UpdateError> {
-    use std::os::windows::process::CommandExt;
-
     let executable = std::env::current_exe()?;
     let destination =
         std::env::temp_dir().join(format!("Sketchi-update-{}-{name}", std::process::id()));
     download_asset(url, &destination)?;
     verify_digest(&destination, expected_digest)?;
     if name.ends_with("-setup.exe") {
-        let result_path = update_result_path()?;
-        let script_path =
-            std::env::temp_dir().join(format!("Sketchi-update-{}-setup.ps1", std::process::id()));
-        fs::write(
-            &script_path,
-            r#"param([string]$Installer, [string]$Exe, [int]$ProcessId, [string]$Result)
+        return install_windows_setup(&executable, &destination);
+    }
+
+    install_windows_archive(&executable, &destination)
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_setup(executable: &Path, destination: &Path) -> Result<(), UpdateError> {
+    let result_path = update_result_path()?;
+    let script_path =
+        std::env::temp_dir().join(format!("Sketchi-update-{}-setup.ps1", std::process::id()));
+    fs::write(
+        &script_path,
+        r#"param([string]$Installer, [string]$Exe, [int]$ProcessId, [string]$Result)
 $ErrorActionPreference = "Stop"
 try {
     Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue
@@ -541,32 +554,19 @@ try {
     Remove-Item -LiteralPath $Installer -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 }"#,
-        )?;
-        fs::write(&result_path, "pending\n")?;
-        let mut command = Command::new("powershell.exe");
-        command
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-WindowStyle",
-                "Hidden",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-            ])
-            .arg(&script_path)
-            .arg(&destination)
-            .arg(&executable)
-            .arg(std::process::id().to_string())
-            .arg(&result_path)
-            .creation_flags(0x0800_0000);
-        if let Err(error) = command.spawn() {
-            clear_update_result(&result_path);
-            return Err(error.into());
-        }
-        return Ok(());
-    }
+    )?;
+    fs::write(&result_path, "pending\n")?;
+    let mut command = windows_powershell_command(&script_path);
+    command
+        .arg(destination)
+        .arg(executable)
+        .arg(std::process::id().to_string())
+        .arg(&result_path);
+    spawn_windows_update_command(command, &result_path)
+}
 
+#[cfg(target_os = "windows")]
+fn install_windows_archive(executable: &Path, destination: &Path) -> Result<(), UpdateError> {
     let parent = executable.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "current executable has no parent")
     })?;
@@ -593,10 +593,21 @@ try {
 } finally {
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
 }"#,
     )?;
     fs::write(&result_path, "pending\n")?;
+    let mut command = windows_powershell_command(&script_path);
+    command
+        .arg(&destination)
+        .arg(&executable)
+        .arg(std::process::id().to_string())
+        .arg(&result_path);
+    spawn_windows_update_command(command, &result_path)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_powershell_command(script_path: &Path) -> Command {
     let mut command = Command::new("powershell.exe");
     command
         .args([
@@ -608,14 +619,18 @@ try {
             "Bypass",
             "-File",
         ])
-        .arg(&script_path)
-        .arg(&destination)
-        .arg(&executable)
-        .arg(std::process::id().to_string())
-        .arg(&result_path)
+        .arg(script_path)
         .creation_flags(0x0800_0000);
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_windows_update_command(
+    mut command: Command,
+    result_path: &Path,
+) -> Result<(), UpdateError> {
     if let Err(error) = command.spawn() {
-        clear_update_result(&result_path);
+        clear_update_result(result_path);
         return Err(error.into());
     }
     Ok(())
