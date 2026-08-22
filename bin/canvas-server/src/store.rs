@@ -2,10 +2,11 @@
 
 use std::path::Path;
 
-use canvas_core::{CrdtSnapshot, Operation};
+use canvas_core::{ClientId, CrdtSnapshot, Operation};
 use canvas_protocol::RoomId;
 use rusqlite::{Connection, params};
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Persistence failures.
 #[derive(Debug, Error)]
@@ -19,6 +20,19 @@ pub enum StoreError {
     /// The store did not contain the requested room.
     #[error("room not found")]
     RoomNotFound,
+}
+
+/// Persisted authentication data for one room.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoomCredentials {
+    /// SHA-256 hash of the room capability.
+    pub token_hash: String,
+    /// Unix timestamp when the room was created.
+    pub created_at_epoch: i64,
+    /// Client identity that created the room, when known.
+    pub creator_id: Option<ClientId>,
+    /// SHA-256 hash of the creator-only cancellation token, when available.
+    pub creator_token_hash: Option<String>,
 }
 
 /// SQLite-backed room store.
@@ -55,12 +69,64 @@ impl RoomStore {
     /// # Errors
     ///
     /// Returns [`StoreError`] when `SQLite` cannot insert the room.
-    pub fn create_room(&mut self, room_id: RoomId, token_hash: &str) -> Result<(), StoreError> {
-        self.connection.execute(
+    pub fn create_room(&mut self, room_id: RoomId, token_hash: &str) -> Result<i64, StoreError> {
+        self.create_room_with_creator(room_id, token_hash, None)
+    }
+
+    /// Creates a room and persists its creator identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when `SQLite` cannot insert the room.
+    pub fn create_room_for(
+        &mut self,
+        room_id: RoomId,
+        token_hash: &str,
+        creator_id: ClientId,
+        creator_token_hash: &str,
+    ) -> Result<i64, StoreError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
             "INSERT INTO rooms (room_id, token_hash, created_at) VALUES (?1, ?2, unixepoch())",
             params![room_id.to_string(), token_hash],
         )?;
-        Ok(())
+        transaction.execute(
+            "INSERT INTO room_creators (room_id, creator_id) VALUES (?1, ?2)",
+            params![room_id.to_string(), creator_id.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO room_creator_tokens (room_id, token_hash) VALUES (?1, ?2)",
+            params![room_id.to_string(), creator_token_hash],
+        )?;
+        transaction.commit()?;
+        self.room_credentials(room_id)?
+            .map_or(Err(StoreError::RoomNotFound), |credentials| {
+                Ok(credentials.created_at_epoch)
+            })
+    }
+
+    fn create_room_with_creator(
+        &mut self,
+        room_id: RoomId,
+        token_hash: &str,
+        creator_id: Option<ClientId>,
+    ) -> Result<i64, StoreError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO rooms (room_id, token_hash, created_at) VALUES (?1, ?2, unixepoch())",
+            params![room_id.to_string(), token_hash],
+        )?;
+        if let Some(creator_id) = creator_id {
+            transaction.execute(
+                "INSERT INTO room_creators (room_id, creator_id) VALUES (?1, ?2)",
+                params![room_id.to_string(), creator_id.to_string()],
+            )?;
+        }
+        transaction.commit()?;
+        self.room_credentials(room_id)?
+            .map_or(Err(StoreError::RoomNotFound), |credentials| {
+                Ok(credentials.created_at_epoch)
+            })
     }
 
     /// Returns the stored capability hash, if the room exists.
@@ -69,12 +135,50 @@ impl RoomStore {
     ///
     /// Returns [`StoreError`] when `SQLite` cannot query the room.
     pub fn token_hash(&self, room_id: RoomId) -> Result<Option<String>, StoreError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT token_hash FROM rooms WHERE room_id = ?1")?;
+        Ok(self
+            .room_credentials(room_id)?
+            .map(|credentials| credentials.token_hash))
+    }
+
+    /// Returns the persisted authentication data, if the room exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when `SQLite` cannot query the room.
+    pub fn room_credentials(&self, room_id: RoomId) -> Result<Option<RoomCredentials>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT rooms.token_hash, rooms.created_at, room_creators.creator_id,
+                    room_creator_tokens.token_hash
+                 FROM rooms
+                 LEFT JOIN room_creators ON room_creators.room_id = rooms.room_id
+                 LEFT JOIN room_creator_tokens
+                    ON room_creator_tokens.room_id = rooms.room_id
+                 WHERE rooms.room_id = ?1",
+        )?;
         let mut rows = statement.query(params![room_id.to_string()])?;
         rows.next()?
-            .map(|row| row.get(0))
+            .map(|row| -> Result<RoomCredentials, rusqlite::Error> {
+                let creator_id = row
+                    .get::<_, Option<String>>(2)?
+                    .map(|value| {
+                        Uuid::parse_str(&value)
+                            .map(ClientId::from_uuid)
+                            .map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    2,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })
+                    })
+                    .transpose()?;
+                Ok(RoomCredentials {
+                    token_hash: row.get(0)?,
+                    created_at_epoch: row.get(1)?,
+                    creator_id,
+                    creator_token_hash: row.get(3)?,
+                })
+            })
             .transpose()
             .map_err(StoreError::from)
     }
@@ -86,6 +190,37 @@ impl RoomStore {
     /// Returns [`StoreError`] when `SQLite` cannot query the room.
     pub fn room_exists(&self, room_id: RoomId) -> Result<bool, StoreError> {
         Ok(self.token_hash(room_id)?.is_some())
+    }
+
+    /// Deletes a room, its operation log, and its snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::RoomNotFound`] when the room does not exist or
+    /// [`StoreError`] when `SQLite` cannot commit the deletion.
+    pub fn delete_room(&mut self, room_id: RoomId) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        let room_id = room_id.to_string();
+        transaction.execute("DELETE FROM snapshots WHERE room_id = ?1", params![room_id])?;
+        transaction.execute(
+            "DELETE FROM operations WHERE room_id = ?1",
+            params![room_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM room_creators WHERE room_id = ?1",
+            params![room_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM room_creator_tokens WHERE room_id = ?1",
+            params![room_id],
+        )?;
+        let deleted =
+            transaction.execute("DELETE FROM rooms WHERE room_id = ?1", params![room_id])?;
+        if deleted == 0 {
+            return Err(StoreError::RoomNotFound);
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Atomically appends a batch of durable operations.

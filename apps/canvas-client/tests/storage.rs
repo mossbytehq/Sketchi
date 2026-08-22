@@ -35,6 +35,17 @@ fn journal_is_idempotent_and_removes_acknowledged_operations() {
 }
 
 #[test]
+fn journal_clear_removes_history_before_a_new_room() {
+    let journal = Journal::open_in_memory().unwrap();
+    journal.append(&operation()).unwrap();
+
+    journal.clear().unwrap();
+
+    assert_eq!(journal.pending_count().unwrap(), 0);
+    assert!(journal.load().unwrap().is_empty());
+}
+
+#[test]
 fn journal_rejects_operation_id_reuse_with_different_content() {
     let journal = Journal::open_in_memory().unwrap();
     let first = operation_with_sequence(1);

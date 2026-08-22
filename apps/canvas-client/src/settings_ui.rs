@@ -4,7 +4,7 @@ use super::{
     ACCENT, Color32, CornerRadius, DARK_MUTED, DARK_TEXT, LIGHT_BORDER, SETTINGS_CARD_BORDER_DARK,
     SETTINGS_CARD_DARK, SETTINGS_CONTROL_DARK, SETTINGS_CONTROL_HOVER_DARK,
     SETTINGS_CONTROL_RADIUS, SETTINGS_PALETTE_GAP, SETTINGS_PALETTE_LABEL_WIDTH,
-    SETTINGS_ROOT_DARK, STANDARD_CONTROL_SIZE, Stroke, Vec2, color_swatch_preview, sketchi_visuals,
+    SETTINGS_ROOT_DARK, STANDARD_CONTROL_SIZE, Stroke, Vec2, color_swatch, sketchi_visuals,
 };
 
 fn settings_widget_visuals(
@@ -94,8 +94,9 @@ pub(super) fn settings_palette_row(
     label: &str,
     palette: &[Color32; 15],
     dark_mode: bool,
-) {
+) -> Option<usize> {
     let width = ui.available_width();
+    let mut clicked = None;
     ui.allocate_ui_with_layout(
         Vec2::new(width, STANDARD_CONTROL_SIZE.y),
         egui::Layout::left_to_right(egui::Align::Center),
@@ -106,8 +107,11 @@ pub(super) fn settings_palette_row(
                 egui::Label::new(label).truncate().halign(egui::Align::LEFT),
             );
             for index in 0..palette.len() {
-                color_swatch_preview(ui, palette.get(index).copied(), false, dark_mode);
+                if color_swatch(ui, palette.get(index).copied(), false, dark_mode).clicked() {
+                    clicked = Some(index);
+                }
             }
         },
     );
+    clicked
 }

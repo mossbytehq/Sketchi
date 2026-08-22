@@ -347,6 +347,7 @@ impl Editor {
                         StylePatch {
                             stroke: Some(element.style.stroke),
                             fill: Some(element.style.fill),
+                            fill_style: Some(element.style.fill_style),
                             stroke_width: Some(element.style.stroke_width),
                             stroke_style: Some(element.style.stroke_style),
                             sloppiness: Some(element.style.sloppiness),

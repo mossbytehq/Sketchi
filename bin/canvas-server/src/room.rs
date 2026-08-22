@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use canvas_core::{ClientId, CrdtDocument, CrdtSnapshot, Document, Operation, VersionVector};
 use canvas_protocol::{MAX_PARTICIPANTS, Participant, PresenceState, RoomId};
@@ -14,6 +14,8 @@ use crate::{auth::CapabilityToken, store::RoomStore};
 pub const SNAPSHOT_OPERATION_INTERVAL: usize = 500;
 /// Snapshot interval by elapsed wall time.
 pub const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
+/// Lifetime of a room capability for new joins and rejoins.
+pub const ROOM_TOKEN_LIFETIME: Duration = Duration::from_hours(2);
 /// Recent operation payloads retained for exact duplicate/reuse checks.
 const SEEN_OPERATION_RETENTION: usize = 256;
 /// Maximum number of idle rooms retained in the manager cache.
@@ -26,6 +28,10 @@ pub struct CreatedRoom {
     pub room_id: RoomId,
     /// Secret required to join.
     pub token: CapabilityToken,
+    /// Secret required to cancel the room as its creator.
+    pub creator_token: CapabilityToken,
+    /// Unix timestamp after which new joins using this capability are rejected.
+    pub expires_at_epoch: u64,
 }
 
 /// Result of submitting operations to a room.
@@ -75,6 +81,9 @@ pub enum RoomError {
     /// The capability token was invalid.
     #[error("invalid room capability")]
     Unauthorized,
+    /// The room capability has expired.
+    #[error("room capability expired; create a new room")]
+    TokenExpired,
     /// The room already has the maximum number of participants.
     #[error("room is full (maximum {MAX_PARTICIPANTS} participants)")]
     RoomFull,
@@ -276,16 +285,70 @@ impl RoomManager {
     ///
     /// Returns [`RoomError`] when `SQLite` initialization or room loading fails.
     pub fn create_room(&mut self) -> Result<CreatedRoom, RoomError> {
+        self.create_room_for(ClientId::default())
+    }
+
+    /// Creates a room owned by the supplied client identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError`] when `SQLite` initialization or room loading fails.
+    pub fn create_room_for(&mut self, creator_id: ClientId) -> Result<CreatedRoom, RoomError> {
         self.evict_idle_rooms();
         let room_id = RoomId::new();
         let token = CapabilityToken::generate();
+        let creator_token = CapabilityToken::generate();
+        let created_at_epoch = self
+            .store
+            .lock()
+            .map_err(|_| RoomError::StoreLock)?
+            .create_room_for(room_id, &token.hash(), creator_id, &creator_token.hash())?;
+        let room = Room::load(room_id, Arc::clone(&self.store))?;
+        self.rooms.insert(room_id, room);
+        let expires_at_epoch = u64::try_from(created_at_epoch)
+            .unwrap_or_default()
+            .saturating_add(ROOM_TOKEN_LIFETIME.as_secs());
+        Ok(CreatedRoom {
+            room_id,
+            token,
+            creator_token,
+            expires_at_epoch,
+        })
+    }
+
+    /// Cancels a room and returns its active members for notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoomError::Unauthorized`] when the caller is not the creator,
+    /// or [`RoomError`] when the room cannot be removed from persistence.
+    pub fn cancel(
+        &mut self,
+        room_id: RoomId,
+        creator_token: &CapabilityToken,
+    ) -> Result<Vec<ClientId>, RoomError> {
+        let credentials = self
+            .store
+            .lock()
+            .map_err(|_| RoomError::StoreLock)?
+            .room_credentials(room_id)?
+            .ok_or(RoomError::RoomNotFound)?;
+        let Some(expected_hash) = credentials.creator_token_hash else {
+            return Err(RoomError::Unauthorized);
+        };
+        if !creator_token.verify(&expected_hash) {
+            return Err(RoomError::Unauthorized);
+        }
+        let members = self
+            .rooms
+            .get(&room_id)
+            .map_or_else(Vec::new, |room| room.members.keys().copied().collect());
         self.store
             .lock()
             .map_err(|_| RoomError::StoreLock)?
-            .create_room(room_id, &token.hash())?;
-        let room = Room::load(room_id, Arc::clone(&self.store))?;
-        self.rooms.insert(room_id, room);
-        Ok(CreatedRoom { room_id, token })
+            .delete_room(room_id)?;
+        self.rooms.remove(&room_id);
+        Ok(members)
     }
 
     /// Joins a room after verifying the capability token.
@@ -315,14 +378,31 @@ impl RoomManager {
         client_id: ClientId,
         name: impl Into<String>,
     ) -> Result<(), RoomError> {
-        let expected = self
+        self.join_named_at(room_id, token, client_id, name, unix_epoch_seconds())
+    }
+
+    fn join_named_at(
+        &mut self,
+        room_id: RoomId,
+        token: &CapabilityToken,
+        client_id: ClientId,
+        name: impl Into<String>,
+        now_epoch: u64,
+    ) -> Result<(), RoomError> {
+        let credentials = self
             .store
             .lock()
             .map_err(|_| RoomError::StoreLock)?
-            .token_hash(room_id)?
+            .room_credentials(room_id)?
             .ok_or(RoomError::RoomNotFound)?;
-        if !token.verify(&expected) {
+        if !token.verify(&credentials.token_hash) {
             return Err(RoomError::Unauthorized);
+        }
+        let expires_at_epoch = u64::try_from(credentials.created_at_epoch)
+            .unwrap_or_default()
+            .saturating_add(ROOM_TOKEN_LIFETIME.as_secs());
+        if now_epoch >= expires_at_epoch {
+            return Err(RoomError::TokenExpired);
         }
         let room = self.room_mut(room_id)?;
         room.join(client_id, name.into())
@@ -425,5 +505,122 @@ impl RoomManager {
             };
             self.rooms.remove(&room_id);
         }
+    }
+}
+
+fn unix_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_capabilities_reject_new_joins_but_active_members_continue() {
+        let store = Arc::new(Mutex::new(RoomStore::open_in_memory().expect("store")));
+        let mut manager = RoomManager::new(store);
+        let created = manager.create_room().expect("room");
+        let creator = ClientId::from_u128(1);
+        manager
+            .join_named_at(
+                created.room_id,
+                &created.token,
+                creator,
+                "Creator",
+                created.expires_at_epoch.saturating_sub(1),
+            )
+            .expect("creator joins before expiry");
+
+        let error = manager
+            .join_named_at(
+                created.room_id,
+                &created.token,
+                ClientId::from_u128(2),
+                "Rejoiner",
+                created.expires_at_epoch,
+            )
+            .expect_err("expired capability must reject new joins");
+        assert!(matches!(error, RoomError::TokenExpired));
+
+        let operation = Operation::new(
+            canvas_core::OperationId::new(creator, 1),
+            canvas_core::LamportTimestamp::new(1),
+            VersionVector::default(),
+            canvas_core::OperationKind::Create {
+                element: canvas_core::Element::rectangle(
+                    canvas_core::ElementId::from_u128(10),
+                    canvas_core::Transform::new(
+                        canvas_core::Point::default(),
+                        canvas_core::Size::new(10.0, 10.0),
+                    ),
+                ),
+            },
+        );
+        assert!(
+            manager
+                .submit(created.room_id, creator, std::slice::from_ref(&operation))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn only_the_creator_can_cancel_a_room() {
+        let store = Arc::new(Mutex::new(RoomStore::open_in_memory().expect("store")));
+        let mut manager = RoomManager::new(Arc::clone(&store));
+        let creator = ClientId::from_u128(1);
+        let collaborator = ClientId::from_u128(2);
+        let created = manager.create_room_for(creator).expect("room");
+        manager
+            .join(created.room_id, &created.token, creator)
+            .expect("creator joins");
+        manager
+            .join(created.room_id, &created.token, collaborator)
+            .expect("collaborator joins");
+
+        assert!(matches!(
+            manager.cancel(
+                created.room_id,
+                &CapabilityToken::from_secret("wrong-creator-token"),
+            ),
+            Err(RoomError::Unauthorized)
+        ));
+        assert_eq!(
+            manager
+                .cancel(created.room_id, &created.creator_token)
+                .expect("cancel"),
+            vec![creator, collaborator]
+        );
+        assert!(
+            !store
+                .lock()
+                .expect("store lock")
+                .room_exists(created.room_id)
+                .expect("room lookup")
+        );
+    }
+
+    #[test]
+    fn creator_can_cancel_a_room_after_manager_restart() {
+        let store = Arc::new(Mutex::new(RoomStore::open_in_memory().expect("store")));
+        let creator = ClientId::from_u128(7);
+        let created = RoomManager::new(Arc::clone(&store))
+            .create_room_for(creator)
+            .expect("room");
+        let mut restarted_manager = RoomManager::new(Arc::clone(&store));
+
+        restarted_manager
+            .cancel(created.room_id, &created.creator_token)
+            .expect("creator can cancel after restart");
+        assert!(
+            !store
+                .lock()
+                .expect("store lock")
+                .room_exists(created.room_id)
+                .expect("room lookup")
+        );
     }
 }

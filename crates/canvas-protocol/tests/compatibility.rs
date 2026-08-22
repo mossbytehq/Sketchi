@@ -15,7 +15,7 @@ fn unsupported_versions_and_unknown_messages_are_rejected() {
         Err(ProtocolError::UnsupportedVersion(999))
     ));
 
-    let unknown = br#"{"protocol_version":2,"message":{"type":"future_feature"}}"#;
+    let unknown = br#"{"protocol_version":3,"message":{"type":"future_feature"}}"#;
     assert!(matches!(
         decode_client(unknown),
         Err(ProtocolError::Json(_))
@@ -23,12 +23,12 @@ fn unsupported_versions_and_unknown_messages_are_rejected() {
 }
 
 #[test]
-fn schema_changes_require_protocol_version_two() {
+fn schema_changes_require_protocol_version_three() {
     let encoded = encode_client(&ClientMessage::Ping { nonce: 1 }).unwrap();
     assert!(
         String::from_utf8(encoded)
             .unwrap()
-            .contains("protocol_version\":2")
+            .contains("protocol_version\":3")
     );
 
     let version_one = br#"{"protocol_version":1,"message":{"type":"ping","nonce":1}}"#;
@@ -78,7 +78,7 @@ fn presence_and_ephemeral_strokes_are_validated_without_becoming_operations() {
         active_tool: ToolKind::Freehand,
     };
     assert!(presence.validate().is_ok());
-    assert_eq!(PROTOCOL_VERSION, 2);
+    assert_eq!(PROTOCOL_VERSION, 3);
 }
 
 #[test]

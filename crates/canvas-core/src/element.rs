@@ -171,6 +171,19 @@ pub enum StrokeStyle {
     Dotted,
 }
 
+/// Interior rendering pattern used when an element has a fill color.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FillStyle {
+    /// A continuous fill.
+    #[default]
+    Solid,
+    /// Diagonal hatch lines.
+    Hachure,
+    /// Crossing diagonal hatch lines.
+    CrossHatch,
+}
+
 /// Degree of hand-drawn variation requested by the author.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -230,6 +243,9 @@ pub struct Style {
     pub stroke: Color,
     /// Optional interior color.
     pub fill: Option<Color>,
+    /// Interior rendering pattern used for the fill color.
+    #[serde(default)]
+    pub fill_style: FillStyle,
     /// Stroke width in world units.
     pub stroke_width: f32,
     /// Stroke rendering pattern.
@@ -268,6 +284,7 @@ impl Default for Style {
         Self {
             stroke: Color::rgb(31, 41, 55),
             fill: None,
+            fill_style: FillStyle::Solid,
             stroke_width: 2.0,
             stroke_style: StrokeStyle::Solid,
             sloppiness: Sloppiness::Artist,
@@ -313,6 +330,9 @@ pub struct StylePatch {
     pub stroke: Option<Color>,
     /// Replacement fill; `Some(None)` clears the fill.
     pub fill: Option<Option<Color>>,
+    /// Replacement interior rendering pattern, when present.
+    #[serde(default)]
+    pub fill_style: Option<FillStyle>,
     /// Replacement stroke width, when present.
     pub stroke_width: Option<f32>,
     /// Replacement stroke rendering pattern, when present.
@@ -381,6 +401,9 @@ impl StylePatch {
         }
         if let Some(fill) = self.fill {
             style.fill = fill;
+        }
+        if let Some(fill_style) = self.fill_style {
+            style.fill_style = fill_style;
         }
         if let Some(stroke_width) = self.stroke_width {
             style.stroke_width = stroke_width;

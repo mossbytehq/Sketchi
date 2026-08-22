@@ -2,9 +2,9 @@
 
 use canvas_core::{
     ApplyResult, ClientId, Color, CrdtDocument, CrdtError, EdgeStyle, Element, ElementId,
-    ElementKind, EmbeddedImage, LamportTimestamp, MAX_IMAGE_BYTES, MAX_POINTS, MAX_TEXT_BYTES,
-    Operation, OperationId, OperationKind, Point, Size, Sloppiness, StrokeStyle, StylePatch,
-    Transform, VersionVector,
+    ElementKind, EmbeddedImage, FillStyle, LamportTimestamp, MAX_IMAGE_BYTES, MAX_POINTS,
+    MAX_TEXT_BYTES, Operation, OperationId, OperationKind, Point, RegisterMetadata, Size,
+    Sloppiness, StrokeStyle, StylePatch, Transform, VersionVector,
 };
 
 fn operation(client: u128, sequence: u64, timestamp: u64, kind: OperationKind) -> Operation {
@@ -203,6 +203,35 @@ fn image_payload_updates_are_durable_and_merge_after_creation() {
             .document(),
         document.document()
     );
+}
+
+#[test]
+fn snapshot_rejects_fill_style_metadata_outside_version_vector() {
+    let create = operation(
+        1,
+        1,
+        1,
+        OperationKind::Create {
+            element: rectangle(ElementId::from_u128(19)),
+        },
+    );
+    let mut document = CrdtDocument::new();
+    document.apply(&create).unwrap();
+    let mut snapshot = document.snapshot();
+    snapshot
+        .elements
+        .first_mut()
+        .expect("created element is retained")
+        .fill_style
+        .metadata = RegisterMetadata {
+        timestamp: LamportTimestamp::new(1),
+        operation_id: OperationId::new(ClientId::from_u128(2), 1),
+    };
+
+    assert!(matches!(
+        CrdtDocument::from_snapshot(snapshot),
+        Err(CrdtError::InvalidSnapshot(message)) if message.contains("fill_style")
+    ));
 }
 
 #[test]
@@ -526,6 +555,7 @@ fn extended_style_fields_merge_and_materialize() {
             element_id,
             style: StylePatch {
                 stroke_style: Some(StrokeStyle::Dashed),
+                fill_style: Some(FillStyle::CrossHatch),
                 sloppiness: Some(Sloppiness::Cartoonist),
                 edges: Some(EdgeStyle::Rounded),
                 opacity: Some(0.42),
@@ -541,6 +571,7 @@ fn extended_style_fields_merge_and_materialize() {
     let materialized = document.document();
     let element = materialized.element(element_id).unwrap();
     assert_eq!(element.style.stroke_style, StrokeStyle::Dashed);
+    assert_eq!(element.style.fill_style, FillStyle::CrossHatch);
     assert_eq!(element.style.sloppiness, Sloppiness::Cartoonist);
     assert_eq!(element.style.edges, EdgeStyle::Rounded);
     assert!((element.style.opacity - 0.42).abs() < f32::EPSILON);

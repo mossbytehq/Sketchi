@@ -487,6 +487,10 @@ pub struct CollaborationView {
     pub room_id: Option<String>,
     /// Capability token returned for a newly created room.
     pub capability_token: Option<String>,
+    /// Creator-only token returned for a newly created room.
+    pub creator_token: Option<String>,
+    /// Unix timestamp after which new joins using the room capability are rejected.
+    pub token_expires_at_epoch: Option<u64>,
     /// WebSocket endpoint that collaborators must use.
     pub endpoint: Option<String>,
     /// SHA-256 certificate pin that accompanies the endpoint.
@@ -507,6 +511,8 @@ impl CollaborationView {
             status: String::from("Not connected"),
             room_id: None,
             capability_token: None,
+            creator_token: None,
+            token_expires_at_epoch: None,
             endpoint: None,
             certificate_sha256: None,
             server_available,
@@ -657,6 +663,8 @@ pub struct CollaborationClient {
     synchronization: SyncController,
     room_id: Option<RoomId>,
     capability_token: Option<String>,
+    creator_token: Option<String>,
+    token_expires_at_epoch: Option<u64>,
     readiness: ReadyMessage,
     next_request_id: u64,
     sent_operations: BTreeSet<OperationId>,
@@ -705,6 +713,8 @@ impl CollaborationClient {
             synchronization: SyncController::new(journal),
             room_id: None,
             capability_token: None,
+            creator_token: None,
+            token_expires_at_epoch: None,
             readiness: readiness.clone(),
             next_request_id: 1,
             sent_operations: BTreeSet::new(),
@@ -766,6 +776,8 @@ impl CollaborationClient {
             status: self.status.clone(),
             room_id: self.room_id.map(|room_id| room_id.to_string()),
             capability_token: self.capability_token.clone(),
+            creator_token: self.creator_token.clone(),
+            token_expires_at_epoch: self.token_expires_at_epoch,
             endpoint: Some(self.readiness.endpoint.clone()),
             certificate_sha256: Some(self.readiness.certificate_sha256.clone()),
             server_available: self.server_available,
@@ -894,10 +906,14 @@ impl CollaborationClient {
             ServerMessage::RoomCreated {
                 room_id,
                 capability_token,
+                creator_token,
+                expires_at_epoch,
                 ..
             } => {
                 self.room_id = Some(*room_id);
                 self.capability_token = Some(capability_token.clone());
+                self.creator_token = Some(creator_token.clone());
+                self.token_expires_at_epoch = *expires_at_epoch;
                 self.create_request_id = None;
                 self.status = format!("Room {room_id} created; joining…");
                 self.refresh_handshake();
@@ -905,6 +921,9 @@ impl CollaborationClient {
                     self.synchronization
                         .join_message(*room_id, capability_token.clone()),
                 )?;
+            }
+            ServerMessage::RoomCancelled { room_id } if self.room_id == Some(*room_id) => {
+                self.reset_room_state("Collaboration room cancelled by its creator.");
             }
             ServerMessage::SyncComplete { .. } => {
                 if self.welcome_generation == Some(received.generation) {
@@ -940,15 +959,45 @@ impl CollaborationClient {
                 }
             }
             ServerMessage::Error { code, message, .. } => {
-                self.status = if *code == canvas_protocol::ErrorCode::RoomFull {
-                    String::from("This room is full (maximum 4 participants).")
+                if matches!(
+                    code,
+                    canvas_protocol::ErrorCode::RoomNotFound
+                        | canvas_protocol::ErrorCode::TokenExpired
+                ) {
+                    let status = if *code == canvas_protocol::ErrorCode::TokenExpired {
+                        "This room invite has expired; create a new room."
+                    } else {
+                        "This collaboration room is no longer available; create or join another."
+                    };
+                    self.reset_room_state(status);
                 } else {
-                    format!("Collaboration error: {message}")
-                };
+                    self.status = match code {
+                        canvas_protocol::ErrorCode::RoomFull => {
+                            String::from("This room is full (maximum 4 participants).")
+                        }
+                        _ => format!("Collaboration error: {message}"),
+                    };
+                }
             }
             _ => {}
         }
         Ok(true)
+    }
+
+    fn reset_room_state(&mut self, status: &str) {
+        self.synchronization.reset_for_new_room();
+        self.room_id = None;
+        self.capability_token = None;
+        self.creator_token = None;
+        self.token_expires_at_epoch = None;
+        self.create_request_id = None;
+        self.participants.clear();
+        self.presence.clear();
+        self.sent_operations.clear();
+        self.welcome_generation = None;
+        self.sync_generation = None;
+        status.clone_into(&mut self.status);
+        self.refresh_handshake();
     }
 
     /// Sends one protocol message through the bounded channel.
@@ -965,6 +1014,27 @@ impl CollaborationClient {
                 mpsc::error::TrySendError::Full(_) => ConnectionError::QueueFull,
                 mpsc::error::TrySendError::Closed(_) => ConnectionError::Closed,
             })
+    }
+
+    /// Requests cancellation of the current room by its creator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectionError::QueueFull`] when the cancellation cannot be
+    /// queued or [`ConnectionError::Closed`] when the runtime has stopped.
+    pub fn cancel_room(&mut self) -> Result<(), ConnectionError> {
+        let Some(room_id) = self.room_id else {
+            return Ok(());
+        };
+        let Some(creator_token) = self.creator_token.clone() else {
+            return Ok(());
+        };
+        self.send(ClientMessage::CancelRoom {
+            room_id,
+            creator_token,
+        })?;
+        self.status = String::from("Cancelling collaboration room…");
+        Ok(())
     }
 
     /// Offers local ephemeral state to the bounded presence transport.
@@ -1095,6 +1165,8 @@ mod tests {
             synchronization: SyncController::new(journal),
             room_id: None,
             capability_token: None,
+            creator_token: None,
+            token_expires_at_epoch: None,
             readiness: ReadyMessage {
                 endpoint: String::from("wss://127.0.0.1:3000/ws"),
                 certificate_sha256: "ab".repeat(32),
@@ -1143,6 +1215,8 @@ mod tests {
             synchronization: SyncController::new(journal),
             room_id: None,
             capability_token: None,
+            creator_token: None,
+            token_expires_at_epoch: None,
             readiness: ReadyMessage {
                 endpoint: String::from("wss://127.0.0.1:3000/ws"),
                 certificate_sha256: "ab".repeat(32),
@@ -1200,6 +1274,8 @@ mod tests {
             synchronization: SyncController::new(journal),
             room_id: Some(RoomId::from_u128(1)),
             capability_token: Some(String::from("capability-token")),
+            creator_token: None,
+            token_expires_at_epoch: None,
             readiness: ReadyMessage {
                 endpoint: String::from("wss://127.0.0.1:3000/ws"),
                 certificate_sha256: "ab".repeat(32),
@@ -1297,6 +1373,86 @@ mod tests {
                 known_version,
             })
         );
+    }
+
+    #[test]
+    fn expired_room_resets_the_session_without_discarding_pending_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (channels, _endpoints) = bounded_channels();
+        let journal = Journal::open_in_memory()?;
+        let operation = canvas_core::Operation::new(
+            canvas_core::OperationId::new(canvas_core::ClientId::from_u128(1), 1),
+            canvas_core::LamportTimestamp::new(1),
+            VersionVector::default(),
+            canvas_core::OperationKind::Create {
+                element: canvas_core::Element::rectangle(
+                    canvas_core::ElementId::from_u128(10),
+                    canvas_core::Transform::new(
+                        canvas_core::Point::default(),
+                        canvas_core::Size::new(10.0, 10.0),
+                    ),
+                ),
+            },
+        );
+        journal.append(&operation)?;
+        let presence_throttle = PresenceThrottle::new(Duration::from_millis(50))?;
+        let connection_generation = Arc::clone(&channels.connection_generation);
+        let mut client = CollaborationClient {
+            handshake: Arc::clone(&channels.handshake),
+            channels,
+            runtime: None,
+            shutdown: ShutdownSignal {
+                sender: watch::channel(false).0,
+            },
+            synchronization: SyncController::new(journal),
+            room_id: Some(RoomId::from_u128(1)),
+            capability_token: Some(String::from("capability")),
+            creator_token: None,
+            token_expires_at_epoch: Some(123),
+            readiness: ReadyMessage {
+                endpoint: String::from("wss://127.0.0.1:3000/ws"),
+                certificate_sha256: "ab".repeat(32),
+            },
+            next_request_id: 1,
+            sent_operations: BTreeSet::new(),
+            status: String::from("Joining"),
+            server_available: true,
+            client_id: canvas_core::ClientId::from_u128(1),
+            display_name: String::from("Test user"),
+            participants: BTreeMap::new(),
+            presence: BTreeMap::new(),
+            presence_throttle,
+            create_request_id: None,
+            connection_generation,
+            welcome_generation: Some(1),
+            sync_generation: Some(1),
+        };
+        client.connection_generation.store(1, Ordering::Release);
+
+        client.observe(&ReceivedServerMessage {
+            generation: 1,
+            message: ServerMessage::Error {
+                request_id: None,
+                code: canvas_protocol::ErrorCode::TokenExpired,
+                message: String::from("expired"),
+            },
+        })?;
+
+        assert_eq!(client.room_id, None);
+        assert_eq!(client.capability_token, None);
+        assert_eq!(client.token_expires_at_epoch, None);
+        assert_eq!(
+            client.status,
+            "This room invite has expired; create a new room."
+        );
+        assert_eq!(client.synchronization.pending_count()?, 1);
+        let handshake_len = client
+            .handshake
+            .lock()
+            .map_err(|_| std::io::Error::other("handshake lock poisoned"))?
+            .len();
+        assert_eq!(handshake_len, 1);
+        Ok(())
     }
 
     #[test]
@@ -1421,6 +1577,26 @@ impl SyncController {
         } else {
             Ok(self.journal.pending_count()?)
         }
+    }
+
+    /// Starts the next room from the current local journal without retaining
+    /// the previous room's synchronization cursor.
+    pub fn reset_for_new_room(&mut self) {
+        self.pending_cache = None;
+        self.known_version = VersionVector::default();
+    }
+
+    /// Clears operations that belong to a completed or cancelled room.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectionError::Storage`] when the durable journal cannot
+    /// be cleared.
+    pub fn clear_pending(&mut self) -> Result<(), ConnectionError> {
+        self.journal.clear()?;
+        self.pending_cache = Some(Vec::new());
+        self.known_version = VersionVector::default();
+        Ok(())
     }
 
     /// Builds deterministic, protocol-sized replay messages.

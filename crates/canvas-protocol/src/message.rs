@@ -263,6 +263,13 @@ pub enum ClientMessage {
         /// Room to leave.
         room_id: RoomId,
     },
+    /// Cancels a room as its creator and invalidates its invite.
+    CancelRoom {
+        /// Room to cancel.
+        room_id: RoomId,
+        /// Creator-only secret authorizing cancellation.
+        creator_token: String,
+    },
     /// Starts an ephemeral freehand preview.
     StrokeStart {
         /// Room receiving the preview.
@@ -309,6 +316,16 @@ pub enum ServerMessage {
         room_id: RoomId,
         /// Capability needed to join.
         capability_token: String,
+        /// Creator-only secret used to cancel the room.
+        creator_token: String,
+        /// Unix timestamp after which new joins using this capability are rejected.
+        #[serde(default)]
+        expires_at_epoch: Option<u64>,
+    },
+    /// Announces that a room was cancelled by its creator.
+    RoomCancelled {
+        /// Room that is no longer available.
+        room_id: RoomId,
     },
     /// Sends a full room snapshot.
     Snapshot {
@@ -419,6 +436,8 @@ pub enum ErrorCode {
     InvalidMessage,
     /// Capability token is absent or invalid.
     Unauthorized,
+    /// The room capability has expired.
+    TokenExpired,
     /// Room does not exist.
     RoomNotFound,
     /// The session is not joined to the requested room.
@@ -485,6 +504,13 @@ impl ClientMessage {
             }
             Self::Ping { .. } => {}
             Self::LeaveRoom { room_id } => validate_room_id(*room_id)?,
+            Self::CancelRoom {
+                room_id,
+                creator_token,
+            } => {
+                validate_room_id(*room_id)?;
+                validate_token(creator_token)?;
+            }
             Self::StrokeEnd { room_id, stroke_id } => {
                 validate_room_id(*room_id)?;
                 validate_stroke_id(*stroke_id)?;
@@ -540,11 +566,20 @@ impl ServerMessage {
                 request_id,
                 room_id,
                 capability_token,
+                creator_token,
+                expires_at_epoch,
             } => {
                 validate_request_id(*request_id)?;
                 validate_room_id(*room_id)?;
                 validate_token(capability_token)?;
+                validate_token(creator_token)?;
+                if expires_at_epoch == &Some(0) {
+                    return Err(ProtocolError::InvalidMessage(
+                        "room capability expiry must be a positive timestamp".to_owned(),
+                    ));
+                }
             }
+            Self::RoomCancelled { room_id } => validate_room_id(*room_id)?,
             Self::Snapshot { room_id, snapshot } => {
                 validate_room_id(*room_id)?;
                 canvas_core::CrdtDocument::from_snapshot(snapshot.clone())?;

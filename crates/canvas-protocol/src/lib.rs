@@ -13,7 +13,7 @@ pub use message::{
 };
 
 /// Current protocol envelope version.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 /// Maximum encoded JSON frame accepted by either endpoint.
 ///
 /// This accommodates a maximum-size embedded image in both a durable

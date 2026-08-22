@@ -33,7 +33,10 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tower::{ServiceExt, service_fn};
 
-use crate::room::{CreatedRoom, RoomError, RoomManager};
+use crate::{
+    auth::CapabilityToken,
+    room::{CreatedRoom, RoomError, RoomManager},
+};
 
 const CREATE_REQUEST_CACHE_CAPACITY: usize = 1024;
 const CREATE_REQUEST_RETENTION: Duration = Duration::from_mins(10);
@@ -387,6 +390,8 @@ async fn handle_message(
                             request_id,
                             room_id: created.room_id,
                             capability_token: created.token.secret().to_owned(),
+                            creator_token: created.creator_token.secret().to_owned(),
+                            expires_at_epoch: Some(created.expires_at_epoch),
                         },
                     )
                     .await;
@@ -676,6 +681,34 @@ async fn handle_message(
                 Err(error) => send_room_error(&outbound, sender, None, error).await,
             }
         }
+        ClientMessage::CancelRoom {
+            room_id,
+            creator_token,
+        } => {
+            let Some(client_id) = peer_client(state, session_id).await else {
+                send_error(
+                    &outbound,
+                    sender,
+                    None,
+                    ErrorCode::Unauthorized,
+                    "send hello first",
+                )
+                .await;
+                return Ok(());
+            };
+            let result = state
+                .manager
+                .lock()
+                .await
+                .cancel(room_id, &CapabilityToken::from_secret(creator_token));
+            match result {
+                Ok(_) => {
+                    state.create_requests.lock().await.remove(&client_id);
+                    cancel_room_sessions(state, room_id, session_id).await;
+                }
+                Err(error) => send_room_error(&outbound, sender, None, error).await,
+            }
+        }
         ClientMessage::StrokeStart {
             room_id,
             stroke_id,
@@ -770,7 +803,7 @@ async fn create_room_for_request(
         return Ok(record.created.clone());
     }
 
-    let created = state.manager.lock().await.create_room()?;
+    let created = state.manager.lock().await.create_room_for(client_id)?;
     while requests.len() >= CREATE_REQUEST_CACHE_CAPACITY {
         let Some(oldest_client) = requests
             .iter()
@@ -863,6 +896,24 @@ where
 {
     if let Some(peer) = state.sessions.lock().await.get_mut(&session_id) {
         update(peer);
+    }
+}
+
+async fn cancel_room_sessions(state: &ServerState, room_id: RoomId, creator_session_id: SessionId) {
+    let session_ids = {
+        let mut sessions = state.sessions.lock().await;
+        sessions
+            .iter_mut()
+            .filter_map(|(session_id, peer)| {
+                (peer.room_id == Some(room_id) || *session_id == creator_session_id).then(|| {
+                    peer.room_id = None;
+                    *session_id
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    for session_id in session_ids {
+        send_to_session(state, session_id, ServerMessage::RoomCancelled { room_id }).await;
     }
 }
 
@@ -1025,6 +1076,7 @@ async fn send_room_error(
 ) {
     let code = match error {
         RoomError::Unauthorized => ErrorCode::Unauthorized,
+        RoomError::TokenExpired => ErrorCode::TokenExpired,
         RoomError::NotInRoom => ErrorCode::NotInRoom,
         RoomError::RoomNotFound => ErrorCode::RoomNotFound,
         RoomError::RoomFull => ErrorCode::RoomFull,
@@ -1141,6 +1193,98 @@ mod tests {
         let first = next_message(&mut receiver).await;
         let second = next_message(&mut second_receiver).await;
         assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_room_clears_create_history_for_the_next_room() {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::store::RoomStore::open_in_memory().expect("in-memory store"),
+        ));
+        let state = ServerState::new(RoomManager::new(store));
+        let session_id = SessionId::new();
+        let client_id = ClientId::from_u128(44);
+        let mut receiver = add_peer(&state, session_id, Some(client_id), None).await;
+        let sender = state
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("peer was inserted")
+            .sender
+            .clone();
+
+        handle_message(
+            session_id,
+            ClientMessage::CreateRoom { request_id: 1 },
+            &state,
+            &sender,
+        )
+        .await
+        .expect("create should be handled");
+        let first_message = next_message(&mut receiver).await;
+        assert!(matches!(first_message, ServerMessage::RoomCreated { .. }));
+        let ServerMessage::RoomCreated {
+            room_id: first_room_id,
+            creator_token: first_creator_token,
+            ..
+        } = first_message
+        else {
+            return;
+        };
+        handle_message(
+            session_id,
+            ClientMessage::CancelRoom {
+                room_id: first_room_id,
+                creator_token: first_creator_token,
+            },
+            &state,
+            &sender,
+        )
+        .await
+        .expect("cancel should be handled");
+        let first_cancel_message = next_message(&mut receiver).await;
+        assert!(
+            matches!(
+                first_cancel_message,
+                ServerMessage::RoomCancelled { room_id } if room_id == first_room_id
+            ),
+            "received {first_cancel_message:?}"
+        );
+
+        handle_message(
+            session_id,
+            ClientMessage::CreateRoom { request_id: 1 },
+            &state,
+            &sender,
+        )
+        .await
+        .expect("second create should be handled");
+        let second_message = next_message(&mut receiver).await;
+        assert!(matches!(second_message, ServerMessage::RoomCreated { .. }));
+        let ServerMessage::RoomCreated {
+            room_id: second_room_id,
+            creator_token: second_creator_token,
+            ..
+        } = second_message
+        else {
+            return;
+        };
+        assert_ne!(first_room_id, second_room_id);
+        handle_message(
+            session_id,
+            ClientMessage::CancelRoom {
+                room_id: second_room_id,
+                creator_token: second_creator_token,
+            },
+            &state,
+            &sender,
+        )
+        .await
+        .expect("second cancel should be handled");
+        assert!(matches!(
+            next_message(&mut receiver).await,
+            ServerMessage::RoomCancelled { room_id } if room_id == second_room_id
+        ));
     }
 
     #[tokio::test]

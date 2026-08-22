@@ -300,6 +300,17 @@ impl Journal {
         Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
 
+    /// Removes all operations waiting for acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when `SQLite` cannot clear the journal.
+    pub fn clear(&self) -> Result<(), StorageError> {
+        self.connection
+            .execute("DELETE FROM pending_operations", [])?;
+        Ok(())
+    }
+
     /// Removes acknowledged operation IDs.
     ///
     /// # Errors

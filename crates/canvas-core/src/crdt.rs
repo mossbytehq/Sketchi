@@ -9,8 +9,8 @@ use crate::{
     clock::{LamportClock, LamportTimestamp},
     document::Document,
     element::{
-        Color, EdgeStyle, Element, ElementKind, EmbeddedImage, Sloppiness, StrokeStyle, Style,
-        TextAlign, TextFontFamily,
+        Color, EdgeStyle, Element, ElementKind, EmbeddedImage, FillStyle, Sloppiness, StrokeStyle,
+        Style, TextAlign, TextFontFamily,
     },
     error::CrdtError,
     geometry::{Point, Size, Transform},
@@ -132,6 +132,9 @@ pub struct ElementSnapshot {
     pub stroke: Register<Color>,
     /// Fill color register.
     pub fill: Register<Option<Color>>,
+    /// Fill rendering pattern register.
+    #[serde(default)]
+    pub fill_style: Register<FillStyle>,
     /// Stroke width register.
     pub stroke_width: Register<f32>,
     /// Stroke rendering pattern register.
@@ -183,6 +186,7 @@ impl ElementSnapshot {
             rotation: Register::new(0.0),
             stroke: Register::new(Style::default().stroke),
             fill: Register::new(Style::default().fill),
+            fill_style: Register::new(Style::default().fill_style),
             stroke_width: Register::new(Style::default().stroke_width),
             stroke_style: Register::new(Style::default().stroke_style),
             sloppiness: Register::new(Style::default().sloppiness),
@@ -217,6 +221,7 @@ impl ElementSnapshot {
             ("rotation", metadata_of(&self.rotation)),
             ("stroke", metadata_of(&self.stroke)),
             ("fill", metadata_of(&self.fill)),
+            ("fill_style", metadata_of(&self.fill_style)),
             ("stroke_width", metadata_of(&self.stroke_width)),
             ("stroke_style", metadata_of(&self.stroke_style)),
             ("sloppiness", metadata_of(&self.sloppiness)),
@@ -256,6 +261,7 @@ impl ElementSnapshot {
         Style {
             stroke: self.stroke.value,
             fill: self.fill.value,
+            fill_style: self.fill_style.value,
             stroke_width: self.stroke_width.value,
             stroke_style: self.stroke_style.value,
             sloppiness: self.sloppiness.value,
@@ -304,6 +310,7 @@ impl ElementSnapshot {
         self.rotation.assign(element.transform.rotation, metadata);
         self.stroke.assign(element.style.stroke, metadata);
         self.fill.assign(element.style.fill, metadata);
+        self.fill_style.assign(element.style.fill_style, metadata);
         self.stroke_width
             .assign(element.style.stroke_width, metadata);
         self.stroke_style
@@ -333,6 +340,7 @@ impl ElementSnapshot {
                 style: Style {
                     stroke: self.stroke.value,
                     fill: self.fill.value,
+                    fill_style: self.fill_style.value,
                     stroke_width: self.stroke_width.value,
                     stroke_style: self.stroke_style.value,
                     sloppiness: self.sloppiness.value,
@@ -581,6 +589,9 @@ impl CrdtDocument {
                 }
                 if let Some(fill) = style.fill {
                     state.fill.assign(fill, metadata);
+                }
+                if let Some(fill_style) = style.fill_style {
+                    state.fill_style.assign(fill_style, metadata);
                 }
                 if let Some(stroke_width) = style.stroke_width {
                     state.stroke_width.assign(stroke_width, metadata);
@@ -860,6 +871,7 @@ fn state_metadata(state: &ElementSnapshot) -> impl Iterator<Item = RegisterMetad
             state.rotation.metadata,
             state.stroke.metadata,
             state.fill.metadata,
+            state.fill_style.metadata,
             state.stroke_width.metadata,
             state.stroke_style.metadata,
             state.sloppiness.metadata,

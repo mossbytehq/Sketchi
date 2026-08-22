@@ -15,6 +15,9 @@ pub(crate) enum GpuError {
     /// The selected adapter could not create a device and queue.
     #[error("could not create GPU device: {0}")]
     Device(String),
+    /// The adapter did not expose a usable framebuffer format.
+    #[error("could not choose a compatible framebuffer format: {0}")]
+    SurfaceFormat(String),
     /// The surface has no supported configuration for the selected adapter.
     #[error("GPU adapter does not support the Sketchi window surface")]
     UnsupportedSurface,
@@ -91,9 +94,12 @@ impl GpuState {
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
             }))
             .map_err(|error| GpuError::Device(error.to_string()))?;
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, dimensions.0, dimensions.1)
             .ok_or(GpuError::UnsupportedSurface)?;
+        config.format =
+            egui_wgpu::preferred_framebuffer_format(&surface.get_capabilities(&adapter).formats)
+                .map_err(|error| GpuError::SurfaceFormat(error.to_string()))?;
         surface.configure(&device, &config);
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,

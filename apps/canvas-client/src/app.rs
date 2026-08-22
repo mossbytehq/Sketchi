@@ -25,7 +25,7 @@ use crate::editor::Editor;
 use crate::gpu::GpuState;
 use crate::lucide_icons;
 use crate::storage;
-use crate::supervisor::LocalServer;
+use crate::supervisor::{LocalServer, ReadyMessage};
 use crate::tools::{Tool, ToolController};
 use crate::ui::WorkspaceUi;
 use crate::window_state::WindowState;
@@ -309,6 +309,27 @@ impl ApplicationHandler for DesktopApplication {
             self.handle_settings_window_event(event_loop, &event);
             return;
         }
+        if matches!(&event, WindowEvent::CloseRequested)
+            && self
+                .window
+                .as_ref()
+                .is_none_or(|window| window.id() != window_id)
+        {
+            if self.settings_window.is_some() {
+                tracing::info!(
+                    ?window_id,
+                    "closing settings window from secondary close request"
+                );
+                self.ui.close_settings();
+                self.close_settings_window();
+            } else {
+                tracing::warn!(
+                    ?window_id,
+                    "close requested for an unknown secondary window"
+                );
+            }
+            return;
+        }
         let paste_requested = matches!(
             &event,
             WindowEvent::KeyboardInput {
@@ -521,30 +542,64 @@ impl DesktopApplication {
     }
 
     fn handle_collaboration_action(&mut self, action: crate::ui::CollaborationAction) {
-        use crate::ui::CollaborationAction;
-
         let local_readiness = self
             .local_server
             .as_ref()
             .map(|server| server.readiness().clone());
-        let intent = match action {
-            CollaborationAction::None => return,
+        let Some(intent) = self.collaboration_intent(action, local_readiness) else {
+            return;
+        };
+
+        let journal = match storage::open_journal(&self.settings_state.autosave_directory) {
+            Ok(journal) => journal,
+            Err(error) => {
+                self.collaboration_error = Some(format!("Could not open sync journal: {error}"));
+                return;
+            }
+        };
+        match CollaborationClient::start(self.editor.client_id(), journal, intent) {
+            Ok(collaboration) => {
+                self.collaboration = Some(collaboration);
+                self.collaboration_error = None;
+            }
+            Err(error) => self.collaboration_error = Some(error.to_string()),
+        }
+    }
+
+    fn collaboration_intent(
+        &mut self,
+        action: crate::ui::CollaborationAction,
+        local_readiness: Option<ReadyMessage>,
+    ) -> Option<CollaborationIntent> {
+        use crate::ui::CollaborationAction;
+
+        match action {
+            CollaborationAction::None => None,
+            CollaborationAction::CancelRoom => {
+                let collaboration = self.collaboration.as_mut()?;
+                if let Err(error) = collaboration.cancel_room() {
+                    self.collaboration_error = Some(error.to_string());
+                } else {
+                    self.collaboration_error = None;
+                }
+                None
+            }
             CollaborationAction::Create { display_name } => {
                 let Some(display_name) = normalized_display_name(&display_name) else {
                     self.collaboration_error =
                         Some(String::from("A display name is required to create a room."));
-                    return;
+                    return None;
                 };
-                let Some(readiness) = local_readiness.clone() else {
+                let Some(readiness) = local_readiness else {
                     self.collaboration_error = Some(String::from(
                         "The local collaboration server is unavailable.",
                     ));
-                    return;
+                    return None;
                 };
-                CollaborationIntent::Create {
+                Some(CollaborationIntent::Create {
                     readiness,
                     display_name,
-                }
+                })
             }
             CollaborationAction::Join {
                 invite_token,
@@ -555,13 +610,13 @@ impl DesktopApplication {
                 let Some(display_name) = normalized_display_name(&display_name) else {
                     self.collaboration_error =
                         Some(String::from("A display name is required to join a room."));
-                    return;
+                    return None;
                 };
                 let invite = match parse_room_invite(&invite_token) {
                     Ok(invite) => invite,
                     Err(error) => {
                         self.collaboration_error = Some(error.to_string());
-                        return;
+                        return None;
                     }
                 };
                 let endpoint = invite
@@ -582,31 +637,16 @@ impl DesktopApplication {
                     Ok(readiness) => readiness,
                     Err(error) => {
                         self.collaboration_error = Some(error.to_string());
-                        return;
+                        return None;
                     }
                 };
-                CollaborationIntent::Join {
+                Some(CollaborationIntent::Join {
                     room_id: invite.room_id,
                     capability_token: invite.capability_token,
                     readiness,
                     display_name,
-                }
+                })
             }
-        };
-
-        let journal = match storage::open_journal(&self.settings_state.autosave_directory) {
-            Ok(journal) => journal,
-            Err(error) => {
-                self.collaboration_error = Some(format!("Could not open sync journal: {error}"));
-                return;
-            }
-        };
-        match CollaborationClient::start(self.editor.client_id(), journal, intent) {
-            Ok(collaboration) => {
-                self.collaboration = Some(collaboration);
-                self.collaboration_error = None;
-            }
-            Err(error) => self.collaboration_error = Some(error.to_string()),
         }
     }
 
@@ -710,6 +750,13 @@ impl DesktopApplication {
                 None,
                 None,
             );
+            let repaint_window = Arc::downgrade(&window);
+            self.settings_egui
+                .set_request_repaint_callback(move |_info| {
+                    if let Some(window) = repaint_window.upgrade() {
+                        window.request_redraw();
+                    }
+                });
             match GpuState::new(window.clone(), &self.wgpu_instance) {
                 Ok(gpu) => {
                     lucide_icons::install(&self.settings_egui);
@@ -739,10 +786,13 @@ impl DesktopApplication {
     }
 
     fn close_settings_window(&mut self) {
+        let settings_window = self.settings_window.take();
         self.settings_egui_state = None;
         self.settings_gpu = None;
-        self.settings_window = None;
         self.settings_first_frame_logged = false;
+        if let Some(window) = settings_window {
+            window.set_visible(false);
+        }
         if let Some(main_window) = &self.window {
             main_window.request_redraw();
         }
@@ -752,6 +802,16 @@ impl DesktopApplication {
         let Some(window) = self.settings_window.clone() else {
             return;
         };
+        if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
+            tracing::info!(
+                window_id = ?window.id(),
+                ?event,
+                "settings window closing"
+            );
+            self.ui.close_settings();
+            self.close_settings_window();
+            return;
+        }
         let paste_requested = matches!(
             event,
             WindowEvent::KeyboardInput {
@@ -767,12 +827,11 @@ impl DesktopApplication {
                 egui_state.on_window_event(window.as_ref(), event).repaint
             }
         });
+        let pointer_activation = matches!(
+            event,
+            WindowEvent::MouseInput { .. } | WindowEvent::Touch { .. }
+        );
         match event {
-            WindowEvent::CloseRequested => {
-                tracing::info!("settings window close requested");
-                self.ui.close_settings();
-                self.close_settings_window();
-            }
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = &mut self.settings_gpu {
                     gpu.resize(size.width, size.height);
@@ -788,7 +847,7 @@ impl DesktopApplication {
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => self.render_settings_window(event_loop),
-            _ if repaint => {
+            _ if repaint || pointer_activation => {
                 window.request_redraw();
                 if let Some(main_window) = &self.window {
                     main_window.request_redraw();
@@ -1108,6 +1167,10 @@ fn should_request_redraw(
     drop_event: bool,
 ) -> bool {
     (egui_repaint && !matches!(event, WindowEvent::RedrawRequested))
+        || matches!(
+            event,
+            WindowEvent::MouseInput { .. } | WindowEvent::Touch { .. }
+        )
         || paste_requested
         || drop_event
 }

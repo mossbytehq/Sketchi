@@ -35,7 +35,7 @@ fn hello_has_a_stable_versioned_json_shape() {
     let json = String::from_utf8(encoded).unwrap();
     assert_eq!(
         json,
-        r#"{"protocol_version":2,"message":{"type":"hello","client_id":"00000000-0000-0000-0000-000000000001","client_name":"Ada"}}"#
+        r#"{"protocol_version":3,"message":{"type":"hello","client_id":"00000000-0000-0000-0000-000000000001","client_name":"Ada"}}"#
     );
     assert_eq!(decode_client(json.as_bytes()).unwrap(), message);
 }

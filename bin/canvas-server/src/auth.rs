@@ -15,7 +15,7 @@ impl CapabilityToken {
     #[must_use]
     pub fn generate() -> Self {
         Self {
-            secret: format!("{}{}", Uuid::new_v4(), Uuid::new_v4()),
+            secret: Uuid::new_v4().to_string(),
         }
     }
 

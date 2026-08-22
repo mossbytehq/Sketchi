@@ -26,8 +26,9 @@ pub use crdt::{
 };
 pub use document::Document;
 pub use element::{
-    Color, EdgeStyle, Element, ElementKind, EmbeddedImage, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION,
-    MAX_IMAGE_PIXELS, Sloppiness, StrokeStyle, Style, StylePatch, TextAlign, TextFontFamily,
+    Color, EdgeStyle, Element, ElementKind, EmbeddedImage, FillStyle, MAX_IMAGE_BYTES,
+    MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS, Sloppiness, StrokeStyle, Style, StylePatch, TextAlign,
+    TextFontFamily,
 };
 pub use error::CrdtError;
 pub use geometry::{Point, Rect, Size, Transform};

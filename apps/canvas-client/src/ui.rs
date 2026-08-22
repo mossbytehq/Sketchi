@@ -4,11 +4,12 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::mpsc::{Receiver, TryRecvError},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use canvas_core::{
     ClientId, Color, Document, EdgeStyle, EditorCommand, Element, ElementId, ElementKind,
-    EmbeddedImage, Point, Size, Sloppiness, StrokeStyle, Style, StylePatch, TextAlign,
+    EmbeddedImage, FillStyle, Point, Size, Sloppiness, StrokeStyle, Style, StylePatch, TextAlign,
     TextFontFamily, Transform,
 };
 use canvas_protocol::{PresenceState, ToolKind};
@@ -26,8 +27,8 @@ use self::settings_ui::{settings_palette_row, settings_visuals};
 use crate::{
     components::{
         STANDARD_CONTROL_SIZE, button, color_picker_editor, color_picker_trigger, color_swatch,
-        color_swatch_preview, dropdown_field_sized, numeric_field, numeric_field_with_decimals,
-        range_slider, sized_text_field, themed_checkbox,
+        dropdown_field_sized, numeric_field, numeric_field_with_decimals, range_slider,
+        sized_text_field, themed_checkbox,
     },
     connection::{CollaborationView, format_room_invite},
     editor::Editor,
@@ -271,6 +272,8 @@ const COLOR_PICKER_COLORS: [Color32; 15] = [
     Color32::from_rgb(255, 201, 201),
     Color32::from_rgb(221, 214, 254),
 ];
+const COLOR_PICKER_SHADE_FACTORS: [f32; 5] = [0.65, 0.8, 1.0, 1.15, 1.3];
+const COLOR_PICKER_BASE_SHADE_INDEX: usize = 2;
 
 /// Immediate-mode UI state for the desktop whiteboard workspace.
 #[allow(clippy::struct_excessive_bools)]
@@ -324,6 +327,8 @@ pub(crate) struct WorkspaceUi {
     text_edit: Option<TextEditState>,
     color_picker: Option<ColorPickerTarget>,
     color_picker_detail: Option<()>,
+    color_picker_hex: String,
+    color_picker_hex_target: Option<ColorPickerTarget>,
     clipboard: Option<arboard::Clipboard>,
     clipboard_paste_requested: Option<()>,
     drop_hovered: Option<()>,
@@ -396,6 +401,8 @@ pub(crate) enum CollaborationAction {
         /// Display name advertised to collaborators.
         display_name: String,
     },
+    /// Cancel the currently hosted collaboration room.
+    CancelRoom,
     /// Join a room using the entered room ID and capability token.
     Join {
         /// Room ID text entered by the user.
@@ -443,6 +450,19 @@ struct ImageTexture {
 enum ColorPickerTarget {
     Stroke,
     Fill,
+    LightCanvas,
+    DarkCanvas,
+    LightPalette(usize),
+    DarkPalette(usize),
+}
+
+impl ColorPickerTarget {
+    const fn is_settings(self) -> bool {
+        matches!(
+            self,
+            Self::LightCanvas | Self::DarkCanvas | Self::LightPalette(_) | Self::DarkPalette(_)
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -964,6 +984,8 @@ impl Default for WorkspaceUi {
             text_edit: None,
             color_picker: None,
             color_picker_detail: None,
+            color_picker_hex: String::new(),
+            color_picker_hex_target: None,
             clipboard: None,
             clipboard_paste_requested: None,
             drop_hovered: None,
@@ -1315,6 +1337,12 @@ impl WorkspaceUi {
     pub(crate) fn close_settings(&mut self) {
         self.settings_open = false;
         self.capturing_keybind = None;
+        if self
+            .color_picker
+            .is_some_and(ColorPickerTarget::is_settings)
+        {
+            self.close_color_picker();
+        }
     }
 
     fn toggle_settings(&mut self) {
@@ -1323,6 +1351,18 @@ impl WorkspaceUi {
         } else {
             self.settings_open = true;
         }
+    }
+
+    fn open_color_picker(&mut self, target: ColorPickerTarget) {
+        self.color_picker = Some(target);
+        self.color_picker_detail = target.is_settings().then_some(());
+        self.color_picker_hex_target = None;
+    }
+
+    fn close_color_picker(&mut self) {
+        self.color_picker = None;
+        self.color_picker_detail = None;
+        self.color_picker_hex_target = None;
     }
 
     fn reset_drawing_style(&mut self) {
@@ -1432,7 +1472,12 @@ impl WorkspaceUi {
         self.show_tool_palette(ui.ctx(), tools);
         self.show_history(ui.ctx(), editor);
         self.show_properties(ui.ctx(), editor);
-        self.show_color_picker(ui.ctx(), editor);
+        if !self
+            .color_picker
+            .is_some_and(ColorPickerTarget::is_settings)
+        {
+            self.show_color_picker(ui.ctx(), editor);
+        }
         self.show_zoom_controls(ui.ctx(), camera);
         self.show_status(ui.ctx(), editor, camera);
         collaboration_action
@@ -2976,6 +3021,15 @@ impl WorkspaceUi {
         }
     }
 
+    fn update_draft_palette_color(&mut self, previous: Color32, next: Color32) {
+        if self.selected.is_empty() && to_color32(self.draft_style.stroke) == previous {
+            let stroke = to_core_color(next);
+            self.draft_style.stroke = stroke;
+            self.new_object_style.stroke = stroke;
+            self.drawing_style_loaded = true;
+        }
+    }
+
     fn set_keybind(&mut self, action: KeybindAction, binding: KeyBinding) {
         self.keybinds.set_binding(action, binding);
     }
@@ -3264,8 +3318,7 @@ impl WorkspaceUi {
         self.selected.clear();
         self.selection_gesture = None;
         self.text_edit = None;
-        self.color_picker = None;
-        self.color_picker_detail = None;
+        self.close_color_picker();
         tools.set_tool(tool);
         self.status = format!("{} tool selected", tool_name(tool));
     }
@@ -3348,6 +3401,8 @@ impl WorkspaceUi {
         let mut action = CollaborationAction::None;
         let room_id = collaboration.room_id.clone();
         let capability_token = collaboration.capability_token.clone();
+        let creator_token = collaboration.creator_token.clone();
+        let token_expires_at_epoch = collaboration.token_expires_at_epoch;
         let endpoint = collaboration.endpoint.clone();
         let certificate_sha256 = collaboration.certificate_sha256.clone();
         let display_name_valid =
@@ -3405,47 +3460,101 @@ impl WorkspaceUi {
         };
         let has_custom_endpoint = !self.collaboration_endpoint.trim().is_empty()
             || !self.collaboration_certificate_sha256.trim().is_empty();
+        let room_active =
+            popup == CollaborationPopup::Create && room_id.is_some() && creator_token.is_some();
         let mut copy_invite_clicked = false;
         let popup_response = egui::Area::new(Id::new("sketchi.collaboration_popup"))
             .anchor(Align2::RIGHT_TOP, egui::vec2(-16.0, 76.0))
             .order(egui::Order::Foreground)
             .show(context, |ui| {
                 collaboration_popover_frame(self.dark_mode).show(ui, |ui| {
-                    ui.set_min_width(304.0);
+                    ui.set_width(320.0);
                     collaboration_popup_scope(ui, self.dark_mode, |ui| {
                         ui.spacing_mut().item_spacing.y = 8.0;
-                        let title = match popup {
-                            CollaborationPopup::Create => "Create room",
-                            CollaborationPopup::Join => "Join room",
+                        let title = match (popup, room_active) {
+                            (CollaborationPopup::Create, true) => "Room active",
+                            (CollaborationPopup::Create, false) => "Create room",
+                            (CollaborationPopup::Join, _) => "Join room",
                         };
-                        ui.label(
-                            egui::RichText::new(title)
-                                .size(16.0)
-                                .strong()
-                                .color(text_color(self.dark_mode)),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(title)
+                                    .size(16.0)
+                                    .strong()
+                                    .color(text_color(self.dark_mode)),
+                            );
+                            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                                if room_active
+                                    && collaboration_secondary_icon_button(
+                                        ui,
+                                        Icon::CircleStop,
+                                        self.dark_mode,
+                                    )
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("Cancel collaboration room")
+                                    .clicked()
+                                {
+                                    action = CollaborationAction::CancelRoom;
+                                    self.collaboration_popup = None;
+                                }
+                            });
+                        });
                         match popup {
                             CollaborationPopup::Create => {
                                 collaboration_description(
                                     ui,
-                                    "Choose the name others will see.",
+                                    if room_active {
+                                        "You are hosting this room."
+                                    } else {
+                                        "Choose the name others will see."
+                                    },
                                     self.dark_mode,
                                 );
-                                collaboration_text_field(
-                                    ui,
-                                    &mut self.collaboration_display_name,
-                                    "Your display name",
-                                    self.dark_mode,
-                                );
+                                ui.add_enabled_ui(!room_active, |ui| {
+                                    collaboration_text_field(
+                                        ui,
+                                        &mut self.collaboration_display_name,
+                                        "Your display name",
+                                        self.dark_mode,
+                                    );
+                                });
                                 if !display_name_valid && room_id.is_none() {
                                     collaboration_required_name_message(ui, self.dark_mode);
                                 }
                                 if let (Some(room_id), Some(token)) = (&room_id, &capability_token)
                                 {
                                     ui.separator();
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("Share invite")
+                                                .strong()
+                                                .color(text_color(self.dark_mode)),
+                                        );
+                                        if let Some(expires_at_epoch) = token_expires_at_epoch {
+                                            let expired =
+                                                expires_at_epoch <= current_epoch_seconds();
+                                            ui.with_layout(
+                                                Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.small(
+                                                        egui::RichText::new(
+                                                            collaboration_token_expiry_label(
+                                                                expires_at_epoch,
+                                                            ),
+                                                        )
+                                                        .color(if expired {
+                                                            Color32::from_rgb(220, 80, 80)
+                                                        } else {
+                                                            muted_color(self.dark_mode)
+                                                        }),
+                                                    );
+                                                },
+                                            );
+                                        }
+                                    });
                                     collaboration_description(
                                         ui,
-                                        "Share this invite with collaborators.",
+                                        "Copy this invite to let others join the room.",
                                         self.dark_mode,
                                     );
                                     let invite = format_room_invite(
@@ -3496,18 +3605,27 @@ impl WorkspaceUi {
                                             }
                                         }
                                     });
-                                    if let Some(endpoint) = &endpoint {
-                                        ui.small(
-                                            egui::RichText::new(endpoint)
-                                                .color(muted_color(self.dark_mode)),
-                                        );
+                                    if token_expires_at_epoch.is_some() {
+                                        context.request_repaint_after(Duration::from_secs(1));
                                     }
-                                    if let Some(pin) = &certificate_sha256 {
-                                        ui.collapsing("Advanced connection details", |ui| {
-                                            ui.small(
-                                                egui::RichText::new(pin)
-                                                    .color(muted_color(self.dark_mode)),
-                                            );
+                                    if endpoint.is_some() || certificate_sha256.is_some() {
+                                        ui.collapsing("Connection details", |ui| {
+                                            if let Some(endpoint) = &endpoint {
+                                                collaboration_detail_row(
+                                                    ui,
+                                                    "Server",
+                                                    endpoint,
+                                                    self.dark_mode,
+                                                );
+                                            }
+                                            if let Some(pin) = &certificate_sha256 {
+                                                collaboration_detail_row(
+                                                    ui,
+                                                    "Certificate pin",
+                                                    pin,
+                                                    self.dark_mode,
+                                                );
+                                            }
                                         });
                                     }
                                 } else if ui
@@ -3909,19 +4027,27 @@ impl WorkspaceUi {
                                     );
                                 });
                                 ui.add_space(8.0);
-                                settings_color_row(
+                                if settings_color_row(
                                     ui,
                                     "Light background color",
                                     self.light_canvas_color,
                                     self.dark_mode,
-                                );
+                                )
+                                .clicked()
+                                {
+                                    self.open_color_picker(ColorPickerTarget::LightCanvas);
+                                }
                                 ui.add_space(8.0);
-                                settings_color_row(
+                                if settings_color_row(
                                     ui,
                                     "Dark background color",
                                     self.dark_canvas_color,
                                     self.dark_mode,
-                                );
+                                )
+                                .clicked()
+                                {
+                                    self.open_color_picker(ColorPickerTarget::DarkCanvas);
+                                }
                             });
                             ui.add_space(12.0);
                             settings_group_frame(self.dark_mode).show(ui, |ui| {
@@ -3932,19 +4058,23 @@ impl WorkspaceUi {
                                         .color(text_color(self.dark_mode)),
                                 );
                                 ui.add_space(8.0);
-                                settings_palette_row(
+                                if let Some(index) = settings_palette_row(
                                     ui,
                                     "Light Mode",
                                     &self.light_palette,
                                     self.dark_mode,
-                                );
+                                ) {
+                                    self.open_color_picker(ColorPickerTarget::LightPalette(index));
+                                }
                                 ui.add_space(10.0);
-                                settings_palette_row(
+                                if let Some(index) = settings_palette_row(
                                     ui,
                                     "Dark Mode",
                                     &self.dark_palette,
                                     self.dark_mode,
-                                );
+                                ) {
+                                    self.open_color_picker(ColorPickerTarget::DarkPalette(index));
+                                }
                             });
                         }
                         SettingsPage::Keybinds => {
@@ -4258,27 +4388,27 @@ impl WorkspaceUi {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Min),
                                         |ui| {
-                                            if update_check_button(
-                                                ui,
-                                                if self.update_checking {
-                                                    "Checking…"
-                                                } else if self.update_installing {
-                                                    "Installing…"
-                                                } else {
-                                                    "Check now"
-                                                },
-                                                Vec2::new(110.0, STANDARD_CONTROL_SIZE.y),
-                                                if self.dark_mode {
-                                                    SETTINGS_CONTROL_DARK
-                                                } else {
-                                                    Color32::from_rgb(245, 246, 249)
-                                                },
-                                                self.update_checking,
-                                            )
-                                            .clicked()
-                                            {
-                                                self.start_update_check();
-                                            }
+                                            ui.add_enabled_ui(!self.update_installing, |ui| {
+                                                if update_check_button(
+                                                    ui,
+                                                    if self.update_checking {
+                                                        "Checking…"
+                                                    } else {
+                                                        "Check now"
+                                                    },
+                                                    Vec2::new(110.0, STANDARD_CONTROL_SIZE.y),
+                                                    if self.dark_mode {
+                                                        SETTINGS_CONTROL_DARK
+                                                    } else {
+                                                        Color32::from_rgb(245, 246, 249)
+                                                    },
+                                                    self.update_checking,
+                                                )
+                                                .clicked()
+                                                {
+                                                    self.start_update_check();
+                                                }
+                                            });
                                         },
                                     );
                                 });
@@ -4379,6 +4509,12 @@ impl WorkspaceUi {
                 );
                     });
 
+        if self
+            .color_picker
+            .is_some_and(ColorPickerTarget::is_settings)
+        {
+            self.show_color_picker(ui.ctx(), editor);
+        }
         ui.ctx().set_visuals(sketchi_visuals(self.dark_mode));
         self.settings_page = selected_page;
     }
@@ -4551,6 +4687,20 @@ impl WorkspaceUi {
                     .next()
                     .and_then(|id| document.element(*id))
                     .is_some_and(|element| element.kind == ElementKind::Freehand));
+        let no_fill_properties =
+            matches!(self.active_tool, Tool::Freehand | Tool::Line | Tool::Arrow)
+                || (self.selected.len() == 1
+                    && self
+                        .selected
+                        .iter()
+                        .next()
+                        .and_then(|id| document.element(*id))
+                        .is_some_and(|element| {
+                            matches!(
+                                element.kind,
+                                ElementKind::Freehand | ElementKind::Line | ElementKind::Arrow
+                            )
+                        }));
         let stroke_preset_limit = stroke_preset_count();
         let panel_height = (context.content_rect().height() - 104.0).max(280.0);
         egui::Area::new(Id::new("sketchi.properties"))
@@ -4886,7 +5036,7 @@ impl WorkspaceUi {
                                         }
                                     });
 
-                                    if !freehand_properties {
+                                    if !no_fill_properties {
                                         ui.add_space(10.0);
                                         section_label(ui, "Background", self.dark_mode);
                                         ui.horizontal_wrapped(|ui| {
@@ -4935,34 +5085,72 @@ impl WorkspaceUi {
                                         });
                                     }
 
-                                    ui.add_space(10.0);
-                                    section_label(ui, "Fill", self.dark_mode);
-                                    ui.horizontal(|ui| {
-                                        if property_choice(
-                                            ui,
-                                            Icon::FillNone,
-                                            "None",
-                                            style.fill.is_none(),
-                                            self.dark_mode,
-                                        )
-                                        .clicked()
-                                        {
-                                            patch = fill_choice_patch(style.fill, false);
-                                            changed = true;
-                                        }
-                                        if property_choice(
-                                            ui,
-                                            Icon::FillSolid,
-                                            "Solid",
-                                            style.fill.is_some(),
-                                            self.dark_mode,
-                                        )
-                                        .clicked()
-                                        {
-                                            patch = fill_choice_patch(style.fill, true);
-                                            changed = true;
-                                        }
-                                    });
+                                    if !no_fill_properties {
+                                        ui.add_space(10.0);
+                                        section_label(ui, "Fill", self.dark_mode);
+                                        ui.horizontal(|ui| {
+                                            if property_choice(
+                                                ui,
+                                                Icon::FillNone,
+                                                "None",
+                                                style.fill.is_none(),
+                                                self.dark_mode,
+                                            )
+                                            .clicked()
+                                            {
+                                                patch = fill_choice_patch(style.fill, false);
+                                                changed = true;
+                                            }
+                                            if property_choice(
+                                                ui,
+                                                Icon::FillSolid,
+                                                "Solid",
+                                                style.fill.is_some_and(|_| {
+                                                    style.fill_style == FillStyle::Solid
+                                                }),
+                                                self.dark_mode,
+                                            )
+                                            .clicked()
+                                            {
+                                                patch = fill_choice_patch(style.fill, true);
+                                                changed = true;
+                                            }
+                                            if property_choice(
+                                                ui,
+                                                Icon::FillHachure,
+                                                "Hatch",
+                                                style.fill.is_some_and(|_| {
+                                                    style.fill_style == FillStyle::Hachure
+                                                }),
+                                                self.dark_mode,
+                                            )
+                                            .clicked()
+                                            {
+                                                patch = pattern_fill_choice_patch(
+                                                    style.fill,
+                                                    FillStyle::Hachure,
+                                                );
+                                                changed = true;
+                                            }
+                                            if property_choice(
+                                                ui,
+                                                Icon::FillCrossHatch,
+                                                "Cross",
+                                                style.fill.is_some_and(|_| {
+                                                    style.fill_style == FillStyle::CrossHatch
+                                                }),
+                                                self.dark_mode,
+                                            )
+                                            .clicked()
+                                            {
+                                                patch = pattern_fill_choice_patch(
+                                                    style.fill,
+                                                    FillStyle::CrossHatch,
+                                                );
+                                                changed = true;
+                                            }
+                                        });
+                                    }
 
                                     ui.add_space(10.0);
                                     section_label(ui, "Stroke width", self.dark_mode);
@@ -5195,12 +5383,10 @@ impl WorkspaceUi {
             });
 
         if let Some(target) = color_target {
-            self.color_picker = Some(target);
-            self.color_picker_detail = None;
+            self.open_color_picker(target);
         }
         if changed {
-            self.color_picker = None;
-            self.color_picker_detail = None;
+            self.close_color_picker();
             self.apply_style_patch(context, editor, patch);
         }
         if let Some(action) = layer_action {
@@ -5238,88 +5424,124 @@ impl WorkspaceUi {
             ColorPickerTarget::Fill => style
                 .fill
                 .map_or(Color32::from_rgb(221, 214, 254), to_color32),
+            ColorPickerTarget::LightCanvas => self.light_canvas_color,
+            ColorPickerTarget::DarkCanvas => self.dark_canvas_color,
+            ColorPickerTarget::LightPalette(index) => self
+                .light_palette
+                .get(index)
+                .copied()
+                .unwrap_or(Color32::WHITE),
+            ColorPickerTarget::DarkPalette(index) => self
+                .dark_palette
+                .get(index)
+                .copied()
+                .unwrap_or(Color32::WHITE),
         };
+        let settings_only = target.is_settings();
+        if self.color_picker_hex_target != Some(target) {
+            self.color_picker_hex = format_hex_color(current);
+            self.color_picker_hex_target = Some(target);
+        }
         let mut picked = None;
         let mut close_after_pick = false;
         let mut picker_rect = Rect::NOTHING;
         let mut detail_rect = Rect::NOTHING;
         let mut detail_open = self.color_picker_detail.is_some();
-        egui::Area::new(Id::new("sketchi.color_picker"))
-            .fixed_pos(egui::pos2(306.0, 76.0))
-            .order(egui::Order::Tooltip)
-            .show(context, |ui| {
-                let frame = egui::Frame::new()
-                    .fill(if self.dark_mode {
-                        DARK_PANEL
-                    } else {
-                        LIGHT_PANEL
-                    })
-                    .stroke(Stroke::new(
-                        1.0_f32,
-                        if self.dark_mode {
-                            DARK_BORDER
+        if !settings_only {
+            egui::Area::new(Id::new("sketchi.color_picker"))
+                .fixed_pos(egui::pos2(306.0, 76.0))
+                .order(egui::Order::Tooltip)
+                .show(context, |ui| {
+                    let frame = egui::Frame::new()
+                        .fill(if self.dark_mode {
+                            DARK_PANEL
                         } else {
-                            LIGHT_BORDER
-                        },
-                    ))
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(Margin::same(14))
-                    .show(ui, |ui| {
-                        ui.set_width(236.0);
-                        ui.label(
-                            egui::RichText::new("Colors")
-                                .size(13.0)
-                                .strong()
-                                .color(text_color(self.dark_mode)),
-                        );
-                        ui.add_space(10.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = Vec2::splat(6.0);
-                            let transparent_selected = match target {
-                                ColorPickerTarget::Stroke => current.a() == 0,
-                                ColorPickerTarget::Fill => style.fill.is_none(),
-                            };
-                            if color_swatch(ui, None, transparent_selected, self.dark_mode)
-                                .on_hover_text("Transparent")
-                                .clicked()
-                            {
-                                picked = Some(Color32::TRANSPARENT);
-                                close_after_pick = true;
-                            }
-                            for color in COLOR_PICKER_COLORS {
-                                if color_swatch(ui, Some(color), color == current, self.dark_mode)
+                            LIGHT_PANEL
+                        })
+                        .stroke(Stroke::new(
+                            1.0_f32,
+                            if self.dark_mode {
+                                DARK_BORDER
+                            } else {
+                                LIGHT_BORDER
+                            },
+                        ))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::same(14))
+                        .show(ui, |ui| {
+                            ui.set_width(236.0);
+                            ui.label(
+                                egui::RichText::new("Colors")
+                                    .size(13.0)
+                                    .strong()
+                                    .color(text_color(self.dark_mode)),
+                            );
+                            ui.add_space(10.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = Vec2::splat(6.0);
+                                let transparent_selected = if target == ColorPickerTarget::Fill {
+                                    style.fill.is_none()
+                                } else {
+                                    current.a() == 0
+                                };
+                                if color_swatch(ui, None, transparent_selected, self.dark_mode)
+                                    .on_hover_text("Transparent")
                                     .clicked()
                                 {
-                                    picked = Some(color);
+                                    picked = Some(Color32::TRANSPARENT);
                                     close_after_pick = true;
                                 }
-                            }
-                        });
-                        ui.add_space(14.0);
-                        section_label(ui, "Shades", self.dark_mode);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            for factor in [0.65_f32, 0.8, 1.0, 1.15, 1.3] {
-                                let color = shade_color(current, factor);
-                                if color_swatch(ui, Some(color), color == current, self.dark_mode)
+                                for color in COLOR_PICKER_COLORS {
+                                    if color_swatch(
+                                        ui,
+                                        Some(color),
+                                        color == current,
+                                        self.dark_mode,
+                                    )
                                     .clicked()
-                                {
-                                    picked = Some(color);
-                                    close_after_pick = true;
+                                    {
+                                        picked = Some(color);
+                                        close_after_pick = true;
+                                    }
                                 }
+                            });
+                            ui.add_space(14.0);
+                            section_label(ui, "Shades", self.dark_mode);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                for (index, factor) in
+                                    COLOR_PICKER_SHADE_FACTORS.into_iter().enumerate()
+                                {
+                                    let color = shade_color(current, factor);
+                                    if color_swatch(
+                                        ui,
+                                        Some(color),
+                                        index == COLOR_PICKER_BASE_SHADE_INDEX,
+                                        self.dark_mode,
+                                    )
+                                    .clicked()
+                                    {
+                                        picked = Some(color);
+                                        close_after_pick = true;
+                                    }
+                                }
+                            });
+                            ui.add_space(14.0);
+                            section_label(ui, "Color picker", self.dark_mode);
+                            if color_picker_trigger(ui, current, self.dark_mode).clicked() {
+                                detail_open = !detail_open;
                             }
                         });
-                        ui.add_space(14.0);
-                        section_label(ui, "Color picker", self.dark_mode);
-                        if color_picker_trigger(ui, current, self.dark_mode).clicked() {
-                            detail_open = !detail_open;
-                        }
-                    });
-                picker_rect = frame.response.rect;
-            });
+                    picker_rect = frame.response.rect;
+                });
+        }
 
         if detail_open {
-            let detail_position = picker_rect.right_top() + Vec2::new(8.0, 0.0);
+            let detail_position = if settings_only {
+                egui::pos2(244.0, 76.0)
+            } else {
+                picker_rect.right_top() + Vec2::new(8.0, 0.0)
+            };
             egui::Area::new(Id::new("sketchi.color_picker.detail"))
                 .fixed_pos(detail_position)
                 .order(egui::Order::Tooltip)
@@ -5344,39 +5566,35 @@ impl WorkspaceUi {
                             ui.set_width(178.0);
                             let mut picker_color = current;
                             if color_picker_editor(ui, &mut picker_color, self.dark_mode) {
+                                self.color_picker_hex = format_hex_color(picker_color);
                                 picked = Some(picker_color);
                             }
                             ui.add_space(10.0);
                             ui.horizontal(|ui| {
-                                let (preview, _) =
-                                    ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
-                                ui.painter().rect_filled(
-                                    preview,
-                                    CornerRadius::same(4),
-                                    picker_color,
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let hex_response = sized_text_field(
+                                    ui,
+                                    &mut self.color_picker_hex,
+                                    Vec2::new(130.0, STANDARD_CONTROL_SIZE.y),
+                                    "#RRGGBB",
                                 );
-                                ui.painter().rect_stroke(
-                                    preview,
-                                    CornerRadius::same(4),
-                                    Stroke::new(
-                                        1.0_f32,
-                                        if self.dark_mode {
-                                            DARK_BORDER
-                                        } else {
-                                            LIGHT_BORDER
-                                        },
-                                    ),
-                                    StrokeKind::Inside,
-                                );
-                                let [red, green, blue, _] = picker_color.to_array();
-                                ui.vertical(|ui| {
-                                    ui.label(format!("#{red:02x}{green:02x}{blue:02x}"));
-                                    ui.label(
-                                        egui::RichText::new(format!("rgb({red}, {green}, {blue})"))
-                                            .small()
-                                            .color(text_color(self.dark_mode)),
-                                    );
-                                });
+                                if hex_response.changed()
+                                    && let Some(color) = parse_hex_color(&self.color_picker_hex)
+                                {
+                                    picker_color = color;
+                                    picked = Some(color);
+                                }
+                                if collaboration_secondary_icon_button(
+                                    ui,
+                                    Icon::Clipboard,
+                                    self.dark_mode,
+                                )
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .on_hover_text("Copy color")
+                                .clicked()
+                                {
+                                    context.copy_text(format_hex_color(picker_color));
+                                }
                             });
                         });
                     detail_rect = frame.response.rect;
@@ -5384,8 +5602,12 @@ impl WorkspaceUi {
         }
 
         if let Some(color) = picked {
-            let patch = color_picker_patch(target, color);
-            self.apply_style_patch(context, editor, patch);
+            if target.is_settings() {
+                self.apply_settings_color(target, color);
+            } else {
+                let patch = color_picker_patch(target, color);
+                self.apply_style_patch(context, editor, patch);
+            }
         }
         let outside_click = context.input(|input| {
             input.pointer.any_pressed()
@@ -5397,7 +5619,7 @@ impl WorkspaceUi {
             || outside_click
             || close_after_pick
         {
-            self.color_picker = None;
+            self.close_color_picker();
             detail_open = false;
         }
         self.color_picker_detail = detail_open.then_some(());
@@ -5471,6 +5693,32 @@ impl WorkspaceUi {
                 || String::from("Style updated"),
                 |error| format!("Could not update style: {error}"),
             );
+        }
+    }
+
+    fn apply_settings_color(&mut self, target: ColorPickerTarget, color: Color32) {
+        match target {
+            ColorPickerTarget::LightCanvas => self.light_canvas_color = color,
+            ColorPickerTarget::DarkCanvas => self.dark_canvas_color = color,
+            ColorPickerTarget::LightPalette(index) => {
+                let previous = self.light_palette.get(index).copied();
+                if let Some(slot) = self.light_palette.get_mut(index) {
+                    *slot = color;
+                }
+                if let Some(previous) = previous {
+                    self.update_draft_palette_color(previous, color);
+                }
+            }
+            ColorPickerTarget::DarkPalette(index) => {
+                let previous = self.dark_palette.get(index).copied();
+                if let Some(slot) = self.dark_palette.get_mut(index) {
+                    *slot = color;
+                }
+                if let Some(previous) = previous {
+                    self.update_draft_palette_color(previous, color);
+                }
+            }
+            ColorPickerTarget::Stroke | ColorPickerTarget::Fill => {}
         }
     }
 
@@ -6024,7 +6272,7 @@ fn settings_color_row(
                 .truncate()
                 .halign(egui::Align::LEFT),
         );
-        color_swatch_preview(ui, Some(color), false, dark_mode)
+        color_swatch(ui, Some(color), false, dark_mode)
     })
     .inner
 }
@@ -6305,6 +6553,22 @@ fn collaboration_description(ui: &mut egui::Ui, text: &str, dark_mode: bool) {
     );
 }
 
+fn collaboration_detail_row(ui: &mut egui::Ui, label: &str, value: &str, dark_mode: bool) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            egui::RichText::new(format!("{label}:"))
+                .size(11.0)
+                .color(muted_color(dark_mode)),
+        );
+        ui.label(
+            egui::RichText::new(value)
+                .size(10.0)
+                .family(egui::FontFamily::Monospace)
+                .color(muted_color(dark_mode)),
+        );
+    });
+}
+
 fn collaboration_required_name_message(ui: &mut egui::Ui, dark_mode: bool) {
     ui.small(
         egui::RichText::new("A display name is required.").color(if dark_mode {
@@ -6326,6 +6590,29 @@ fn collaboration_invite_field_width(available_width: f32) -> f32 {
 fn collaboration_invite_preview(room_id: &str, capability_token: &str) -> String {
     let token_preview = capability_token.chars().take(8).collect::<String>();
     format!("{room_id}:{token_preview}")
+}
+
+fn current_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn collaboration_token_expiry_label(expires_at_epoch: u64) -> String {
+    let remaining = expires_at_epoch.saturating_sub(current_epoch_seconds());
+    if remaining == 0 {
+        return String::from("Invite expired");
+    }
+    let hours = remaining / 3_600;
+    let minutes = remaining / 60 % 60;
+    let seconds = remaining % 60;
+    if hours > 0 {
+        format!("Invite expires in {hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        format!("Invite expires in {minutes}m {seconds:02}s")
+    } else {
+        format!("Invite expires in {seconds}s")
+    }
 }
 
 fn collaboration_invite_field(
@@ -7161,6 +7448,55 @@ fn shade_color(color: Color32, factor: f32) -> Color32 {
     )
 }
 
+fn format_hex_color(color: Color32) -> String {
+    let [red, green, blue, alpha] = color.to_array();
+    if alpha == u8::MAX {
+        format!("#{red:02x}{green:02x}{blue:02x}")
+    } else {
+        format!("#{red:02x}{green:02x}{blue:02x}{alpha:02x}")
+    }
+}
+
+fn parse_hex_color(value: &str) -> Option<Color32> {
+    let value = value.trim().strip_prefix('#').unwrap_or(value);
+    let expand = |digit: u8| digit | digit << 4;
+    let parse_digit = |digit: u8| match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
+    };
+    match value.as_bytes() {
+        [red, green, blue] => Some(Color32::from_rgba_unmultiplied(
+            expand(parse_digit(*red)?),
+            expand(parse_digit(*green)?),
+            expand(parse_digit(*blue)?),
+            u8::MAX,
+        )),
+        [red, green, blue, alpha] => Some(Color32::from_rgba_unmultiplied(
+            expand(parse_digit(*red)?),
+            expand(parse_digit(*green)?),
+            expand(parse_digit(*blue)?),
+            expand(parse_digit(*alpha)?),
+        )),
+        bytes if bytes.len() == 6 || bytes.len() == 8 => {
+            let parse_byte =
+                |digits: &[u8]| u8::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok();
+            let mut bytes = bytes.chunks_exact(2);
+            let red = parse_byte(bytes.next()?)?;
+            let green = parse_byte(bytes.next()?)?;
+            let blue = parse_byte(bytes.next()?)?;
+            let alpha = if value.len() == 8 {
+                parse_byte(bytes.next()?)?
+            } else {
+                u8::MAX
+            };
+            Some(Color32::from_rgba_unmultiplied(red, green, blue, alpha))
+        }
+        _ => None,
+    }
+}
+
 fn paint_dot_grid(painter: &Painter, canvas: Rect, camera: Camera, dark_mode: bool) {
     let step = grid_step_for_zoom(camera.zoom());
     let top_left = camera.screen_to_world(Point::new(canvas.left(), canvas.top()));
@@ -7411,6 +7747,7 @@ fn full_style_patch(style: Style) -> StylePatch {
     StylePatch {
         stroke: Some(style.stroke),
         fill: Some(style.fill),
+        fill_style: Some(style.fill_style),
         stroke_width: Some(style.stroke_width),
         stroke_style: Some(style.stroke_style),
         sloppiness: Some(style.sloppiness),
@@ -7456,6 +7793,99 @@ fn paint_text_edit_preview(painter: &Painter, text_edit: &TextEditState, camera:
     painter.line_segment([caret_start, caret_end], Stroke::new(1.2_f32, color));
 }
 
+fn paint_fill_pattern(painter: &Painter, fill_style: FillStyle, color: Color32, points: &[Pos2]) {
+    if fill_style == FillStyle::Solid || color.a() == 0 || points.len() < 3 {
+        return;
+    }
+
+    let Some(first) = points.first().copied() else {
+        return;
+    };
+    let bounds = points
+        .iter()
+        .fold(Rect::from_min_max(first, first), |bounds, point| {
+            Rect::from_min_max(bounds.min.min(*point), bounds.max.max(*point))
+        });
+    let height = bounds.height();
+    let width = bounds.width();
+    if height <= f32::EPSILON || width <= f32::EPSILON {
+        return;
+    }
+
+    let spacing = 10.0;
+    let mut offset = -height;
+    while offset <= width {
+        if fill_style == FillStyle::CrossHatch {
+            let down_start = Pos2::new(bounds.left() + offset, bounds.top());
+            let down_end = Pos2::new(bounds.left() + offset + height, bounds.bottom());
+            paint_clipped_pattern_segment(painter, down_start, down_end, points, color);
+        }
+
+        let up_start = Pos2::new(bounds.left() + offset, bounds.bottom());
+        let up_end = Pos2::new(bounds.left() + offset + height, bounds.top());
+        paint_clipped_pattern_segment(painter, up_start, up_end, points, color);
+        offset += spacing;
+    }
+}
+
+fn paint_clipped_pattern_segment(
+    painter: &Painter,
+    start: Pos2,
+    end: Pos2,
+    polygon: &[Pos2],
+    color: Color32,
+) {
+    let Some([clipped_start, clipped_end]) = clip_segment_to_convex_polygon(start, end, polygon)
+    else {
+        return;
+    };
+    painter.line_segment([clipped_start, clipped_end], Stroke::new(1.0, color));
+}
+
+fn clip_segment_to_convex_polygon(start: Pos2, end: Pos2, polygon: &[Pos2]) -> Option<[Pos2; 2]> {
+    let signed_area = polygon
+        .iter()
+        .zip(polygon.iter().cycle().skip(1))
+        .take(polygon.len())
+        .map(|(from, to)| from.x * to.y - to.x * from.y)
+        .sum::<f32>();
+    let orientation = if signed_area >= 0.0 { 1.0 } else { -1.0 };
+    let direction = end - start;
+    let mut minimum: f32 = 0.0;
+    let mut maximum: f32 = 1.0;
+
+    for (edge_start, edge_end) in polygon
+        .iter()
+        .zip(polygon.iter().cycle().skip(1))
+        .take(polygon.len())
+    {
+        let edge = *edge_end - *edge_start;
+        let constant = orientation * cross(edge, start - *edge_start);
+        let slope = orientation * cross(edge, direction);
+        if slope.abs() <= f32::EPSILON {
+            if constant < 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let intersection = -constant / slope;
+        if slope > 0.0 {
+            minimum = minimum.max(intersection);
+        } else {
+            maximum = maximum.min(intersection);
+        }
+        if minimum > maximum {
+            return None;
+        }
+    }
+
+    Some([start + direction * minimum, start + direction * maximum])
+}
+
+fn cross(left: Vec2, right: Vec2) -> f32 {
+    left.x * right.y - left.y * right.x
+}
+
 #[allow(clippy::too_many_lines)]
 fn paint_element(
     painter: &Painter,
@@ -7477,9 +7907,14 @@ fn paint_element(
         (element.style.stroke_width * camera.zoom()).clamp(1.0, 12.0),
         stroke_color,
     );
-    let fill = element.style.fill.map_or(Color32::TRANSPARENT, |color| {
+    let fill_color = element.style.fill.map_or(Color32::TRANSPARENT, |color| {
         apply_opacity(to_color32(color), element.style.opacity)
     });
+    let fill = if element.style.fill_style == FillStyle::Solid {
+        fill_color
+    } else {
+        Color32::TRANSPARENT
+    };
     let corner_radius = corner_radius(element.style.edges, camera.zoom());
     match element.kind {
         ElementKind::Rectangle => {
@@ -7494,6 +7929,7 @@ fn paint_element(
                     fill,
                     Stroke::NONE,
                 ));
+                paint_fill_pattern(painter, element.style.fill_style, fill_color, &base_points);
                 paint_sloppiness_outline(
                     painter,
                     &base_points,
@@ -7510,6 +7946,7 @@ fn paint_element(
                     fill,
                     Stroke::NONE,
                 ));
+                paint_fill_pattern(painter, element.style.fill_style, fill_color, &base_points);
                 paint_sloppiness_outline(
                     painter,
                     &base_points,
@@ -7521,6 +7958,8 @@ fn paint_element(
                 );
             } else {
                 painter.rect_filled(rect, CornerRadius::same(corner_radius), fill);
+                let base_points = rounded_rect_points(rect, corner_radius);
+                paint_fill_pattern(painter, element.style.fill_style, fill_color, &base_points);
                 if element.style.stroke_style == StrokeStyle::Solid {
                     painter.rect_stroke(
                         rect,
@@ -7547,6 +7986,7 @@ fn paint_element(
                 fill,
                 Stroke::NONE,
             ));
+            paint_fill_pattern(painter, element.style.fill_style, fill_color, &base_points);
             paint_sloppiness_outline(
                 painter,
                 &base_points,
@@ -7564,6 +8004,7 @@ fn paint_element(
                 fill,
                 Stroke::NONE,
             ));
+            paint_fill_pattern(painter, element.style.fill_style, fill_color, &base_points);
             paint_sloppiness_outline(
                 painter,
                 &base_points,
@@ -7586,6 +8027,7 @@ fn paint_element(
                     fill,
                     Stroke::NONE,
                 ));
+                paint_fill_pattern(painter, element.style.fill_style, fill_color, &base_points);
                 paint_sloppiness_outline(
                     painter,
                     &base_points,
@@ -7602,6 +8044,7 @@ fn paint_element(
                     fill,
                     Stroke::NONE,
                 ));
+                paint_fill_pattern(painter, element.style.fill_style, fill_color, &base_points);
                 paint_sloppiness_outline(
                     painter,
                     &base_points,
@@ -7617,6 +8060,8 @@ fn paint_element(
                     rect.size() / 2.0,
                     fill,
                 ));
+                let base_points = ellipse_points(rect);
+                paint_fill_pattern(painter, element.style.fill_style, fill_color, &base_points);
                 if element.style.stroke_style == StrokeStyle::Solid {
                     painter.add(egui::Shape::ellipse_stroke(
                         rect.center(),
@@ -8698,6 +9143,15 @@ fn fill_choice_patch(current: Option<Color>, solid: bool) -> StylePatch {
         } else {
             None
         }),
+        fill_style: solid.then_some(FillStyle::Solid),
+        ..StylePatch::default()
+    }
+}
+
+fn pattern_fill_choice_patch(current: Option<Color>, fill_style: FillStyle) -> StylePatch {
+    StylePatch {
+        fill: Some(Some(current.unwrap_or(Color::rgb(221, 214, 254)))),
+        fill_style: Some(fill_style),
         ..StylePatch::default()
     }
 }
@@ -8716,6 +9170,10 @@ fn color_picker_patch(target: ColorPickerTarget, color: Color32) -> StylePatch {
             }),
             ..StylePatch::default()
         },
+        ColorPickerTarget::LightCanvas
+        | ColorPickerTarget::DarkCanvas
+        | ColorPickerTarget::LightPalette(_)
+        | ColorPickerTarget::DarkPalette(_) => StylePatch::default(),
     }
 }
 
@@ -8835,8 +9293,8 @@ fn zoom_delta_for_scroll(scroll_y: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use canvas_core::{
-        ClientId, Color, EditorCommand, Element, ElementId, ElementKind, EmbeddedImage, Point,
-        Size, Style, StylePatch, Transform,
+        ClientId, Color, EditorCommand, Element, ElementId, ElementKind, EmbeddedImage, FillStyle,
+        Point, Size, Style, StylePatch, Transform,
     };
     use egui::{Color32, CornerRadius, Key, Margin, Modifiers, Pos2, Rect, Stroke, Vec2};
 
@@ -8858,15 +9316,16 @@ mod tests {
         collaboration_participant_initial, collaboration_popup_should_dismiss,
         collaboration_primary_button, collaboration_text_field, color_picker_patch,
         confirmation_frame, custom_font_size_selected, delete_previous_word, fill_choice_patch,
-        grid_step_for_zoom, insert_text_at_cursor, insert_text_event, key_binding_label,
-        mossbyte_agency_credit_layout, next_char_cursor, next_word_cursor, next_z_index,
-        padded_selection_bounds, platform_label, preset_font_size_selected, previous_char_cursor,
-        previous_word_cursor, reordered_layer_ids, resolve_drop_screen_position,
-        rotated_text_origin, selection_drag_position, selection_handle_cursor_tolerance,
+        format_hex_color, grid_step_for_zoom, insert_text_at_cursor, insert_text_event,
+        key_binding_label, mossbyte_agency_credit_layout, next_char_cursor, next_word_cursor,
+        next_z_index, padded_selection_bounds, parse_hex_color, pattern_fill_choice_patch,
+        platform_label, preset_font_size_selected, previous_char_cursor, previous_word_cursor,
+        reordered_layer_ids, resolve_drop_screen_position, rotated_text_origin,
+        selection_drag_position, selection_handle_cursor_tolerance,
         selection_handle_drag_tolerance, settings_group_frame, settings_keybind_card_frame,
         settings_scroll_bar_visibility, settings_visuals, settings_window_frame,
         sloppiness_amplitude, sloppy_polyline, stroke_preset_count, text_create_command,
-        text_update_command, to_core_color, zoom_delta_for_scroll, zoom_percent,
+        text_update_command, to_color32, to_core_color, zoom_delta_for_scroll, zoom_percent,
     };
 
     use crate::selection::SelectionHandle;
@@ -9811,6 +10270,7 @@ mod tests {
             default_fill,
             StylePatch {
                 fill: Some(Some(Color::rgb(221, 214, 254))),
+                fill_style: Some(FillStyle::Solid),
                 ..StylePatch::default()
             }
         );
@@ -9818,6 +10278,7 @@ mod tests {
             existing_fill,
             StylePatch {
                 fill: Some(Some(Color::rgb(1, 2, 3))),
+                fill_style: Some(FillStyle::Solid),
                 ..StylePatch::default()
             }
         );
@@ -9825,6 +10286,21 @@ mod tests {
             clear_fill,
             StylePatch {
                 fill: Some(None),
+                fill_style: None,
+                ..StylePatch::default()
+            }
+        );
+    }
+
+    #[test]
+    fn patterned_fill_choice_preserves_color_and_sets_style() {
+        let patch = pattern_fill_choice_patch(Some(Color::rgb(1, 2, 3)), FillStyle::Hachure);
+
+        assert_eq!(
+            patch,
+            StylePatch {
+                fill: Some(Some(Color::rgb(1, 2, 3))),
+                fill_style: Some(FillStyle::Hachure),
                 ..StylePatch::default()
             }
         );
@@ -10076,6 +10552,44 @@ mod tests {
         let fill = color_picker_patch(ColorPickerTarget::Fill, Color32::TRANSPARENT);
         assert_eq!(fill.stroke, None);
         assert_eq!(fill.fill, Some(None));
+    }
+
+    #[test]
+    fn color_picker_hex_values_round_trip_short_and_full_forms() {
+        assert_eq!(
+            parse_hex_color("#abc"),
+            Some(Color32::from_rgb(0xaa, 0xbb, 0xcc))
+        );
+        assert_eq!(
+            parse_hex_color("#12345678"),
+            Some(Color32::from_rgba_unmultiplied(0x12, 0x34, 0x56, 0x78))
+        );
+        assert_eq!(
+            format_hex_color(Color32::from_rgb(0xab, 0xcd, 0xef)),
+            "#abcdef"
+        );
+        assert_eq!(parse_hex_color("#not-a-color"), None);
+    }
+
+    #[test]
+    fn settings_color_picker_updates_canvas_and_palette_colors() {
+        let mut workspace = WorkspaceUi::default();
+        let previous_palette_color = workspace.light_palette[2];
+        let next_canvas_color = Color32::from_rgb(12, 34, 56);
+        let next_palette_color = Color32::from_rgb(78, 90, 123);
+        workspace.draft_style.stroke = to_core_color(previous_palette_color);
+        workspace.new_object_style.stroke = to_core_color(previous_palette_color);
+
+        workspace.apply_settings_color(ColorPickerTarget::LightCanvas, next_canvas_color);
+        workspace.apply_settings_color(ColorPickerTarget::LightPalette(2), next_palette_color);
+
+        assert_eq!(workspace.light_canvas_color, next_canvas_color);
+        assert_eq!(workspace.light_palette[2], next_palette_color);
+        assert_eq!(to_color32(workspace.draft_style.stroke), next_palette_color);
+        assert_eq!(
+            to_color32(workspace.new_object_style.stroke),
+            next_palette_color
+        );
     }
 
     #[test]
