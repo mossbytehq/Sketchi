@@ -184,6 +184,7 @@ pub async fn run_reconnecting(
         connection_generation,
         mut shutdown,
     } = endpoints;
+    let mut last_error;
     loop {
         let connector = config.connector()?;
         let connection = tokio::select! {
@@ -193,29 +194,40 @@ pub async fn run_reconnecting(
                 return Ok(());
             }
         };
-        if let Ok((socket, _)) = connection {
-            let generation = connection_generation
-                .fetch_add(1, Ordering::AcqRel)
-                .wrapping_add(1);
-            backoff.on_connected();
-            match run_socket(
-                socket,
-                &mut outbound,
-                &inbound,
-                &handshake,
-                generation,
-                &mut shutdown,
-            )
-            .await
-            {
-                Ok(()) => return Ok(()),
-                Err(ConnectionError::Disconnected | ConnectionError::Transport(_)) => {
-                    connection_generation.fetch_add(1, Ordering::AcqRel);
+        match connection {
+            Ok((socket, _)) => {
+                let generation = connection_generation
+                    .fetch_add(1, Ordering::AcqRel)
+                    .wrapping_add(1);
+                backoff.on_connected();
+                match run_socket(
+                    socket,
+                    &mut outbound,
+                    &inbound,
+                    &handshake,
+                    generation,
+                    &mut shutdown,
+                )
+                .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(error)
+                        if matches!(
+                            error,
+                            ConnectionError::Disconnected | ConnectionError::Transport(_)
+                        ) =>
+                    {
+                        last_error = error;
+                        connection_generation.fetch_add(1, Ordering::AcqRel);
+                    }
+                    Err(error) => {
+                        connection_generation.fetch_add(1, Ordering::AcqRel);
+                        return Err(error);
+                    }
                 }
-                Err(error) => {
-                    connection_generation.fetch_add(1, Ordering::AcqRel);
-                    return Err(error);
-                }
+            }
+            Err(error) => {
+                last_error = ConnectionError::Transport(error);
             }
         }
         match backoff.on_disconnect() {
@@ -228,9 +240,10 @@ pub async fn run_reconnecting(
                     }
                 }
             }
-            ReconnectState::Exhausted { .. } => return Err(ConnectionError::ReconnectExhausted),
-            ReconnectState::Connected | ReconnectState::Disconnected => {
-                return Err(ConnectionError::ReconnectExhausted);
+            ReconnectState::Exhausted { .. }
+            | ReconnectState::Connected
+            | ReconnectState::Disconnected => {
+                return Err(last_error);
             }
         }
     }
@@ -501,6 +514,8 @@ pub struct CollaborationView {
     pub participants: Vec<Participant>,
     /// Current ephemeral cursor, selection, and tool state for each participant.
     pub presence: Vec<PresenceState>,
+    /// Whether the current transport connection completed room synchronization.
+    pub synchronized: bool,
 }
 
 impl CollaborationView {
@@ -518,6 +533,7 @@ impl CollaborationView {
             server_available,
             participants: Vec::new(),
             presence: Vec::new(),
+            synchronized: false,
         }
     }
 }
@@ -792,6 +808,7 @@ impl CollaborationClient {
                 })
                 .collect(),
             presence: self.presence.values().cloned().collect(),
+            synchronized: self.is_synchronized_for_current_connection(),
         }
     }
 
@@ -1113,6 +1130,11 @@ impl CollaborationClient {
         self.status = message;
     }
 
+    /// Clears a session whose transport task has stopped so the user can retry.
+    pub fn reset_after_connection_failure(&mut self, status: &str) {
+        self.reset_room_state(status);
+    }
+
     fn next_request_id(&mut self) -> u64 {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.saturating_add(1).max(1);
@@ -1287,6 +1309,39 @@ mod tests {
             Err(ConnectionError::ReconnectExhausted)
         ));
         assert_eq!(client.status, "reconnect attempts exhausted");
+    }
+
+    #[test]
+    fn pending_join_view_is_not_marked_as_synchronized() {
+        let room_id = RoomId::from_u128(7);
+        let Some((mut client, _)) = test_client(Some(room_id)) else {
+            return;
+        };
+        client.sync_generation = None;
+
+        let view = client.view();
+
+        assert_eq!(view.room_id, Some(room_id.to_string()));
+        assert!(!view.synchronized);
+
+        client.connection_generation.store(1, Ordering::Release);
+        client.sync_generation = Some(1);
+        assert!(client.view().synchronized);
+    }
+
+    #[test]
+    fn connection_failure_clears_pending_join_for_retry() {
+        let room_id = RoomId::from_u128(7);
+        let Some((mut client, _)) = test_client(Some(room_id)) else {
+            return;
+        };
+        client.sync_generation = None;
+
+        client.reset_after_connection_failure("WebSocket transport failed");
+
+        assert_eq!(client.room_id(), None);
+        assert_eq!(client.status, "WebSocket transport failed");
+        assert!(!client.view().synchronized);
     }
 
     #[test]
@@ -1507,6 +1562,26 @@ mod tests {
             return;
         };
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reconnecting_runtime_reports_the_last_transport_error() {
+        let (channels, endpoints) = bounded_channels();
+        let config_result = ConnectionConfig::new("ws://127.0.0.1:9", None);
+        assert!(config_result.is_ok(), "test endpoint must be valid");
+        let Ok(config) = config_result else {
+            return;
+        };
+        let backoff = ReconnectBackoff::new(Duration::from_millis(1), Duration::from_millis(1), 1);
+        assert!(backoff.is_ok(), "test backoff must be valid");
+        let Ok(backoff) = backoff else {
+            return;
+        };
+
+        let result = run_reconnecting(config, endpoints, backoff).await;
+
+        assert!(matches!(result, Err(ConnectionError::Transport(_))));
+        channels.shutdown.cancel();
     }
 
     #[test]

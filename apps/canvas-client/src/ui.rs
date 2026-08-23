@@ -3658,8 +3658,10 @@ impl WorkspaceUi {
             || !self.collaboration_certificate_sha256.trim().is_empty();
         let room_active =
             popup == CollaborationPopup::Create && room_id.is_some() && creator_token.is_some();
-        let joined_room =
-            popup == CollaborationPopup::Join && room_id.is_some() && creator_token.is_none();
+        let joined_room = popup == CollaborationPopup::Join
+            && collaboration.synchronized
+            && room_id.is_some()
+            && creator_token.is_none();
         let mut copy_invite_clicked = false;
         let popup_response = egui::Area::new(Id::new("sketchi.collaboration_popup"))
             .anchor(Align2::RIGHT_TOP, egui::vec2(-16.0, 76.0))

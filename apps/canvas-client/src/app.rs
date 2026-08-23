@@ -647,7 +647,11 @@ impl DesktopApplication {
             match collaboration.poll() {
                 Ok(messages) => messages,
                 Err(error) => {
-                    self.report_collaboration_error(error.to_string());
+                    let message = error.to_string();
+                    if let Some(collaboration) = self.collaboration.as_mut() {
+                        collaboration.reset_after_connection_failure(&message);
+                    }
+                    self.report_collaboration_error(message);
                     return true;
                 }
             }
