@@ -317,6 +317,51 @@ fn triangle_create_survives_crdt_and_snapshot_round_trip() {
 }
 
 #[test]
+fn polygon_creates_survive_crdt_and_snapshot_round_trip() {
+    let mut document = CrdtDocument::new();
+    for (counter, (element_id, element, expected_kind)) in [
+        (
+            1,
+            (
+                ElementId::from_u128(24),
+                Element::pentagon(
+                    ElementId::from_u128(24),
+                    Transform::new(Point::new(10.0, 20.0), Size::new(80.0, 60.0)),
+                ),
+                ElementKind::Pentagon,
+            ),
+        ),
+        (
+            2,
+            (
+                ElementId::from_u128(25),
+                Element::hexagon(
+                    ElementId::from_u128(25),
+                    Transform::new(Point::new(100.0, 20.0), Size::new(80.0, 60.0)),
+                ),
+                ElementKind::Hexagon,
+            ),
+        ),
+    ] {
+        document
+            .apply(&operation(
+                1,
+                counter,
+                counter,
+                OperationKind::Create { element },
+            ))
+            .unwrap();
+        assert_eq!(
+            document.document().element(element_id).unwrap().kind,
+            expected_kind
+        );
+    }
+
+    let restored = CrdtDocument::from_snapshot(document.snapshot()).unwrap();
+    assert_eq!(restored.document(), document.document());
+}
+
+#[test]
 fn sequential_operations_and_duplicates_are_safe() {
     let element_id = ElementId::from_u128(7);
     let create = operation(

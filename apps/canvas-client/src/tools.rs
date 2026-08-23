@@ -1,6 +1,6 @@
 //! Pointer tools that translate input into editor commands.
 
-use canvas_core::{EditorCommand, Element, ElementId, ElementKind, Point, Size, Transform};
+use canvas_core::{EditorCommand, Element, ElementId, ElementKind, Point, Rect, Size, Transform};
 use canvas_protocol::{ClientMessage, MAX_STROKE_CHUNK_POINTS, RoomId, StrokeId};
 use thiserror::Error;
 
@@ -17,12 +17,24 @@ pub enum Tool {
     Diamond,
     /// Create triangles.
     Triangle,
+    /// Create pentagons.
+    Pentagon,
+    /// Create hexagons.
+    Hexagon,
     /// Create ellipses.
     Ellipse,
     /// Create lines.
     Line,
+    /// Create lines that bend clockwise from start to end.
+    CurvedLineClockwise,
+    /// Create lines that bend counter-clockwise from start to end.
+    CurvedLineCounterClockwise,
     /// Create arrows.
     Arrow,
+    /// Create arrows that bend clockwise from start to end.
+    CurvedArrowClockwise,
+    /// Create arrows that bend counter-clockwise from start to end.
+    CurvedArrowCounterClockwise,
     /// Create freehand paths.
     Freehand,
     /// Pan the camera.
@@ -151,6 +163,7 @@ pub struct ToolController {
     start: Option<Point>,
     last: Option<Point>,
     points: Vec<Point>,
+    canvas_bounds: Option<Rect>,
 }
 
 impl ToolController {
@@ -164,6 +177,7 @@ impl ToolController {
             start: None,
             last: None,
             points: Vec::new(),
+            canvas_bounds: None,
         }
     }
 
@@ -180,6 +194,11 @@ impl ToolController {
         } else {
             0.5
         };
+    }
+
+    /// Sets the currently visible world-space canvas bounds for curved tools.
+    pub fn set_canvas_bounds(&mut self, bounds: Rect) {
+        self.canvas_bounds = Some(bounds);
     }
 
     /// Returns the active tool.
@@ -254,6 +273,18 @@ impl ToolController {
                 start,
                 end,
             )),
+            Tool::Pentagon => Some(shape_from_drag(
+                element_id,
+                ElementKind::Pentagon,
+                start,
+                end,
+            )),
+            Tool::Hexagon => Some(shape_from_drag(
+                element_id,
+                ElementKind::Hexagon,
+                start,
+                end,
+            )),
             Tool::Ellipse => Some(shape_from_drag(
                 element_id,
                 ElementKind::Ellipse,
@@ -261,7 +292,39 @@ impl ToolController {
                 end,
             )),
             Tool::Line => Some(line_from_drag(element_id, ElementKind::Line, start, end)),
+            Tool::CurvedLineClockwise => Some(curved_path_from_drag(
+                element_id,
+                ElementKind::Line,
+                start,
+                end,
+                true,
+                self.canvas_bounds,
+            )),
+            Tool::CurvedLineCounterClockwise => Some(curved_path_from_drag(
+                element_id,
+                ElementKind::Line,
+                start,
+                end,
+                false,
+                self.canvas_bounds,
+            )),
             Tool::Arrow => Some(line_from_drag(element_id, ElementKind::Arrow, start, end)),
+            Tool::CurvedArrowClockwise => Some(curved_path_from_drag(
+                element_id,
+                ElementKind::Arrow,
+                start,
+                end,
+                true,
+                self.canvas_bounds,
+            )),
+            Tool::CurvedArrowCounterClockwise => Some(curved_path_from_drag(
+                element_id,
+                ElementKind::Arrow,
+                start,
+                end,
+                false,
+                self.canvas_bounds,
+            )),
             Tool::Freehand => {
                 let mut points = self.points.clone();
                 if points.last().copied() != Some(end) {
@@ -322,6 +385,8 @@ fn shape_from_drag(id: ElementId, kind: ElementKind, start: Point, end: Point) -
         ElementKind::Rectangle
             | ElementKind::Diamond
             | ElementKind::Triangle
+            | ElementKind::Pentagon
+            | ElementKind::Hexagon
             | ElementKind::Ellipse
     ) {
         Size::new(width.max(MIN_SHAPE_SIZE), height.max(MIN_SHAPE_SIZE))
@@ -332,6 +397,8 @@ fn shape_from_drag(id: ElementId, kind: ElementKind, start: Point, end: Point) -
     match kind {
         ElementKind::Diamond => Element::diamond(id, transform),
         ElementKind::Triangle => Element::triangle(id, transform),
+        ElementKind::Pentagon => Element::pentagon(id, transform),
+        ElementKind::Hexagon => Element::hexagon(id, transform),
         _ => Element::new(id, kind, transform),
     }
 }
@@ -347,6 +414,65 @@ fn line_from_drag(id: ElementId, kind: ElementKind, start: Point, end: Point) ->
             Size::new((start.x - end.x).abs(), (start.y - end.y).abs()),
         ),
         vec![start, end],
+    )
+}
+
+const CURVED_PATH_SEGMENTS: u16 = 24;
+const CURVED_PATH_BEND: f32 = 0.35;
+
+fn curved_path_from_drag(
+    id: ElementId,
+    kind: ElementKind,
+    start: Point,
+    end: Point,
+    clockwise: bool,
+    canvas_bounds: Option<Rect>,
+) -> Element {
+    let direction = Point::new(end.x - start.x, end.y - start.y);
+    let length = (direction.x * direction.x + direction.y * direction.y).sqrt();
+    if length <= f32::EPSILON {
+        return line_from_drag(id, kind, start, end);
+    }
+
+    let midpoint = Point::new(f32::midpoint(start.x, end.x), f32::midpoint(start.y, end.y));
+    let perpendicular = Point::new(-direction.y / length, direction.x / length);
+    let bend_direction = if clockwise { -1.0 } else { 1.0 };
+    let control = Point::new(
+        midpoint.x + perpendicular.x * length * CURVED_PATH_BEND * bend_direction,
+        midpoint.y + perpendicular.y * length * CURVED_PATH_BEND * bend_direction,
+    );
+    let control = canvas_bounds.map_or(control, |bounds| {
+        let max = bounds.max();
+        Point::new(
+            control.x.clamp(bounds.min.x, max.x),
+            control.y.clamp(bounds.min.y, max.y),
+        )
+    });
+    let points = (0..=CURVED_PATH_SEGMENTS)
+        .map(|index| {
+            let t = f32::from(index) / f32::from(CURVED_PATH_SEGMENTS);
+            let inverse = 1.0 - t;
+            Point::new(
+                inverse * inverse * start.x + 2.0 * inverse * t * control.x + t * t * end.x,
+                inverse * inverse * start.y + 2.0 * inverse * t * control.y + t * t * end.y,
+            )
+        })
+        .collect::<Vec<_>>();
+    let position = Point::new(
+        points
+            .iter()
+            .map(|point| point.x)
+            .fold(f32::INFINITY, f32::min),
+        points
+            .iter()
+            .map(|point| point.y)
+            .fold(f32::INFINITY, f32::min),
+    );
+    Element::with_points(
+        id,
+        kind,
+        Transform::new(position, bounds_size(&points)),
+        points,
     )
 }
 
@@ -366,4 +492,63 @@ fn bounds_size(points: &[Point]) -> Size {
         },
     );
     Size::new(max_x - min_x, max_y - min_y)
+}
+
+#[cfg(test)]
+mod tests {
+    use canvas_core::{ElementId, ElementKind, Point, Rect, Size};
+
+    use super::{Tool, ToolController};
+
+    #[test]
+    fn curved_arrows_bend_on_opposite_sides() {
+        let start = Point::new(0.0, 0.0);
+        let end = Point::new(100.0, 0.0);
+        let mut clockwise = ToolController::new(Tool::CurvedArrowClockwise);
+        clockwise.pointer_down(ElementId::from_u128(1), start);
+        clockwise.pointer_move(end);
+        let clockwise_preview = clockwise.preview();
+
+        let mut counter_clockwise = ToolController::new(Tool::CurvedArrowCounterClockwise);
+        counter_clockwise.pointer_down(ElementId::from_u128(2), start);
+        counter_clockwise.pointer_move(end);
+        let counter_clockwise_preview = counter_clockwise.preview();
+
+        assert!(clockwise_preview.as_ref().is_some_and(|preview| {
+            preview.points.len() == 25
+                && preview.points.get(12).is_some_and(|point| point.y < 0.0)
+                && preview.points.first() == Some(&start)
+                && preview.points.last() == Some(&end)
+        }));
+        assert!(counter_clockwise_preview.as_ref().is_some_and(|preview| {
+            preview.points.len() == 25
+                && preview.points.get(12).is_some_and(|point| point.y > 0.0)
+                && preview.points.first() == Some(&start)
+                && preview.points.last() == Some(&end)
+        }));
+    }
+
+    #[test]
+    fn curved_arrow_bend_is_clamped_to_visible_canvas_bounds() {
+        let mut tool = ToolController::new(Tool::CurvedArrowCounterClockwise);
+        tool.set_canvas_bounds(Rect::new(Point::new(0.0, 0.0), Size::new(100.0, 20.0)));
+        tool.pointer_down(ElementId::from_u128(3), Point::new(0.0, 0.0));
+        tool.pointer_move(Point::new(100.0, 0.0));
+
+        assert!(
+            tool.preview()
+                .is_some_and(|preview| preview.points.iter().all(|point| point.y <= 20.0))
+        );
+    }
+
+    #[test]
+    fn curved_line_tools_keep_line_geometry_without_arrowheads() {
+        let mut tool = ToolController::new(Tool::CurvedLineClockwise);
+        tool.pointer_down(ElementId::from_u128(4), Point::new(0.0, 0.0));
+        tool.pointer_move(Point::new(100.0, 0.0));
+
+        assert!(tool.preview().is_some_and(|preview| {
+            preview.kind == ElementKind::Line && preview.points.len() == 25
+        }));
+    }
 }

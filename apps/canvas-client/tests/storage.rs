@@ -2,7 +2,7 @@
 
 use canvas_client::storage::{
     Journal, StorageError, journal_path, load_document, load_document_from_path, open_journal,
-    save_document,
+    save_document, save_document_to_path,
 };
 use canvas_core::{
     ClientId, Element, ElementId, LamportTimestamp, Operation, OperationId, OperationKind, Point,
@@ -146,6 +146,30 @@ fn document_files_load_from_an_explicit_path() {
     std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
 
     assert_eq!(load_document_from_path(&path).unwrap(), document);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn named_document_files_can_be_saved_independently() {
+    let directory = std::env::temp_dir().join(format!(
+        "sketchi-storage-save-as-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let first_path = directory.join("first-canvas.json");
+    let second_path = directory.join("second-canvas.json");
+    let mut replica = canvas_core::CrdtDocument::new();
+    replica.apply(&operation()).unwrap();
+    let document = replica.document();
+
+    save_document_to_path(&first_path, &document).unwrap();
+    save_document_to_path(&second_path, &document).unwrap();
+
+    assert_eq!(load_document_from_path(&first_path).unwrap(), document);
+    assert_eq!(load_document_from_path(&second_path).unwrap(), document);
     std::fs::remove_dir_all(directory).unwrap();
 }
 

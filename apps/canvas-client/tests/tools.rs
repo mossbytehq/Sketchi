@@ -73,6 +73,23 @@ fn triangle_tool_commits_a_triangle_element() {
 }
 
 #[test]
+fn polygon_tools_commit_their_matching_element_kinds() {
+    for (element_id, tool, expected_kind) in [
+        (14, Tool::Pentagon, ElementKind::Pentagon),
+        (15, Tool::Hexagon, ElementKind::Hexagon),
+    ] {
+        let mut tools = ToolController::new(tool);
+        tools.pointer_down(ElementId::from_u128(element_id), Point::new(100.0, 100.0));
+        let output = tools.pointer_up(Point::new(40.0, 20.0)).unwrap();
+        let ToolOutput::Command(EditorCommand::Create(element)) = output else {
+            panic!("polygon tool did not create an element");
+        };
+        assert_eq!(element.kind, expected_kind);
+        assert_eq!(element.transform.size, canvas_core::Size::new(60.0, 80.0));
+    }
+}
+
+#[test]
 fn triangle_tool_keeps_a_flat_drag_renderable() {
     let element_id = ElementId::from_u128(13);
     let mut tools = ToolController::new(Tool::Triangle);

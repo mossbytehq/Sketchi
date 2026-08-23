@@ -6,6 +6,7 @@ use std::{
 };
 
 use canvas_core::ClientId;
+use canvas_protocol::ServerMessage;
 use canvas_renderer::Camera;
 use thiserror::Error;
 use winit::{
@@ -14,7 +15,7 @@ use winit::{
     event::{ElementState, KeyEvent, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
-    window::{Icon as WindowIcon, Theme, Window, WindowButtons, WindowId},
+    window::{Icon as WindowIcon, Theme, Window, WindowId},
 };
 
 use crate::connection::{
@@ -26,6 +27,7 @@ use crate::gpu::GpuState;
 use crate::lucide_icons;
 use crate::storage;
 use crate::supervisor::{LocalServer, ReadyMessage};
+use crate::toast::ToastKind;
 use crate::tools::{Tool, ToolController};
 use crate::ui::WorkspaceUi;
 use crate::window_state::WindowState;
@@ -153,16 +155,11 @@ impl DesktopShell {
         } else {
             Editor::new(ClientId::new())
         };
-        let settings_egui = egui::Context::default();
         let mut application = DesktopApplication {
             window: None,
             gpu: None,
             egui_state: None,
             egui,
-            settings_window: None,
-            settings_gpu: None,
-            settings_egui_state: None,
-            settings_egui,
             wgpu_instance,
             local_server,
             ui,
@@ -170,7 +167,6 @@ impl DesktopShell {
             tools: ToolController::new(Tool::Select),
             camera: Camera::default(),
             first_frame_logged: false,
-            settings_first_frame_logged: false,
             window_state: saved_window_state,
             window_state_dirty: false,
             settings_state,
@@ -179,6 +175,7 @@ impl DesktopShell {
             autosave_retry_at: None,
             modifiers: ModifiersState::default(),
             collaboration: None,
+            collaboration_created_room: false,
             collaboration_error: local_server_error,
         };
         let result = event_loop.run_app(&mut application);
@@ -194,10 +191,6 @@ struct DesktopApplication {
     gpu: Option<GpuState>,
     egui_state: Option<egui_winit::State>,
     egui: egui::Context,
-    settings_window: Option<Arc<Window>>,
-    settings_gpu: Option<GpuState>,
-    settings_egui_state: Option<egui_winit::State>,
-    settings_egui: egui::Context,
     wgpu_instance: wgpu::Instance,
     local_server: Option<LocalServer>,
     ui: WorkspaceUi,
@@ -205,7 +198,6 @@ struct DesktopApplication {
     tools: ToolController,
     camera: Camera,
     first_frame_logged: bool,
-    settings_first_frame_logged: bool,
     window_state: Option<WindowState>,
     window_state_dirty: bool,
     settings_state: settings::Settings,
@@ -214,6 +206,7 @@ struct DesktopApplication {
     autosave_retry_at: Option<Instant>,
     modifiers: ModifiersState,
     collaboration: Option<CollaborationClient>,
+    collaboration_created_room: bool,
     collaboration_error: Option<String>,
 }
 
@@ -295,40 +288,11 @@ impl ApplicationHandler for DesktopApplication {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        window_id: WindowId,
+        _window_id: WindowId,
         event: WindowEvent,
     ) {
         if let WindowEvent::ModifiersChanged(modifiers) = &event {
             self.modifiers = modifiers.state();
-        }
-        if self
-            .settings_window
-            .as_ref()
-            .is_some_and(|window| window.id() == window_id)
-        {
-            self.handle_settings_window_event(event_loop, &event);
-            return;
-        }
-        if matches!(&event, WindowEvent::CloseRequested)
-            && self
-                .window
-                .as_ref()
-                .is_none_or(|window| window.id() != window_id)
-        {
-            if self.settings_window.is_some() {
-                tracing::info!(
-                    ?window_id,
-                    "closing settings window from secondary close request"
-                );
-                self.ui.close_settings();
-                self.close_settings_window();
-            } else {
-                tracing::warn!(
-                    ?window_id,
-                    "close requested for an unknown secondary window"
-                );
-            }
-            return;
         }
         let paste_requested = matches!(
             &event,
@@ -382,9 +346,6 @@ impl ApplicationHandler for DesktopApplication {
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
-                if let Some(window) = &self.settings_window {
-                    window.request_redraw();
-                }
             }
             WindowEvent::RedrawRequested => {
                 let Some(window) = self.window.clone() else {
@@ -421,10 +382,12 @@ impl ApplicationHandler for DesktopApplication {
                     }
                     self.flush_collaboration_operations();
                 });
+                if self.ui.take_toast_repaint_request() {
+                    window.request_redraw();
+                }
                 self.sync_window_state_preferences();
                 self.sync_settings_preferences();
                 self.maybe_autosave();
-                self.sync_settings_window(event_loop);
                 if let Some(egui_state) = &mut self.egui_state {
                     egui_state.handle_platform_output(
                         window.as_ref(),
@@ -475,21 +438,20 @@ impl ApplicationHandler for DesktopApplication {
         if collaboration_changed && let Some(window) = &self.window {
             window.request_redraw();
         }
-        if self.ui.poll_update_check() {
-            if let Some(window) = &self.settings_window {
-                window.request_redraw();
-            }
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+        if self.ui.take_toast_repaint_request()
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
         }
-        if self.ui.poll_update_install() {
-            if let Some(window) = &self.settings_window {
-                window.request_redraw();
-            }
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+        if self.ui.poll_update_check()
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+        if self.ui.poll_update_install()
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
         }
         if self.ui.take_update_restart_request() {
             event_loop.exit();
@@ -530,6 +492,13 @@ impl ApplicationHandler for DesktopApplication {
 }
 
 impl DesktopApplication {
+    fn report_collaboration_error(&mut self, error: impl Into<String>) {
+        let message = error.into();
+        self.ui
+            .notify(ToastKind::Error, "Collaboration error", message.clone());
+        self.collaboration_error = Some(message);
+    }
+
     fn collaboration_view(&self) -> CollaborationView {
         let mut view = self.collaboration.as_ref().map_or_else(
             || CollaborationView::disconnected(self.local_server.is_some()),
@@ -549,20 +518,25 @@ impl DesktopApplication {
         let Some(intent) = self.collaboration_intent(action, local_readiness) else {
             return;
         };
+        let creating_room = matches!(&intent, CollaborationIntent::Create { .. });
 
         let journal = match storage::open_journal(&self.settings_state.autosave_directory) {
             Ok(journal) => journal,
             Err(error) => {
-                self.collaboration_error = Some(format!("Could not open sync journal: {error}"));
+                self.report_collaboration_error(format!("Could not open sync journal: {error}"));
                 return;
             }
         };
         match CollaborationClient::start(self.editor.client_id(), journal, intent) {
             Ok(collaboration) => {
                 self.collaboration = Some(collaboration);
+                self.collaboration_created_room = creating_room;
                 self.collaboration_error = None;
             }
-            Err(error) => self.collaboration_error = Some(error.to_string()),
+            Err(error) => {
+                self.collaboration_created_room = false;
+                self.report_collaboration_error(error.to_string());
+            }
         }
     }
 
@@ -578,22 +552,38 @@ impl DesktopApplication {
             CollaborationAction::CancelRoom => {
                 let collaboration = self.collaboration.as_mut()?;
                 if let Err(error) = collaboration.cancel_room() {
-                    self.collaboration_error = Some(error.to_string());
+                    self.report_collaboration_error(error.to_string());
                 } else {
                     self.collaboration_error = None;
                 }
                 None
             }
+            CollaborationAction::LeaveRoom => {
+                let result = self
+                    .collaboration
+                    .as_mut()
+                    .map_or(Ok(()), CollaborationClient::leave_room);
+                if let Err(error) = result {
+                    self.report_collaboration_error(error.to_string());
+                } else {
+                    self.collaboration_error = None;
+                    self.ui.notify(
+                        ToastKind::Success,
+                        "Left collaboration",
+                        "You are no longer connected to the room.",
+                    );
+                }
+                None
+            }
             CollaborationAction::Create { display_name } => {
                 let Some(display_name) = normalized_display_name(&display_name) else {
-                    self.collaboration_error =
-                        Some(String::from("A display name is required to create a room."));
+                    self.report_collaboration_error("A display name is required to create a room.");
                     return None;
                 };
                 let Some(readiness) = local_readiness else {
-                    self.collaboration_error = Some(String::from(
+                    self.report_collaboration_error(
                         "The local collaboration server is unavailable.",
-                    ));
+                    );
                     return None;
                 };
                 Some(CollaborationIntent::Create {
@@ -608,14 +598,13 @@ impl DesktopApplication {
                 certificate_sha256,
             } => {
                 let Some(display_name) = normalized_display_name(&display_name) else {
-                    self.collaboration_error =
-                        Some(String::from("A display name is required to join a room."));
+                    self.report_collaboration_error("A display name is required to join a room.");
                     return None;
                 };
                 let invite = match parse_room_invite(&invite_token) {
                     Ok(invite) => invite,
                     Err(error) => {
-                        self.collaboration_error = Some(error.to_string());
+                        self.report_collaboration_error(error.to_string());
                         return None;
                     }
                 };
@@ -636,7 +625,7 @@ impl DesktopApplication {
                 ) {
                     Ok(readiness) => readiness,
                     Err(error) => {
-                        self.collaboration_error = Some(error.to_string());
+                        self.report_collaboration_error(error.to_string());
                         return None;
                     }
                 };
@@ -658,39 +647,110 @@ impl DesktopApplication {
             match collaboration.poll() {
                 Ok(messages) => messages,
                 Err(error) => {
-                    self.collaboration_error = Some(error.to_string());
+                    self.report_collaboration_error(error.to_string());
                     return true;
                 }
             }
         };
         let changed = !messages.is_empty();
         for message in messages {
-            let result = {
-                let Some(collaboration) = self.collaboration.as_mut() else {
-                    return changed;
-                };
-                collaboration
-                    .observe(&message)
-                    .map_err(|error| error.to_string())
-                    .and_then(|accepted| {
-                        if !accepted {
-                            return Ok(());
-                        }
-                        self.editor
-                            .apply_server_message(
-                                collaboration.synchronization_mut(),
-                                &message.message,
-                            )
-                            .map(|_| ())
-                            .map_err(|error| error.to_string())
-                    })
-            };
-            if let Err(error) = result {
-                self.collaboration_error = Some(error);
+            let room_closed = self.room_was_closed(&message);
+            match self.apply_collaboration_message(&message) {
+                Ok(accepted) => self.notify_collaboration_message(&message, accepted, room_closed),
+                Err(error) => self.report_collaboration_error(error),
             }
         }
         self.flush_collaboration_operations();
         changed
+    }
+
+    fn room_was_closed(&self, message: &crate::connection::ReceivedServerMessage) -> bool {
+        match &message.message {
+            ServerMessage::RoomCancelled { room_id } => self
+                .collaboration
+                .as_ref()
+                .is_some_and(|collaboration| collaboration.room_id() == Some(*room_id)),
+            _ => false,
+        }
+    }
+
+    fn apply_collaboration_message(
+        &mut self,
+        message: &crate::connection::ReceivedServerMessage,
+    ) -> Result<bool, String> {
+        let Some(collaboration) = self.collaboration.as_mut() else {
+            return Ok(false);
+        };
+        collaboration
+            .observe(message)
+            .map_err(|error| error.to_string())
+            .and_then(|accepted| {
+                if !accepted {
+                    return Ok(false);
+                }
+                self.editor
+                    .apply_server_message(collaboration.synchronization_mut(), &message.message)
+                    .map(|_| true)
+                    .map_err(|error| error.to_string())
+            })
+    }
+
+    fn notify_collaboration_message(
+        &mut self,
+        message: &crate::connection::ReceivedServerMessage,
+        accepted: bool,
+        room_closed: bool,
+    ) {
+        if !accepted {
+            return;
+        }
+        match &message.message {
+            ServerMessage::Error { code, message, .. } => {
+                let detail = match code {
+                    canvas_protocol::ErrorCode::RoomFull => {
+                        String::from("This collaboration room is full.")
+                    }
+                    canvas_protocol::ErrorCode::RoomNotFound => {
+                        String::from("This collaboration room is no longer available.")
+                    }
+                    canvas_protocol::ErrorCode::TokenExpired => {
+                        String::from("This room invite has expired.")
+                    }
+                    _ => message.clone(),
+                };
+                self.report_collaboration_error(detail);
+            }
+            ServerMessage::SyncComplete { .. } => {
+                let room = self
+                    .collaboration
+                    .as_ref()
+                    .and_then(CollaborationClient::room_id)
+                    .map_or_else(|| "the collaboration room".to_owned(), |id| id.to_string());
+                if self.collaboration_created_room {
+                    self.ui.notify(
+                        ToastKind::Success,
+                        "Room created",
+                        format!("Room {room} was created and is ready to use."),
+                    );
+                    self.collaboration_created_room = false;
+                } else {
+                    self.ui.notify(
+                        ToastKind::Success,
+                        "Joined collaboration",
+                        format!("You are now connected to {room}."),
+                    );
+                }
+            }
+            _ => {}
+        }
+        if room_closed {
+            self.collaboration_created_room = false;
+            self.ui.notify(
+                ToastKind::Success,
+                "Room closed",
+                "The collaboration room was closed successfully.",
+            );
+        }
     }
 
     fn flush_collaboration_operations(&mut self) {
@@ -708,204 +768,7 @@ impl DesktopApplication {
             if let Some(collaboration) = self.collaboration.as_mut() {
                 collaboration.set_error(error.to_string());
             }
-            self.collaboration_error = Some(error.to_string());
-        }
-    }
-
-    fn sync_settings_window(&mut self, event_loop: &ActiveEventLoop) {
-        if self.ui.settings_open() {
-            if self.settings_window.is_some() {
-                return;
-            }
-
-            let attributes = Window::default_attributes()
-                .with_title("Settings — Sketchi")
-                .with_window_icon(native_window_icon())
-                .with_inner_size(PhysicalSize::new(860, 560))
-                .with_min_inner_size(PhysicalSize::new(720, 480))
-                .with_decorations(true)
-                .with_enabled_buttons(settings_window_buttons())
-                .with_resizable(true);
-            #[cfg(target_os = "linux")]
-            let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
-                attributes, "sketchi", "settings",
-            );
-
-            let window = match event_loop.create_window(attributes) {
-                Ok(window) => Arc::new(window),
-                Err(error) => {
-                    tracing::error!(error = %error, "Sketchi could not create settings window");
-                    self.ui.close_settings();
-                    if let Some(main_window) = &self.window {
-                        main_window.request_redraw();
-                    }
-                    return;
-                }
-            };
-            let egui_state = egui_winit::State::new(
-                self.settings_egui.clone(),
-                egui::ViewportId::ROOT,
-                window.as_ref(),
-                Some(native_pixels_per_point(window.as_ref())),
-                None,
-                None,
-            );
-            let repaint_window = Arc::downgrade(&window);
-            self.settings_egui
-                .set_request_repaint_callback(move |_info| {
-                    if let Some(window) = repaint_window.upgrade() {
-                        window.request_redraw();
-                    }
-                });
-            match GpuState::new(window.clone(), &self.wgpu_instance) {
-                Ok(gpu) => {
-                    lucide_icons::install(&self.settings_egui);
-                    tracing::info!(
-                        width = window.inner_size().width,
-                        height = window.inner_size().height,
-                        scale_factor = window.scale_factor(),
-                        "settings window created"
-                    );
-                    self.settings_egui_state = Some(egui_state);
-                    self.settings_gpu = Some(gpu);
-                    self.settings_window = Some(window.clone());
-                    self.settings_first_frame_logged = false;
-                    window.request_redraw();
-                }
-                Err(error) => {
-                    tracing::error!(error = %error, "Sketchi could not initialize settings window GPU");
-                    self.ui.close_settings();
-                    if let Some(main_window) = &self.window {
-                        main_window.request_redraw();
-                    }
-                }
-            }
-        } else if self.settings_window.is_some() {
-            self.close_settings_window();
-        }
-    }
-
-    fn close_settings_window(&mut self) {
-        let settings_window = self.settings_window.take();
-        self.settings_egui_state = None;
-        self.settings_gpu = None;
-        self.settings_first_frame_logged = false;
-        if let Some(window) = settings_window {
-            window.set_visible(false);
-        }
-        if let Some(main_window) = &self.window {
-            main_window.request_redraw();
-        }
-    }
-
-    fn handle_settings_window_event(&mut self, event_loop: &ActiveEventLoop, event: &WindowEvent) {
-        let Some(window) = self.settings_window.clone() else {
-            return;
-        };
-        if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
-            tracing::info!(
-                window_id = ?window.id(),
-                ?event,
-                "settings window closing"
-            );
-            self.ui.close_settings();
-            self.close_settings_window();
-            return;
-        }
-        let paste_requested = matches!(
-            event,
-            WindowEvent::KeyboardInput {
-                event: key_event,
-                ..
-            } if is_clipboard_paste(key_event, self.modifiers)
-        );
-        let repaint = self.settings_egui_state.as_mut().is_some_and(|egui_state| {
-            if paste_requested {
-                queue_text_clipboard_paste(egui_state);
-                false
-            } else {
-                egui_state.on_window_event(window.as_ref(), event).repaint
-            }
-        });
-        let pointer_activation = matches!(
-            event,
-            WindowEvent::MouseInput { .. } | WindowEvent::Touch { .. }
-        );
-        match event {
-            WindowEvent::Resized(size) => {
-                if let Some(gpu) = &mut self.settings_gpu {
-                    gpu.resize(size.width, size.height);
-                }
-                window.request_redraw();
-            }
-            WindowEvent::ScaleFactorChanged { .. } => window.request_redraw(),
-            WindowEvent::ThemeChanged(theme) => {
-                self.ui.set_system_dark_mode(*theme == Theme::Dark);
-                if let Some(main_window) = &self.window {
-                    main_window.request_redraw();
-                }
-                window.request_redraw();
-            }
-            WindowEvent::RedrawRequested => self.render_settings_window(event_loop),
-            _ if repaint || pointer_activation => {
-                window.request_redraw();
-                if let Some(main_window) = &self.window {
-                    main_window.request_redraw();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn render_settings_window(&mut self, _event_loop: &ActiveEventLoop) {
-        let Some(window) = self.settings_window.clone() else {
-            return;
-        };
-        let raw_input = {
-            let Some(egui_state) = &mut self.settings_egui_state else {
-                tracing::warn!("settings redraw requested before egui initialization");
-                return;
-            };
-            egui_state.take_egui_input(window.as_ref())
-        };
-        let context = self.settings_egui.clone();
-        let full_output = context.run_ui(raw_input, |ui| {
-            self.ui
-                .show_settings_window(ui, &mut self.editor, &mut self.tools);
-        });
-        self.sync_settings_preferences();
-        if let Some(egui_state) = &mut self.settings_egui_state {
-            egui_state.handle_platform_output(window.as_ref(), full_output.platform_output.clone());
-        }
-        let Some(gpu) = &mut self.settings_gpu else {
-            tracing::warn!("settings redraw requested before GPU initialization");
-            return;
-        };
-        match gpu.render(
-            &context,
-            full_output,
-            GpuState::settings_clear_color(self.ui.settings_dark_mode()),
-        ) {
-            Ok(()) => {
-                if !self.settings_first_frame_logged {
-                    self.settings_first_frame_logged = true;
-                    tracing::info!("first settings GPU frame presented");
-                }
-            }
-            Err(crate::gpu::GpuSurfaceError::Lost | crate::gpu::GpuSurfaceError::Outdated) => {
-                tracing::warn!("settings GPU surface lost or outdated; reconfiguring");
-                gpu.reconfigure();
-                window.request_redraw();
-            }
-            Err(crate::gpu::GpuSurfaceError::Timeout) => {
-                tracing::warn!("settings GPU surface frame timed out");
-            }
-            Err(crate::gpu::GpuSurfaceError::Other) => {
-                tracing::error!("settings GPU surface returned an unspecified error");
-            }
-        }
-        if !self.ui.settings_open() {
-            self.close_settings_window();
+            self.report_collaboration_error(error.to_string());
         }
     }
 
@@ -1102,10 +965,6 @@ pub fn run() {
     }
 }
 
-const fn settings_window_buttons() -> WindowButtons {
-    WindowButtons::CLOSE
-}
-
 #[allow(clippy::cast_possible_truncation)]
 fn native_pixels_per_point(window: &Window) -> f32 {
     window.scale_factor() as f32
@@ -1177,16 +1036,8 @@ fn should_request_redraw(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        WindowButtons, lucide_icons, normalized_display_name, settings_window_buttons,
-        should_request_redraw,
-    };
+    use super::{lucide_icons, normalized_display_name, should_request_redraw};
     use winit::event::WindowEvent;
-
-    #[test]
-    fn settings_window_keeps_only_the_native_close_button() {
-        assert_eq!(settings_window_buttons(), WindowButtons::CLOSE);
-    }
 
     #[test]
     fn redraw_requested_does_not_schedule_another_redraw() {

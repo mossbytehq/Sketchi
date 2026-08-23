@@ -26,9 +26,9 @@ use self::settings_ui::{settings_palette_row, settings_visuals};
 
 use crate::{
     components::{
-        STANDARD_CONTROL_SIZE, button, color_picker_editor, color_picker_trigger, color_swatch,
-        dropdown_field_sized, numeric_field, numeric_field_with_decimals, range_slider,
-        sized_text_field, themed_checkbox,
+        STANDARD_CONTROL_SIZE, button, close_icon_button, color_picker_editor,
+        color_picker_trigger, color_swatch, dropdown_field_sized, numeric_field,
+        numeric_field_with_decimals, range_slider, sized_text_field, themed_checkbox,
     },
     connection::{CollaborationView, format_room_invite},
     editor::Editor,
@@ -45,6 +45,7 @@ use crate::{
     settings,
     supervisor::ReadyMessage,
     theme::CONTROL_CORNER_RADIUS,
+    toast::{ToastKind, ToastQueue},
     tools::{Tool, ToolController, ToolOutput},
     update::{self, UpdateCache, UpdateChannel},
 };
@@ -69,9 +70,13 @@ const DARK_TEXT: Color32 = Color32::from_rgb(232, 233, 237);
 const LIGHT_MUTED: Color32 = Color32::from_rgb(91, 97, 108);
 const DARK_MUTED: Color32 = Color32::from_rgb(160, 163, 174);
 const SELECTION_STROKE_WIDTH: f32 = 2.0;
-const SETTINGS_NAV_WIDTH: f32 = 152.0;
 const SETTINGS_NAV_ITEM_WIDTH: f32 = 136.0;
 const SETTINGS_NAV_ITEM_HEIGHT: f32 = 40.0;
+const SETTINGS_MODAL_WIDTH: f32 = 860.0;
+const SETTINGS_MODAL_HEIGHT: f32 = 560.0;
+const SETTINGS_BODY_INSET: f32 = 10.0;
+const SETTINGS_HEADER_INSET: f32 = 8.0;
+const SETTINGS_NAV_WIDTH: f32 = SETTINGS_NAV_ITEM_WIDTH + SETTINGS_BODY_INSET;
 const SETTINGS_CONTROL_RADIUS: u8 = CONTROL_CORNER_RADIUS;
 const SETTINGS_ROOT_RADIUS: u8 = 10;
 const SETTINGS_DIVIDER_INSET: f32 = 12.0;
@@ -287,6 +292,7 @@ pub(crate) struct WorkspaceUi {
     new_document_confirmation: bool,
     open_document_confirmation: bool,
     pending_open_document: Option<(PathBuf, Editor)>,
+    document_path: Option<PathBuf>,
     restore_session: bool,
     autosave_interval: AutosaveInterval,
     autosave_directory: String,
@@ -310,6 +316,12 @@ pub(crate) struct WorkspaceUi {
     update_installing: bool,
     update_install_receiver: Option<Receiver<Result<(), String>>>,
     update_restart_requested: bool,
+    toasts: ToastQueue,
+    toast_repaint_requested: bool,
+    help_open: bool,
+    line_menu_open: bool,
+    arrow_menu_open: bool,
+    triangle_menu_open: bool,
     capturing_keybind: Option<KeybindAction>,
     status: String,
     collaboration_popup: Option<CollaborationPopup>,
@@ -403,6 +415,8 @@ pub(crate) enum CollaborationAction {
     },
     /// Cancel the currently hosted collaboration room.
     CancelRoom,
+    /// Leave the current collaboration room without cancelling it.
+    LeaveRoom,
     /// Join a room using the entered room ID and capability token.
     Join {
         /// Room ID text entered by the user.
@@ -530,9 +544,15 @@ struct Keybinds {
     rectangle: KeyBinding,
     diamond: KeyBinding,
     triangle: KeyBinding,
+    pentagon: KeyBinding,
+    hexagon: KeyBinding,
     ellipse: KeyBinding,
     line: KeyBinding,
+    curved_line_clockwise: KeyBinding,
+    curved_line_counter_clockwise: KeyBinding,
     arrow: KeyBinding,
+    curved_arrow_clockwise: KeyBinding,
+    curved_arrow_counter_clockwise: KeyBinding,
     pan: KeyBinding,
     select_all: KeyBinding,
     copy: KeyBinding,
@@ -543,10 +563,12 @@ struct Keybinds {
     redo: KeyBinding,
     new_document: KeyBinding,
     save: KeyBinding,
+    save_as: KeyBinding,
     settings: KeyBinding,
 }
 
 impl Default for Keybinds {
+    #[allow(clippy::too_many_lines)]
     fn default() -> Self {
         Self {
             select: KeyBinding {
@@ -573,6 +595,14 @@ impl Default for Keybinds {
                 key: Key::Y,
                 modifiers: Modifiers::NONE,
             },
+            pentagon: KeyBinding {
+                key: Key::G,
+                modifiers: Modifiers::NONE,
+            },
+            hexagon: KeyBinding {
+                key: Key::B,
+                modifiers: Modifiers::NONE,
+            },
             ellipse: KeyBinding {
                 key: Key::O,
                 modifiers: Modifiers::NONE,
@@ -581,8 +611,24 @@ impl Default for Keybinds {
                 key: Key::L,
                 modifiers: Modifiers::NONE,
             },
+            curved_line_clockwise: KeyBinding {
+                key: Key::J,
+                modifiers: Modifiers::NONE,
+            },
+            curved_line_counter_clockwise: KeyBinding {
+                key: Key::K,
+                modifiers: Modifiers::NONE,
+            },
             arrow: KeyBinding {
                 key: Key::A,
+                modifiers: Modifiers::NONE,
+            },
+            curved_arrow_clockwise: KeyBinding {
+                key: Key::C,
+                modifiers: Modifiers::NONE,
+            },
+            curved_arrow_counter_clockwise: KeyBinding {
+                key: Key::X,
                 modifiers: Modifiers::NONE,
             },
             pan: KeyBinding {
@@ -625,6 +671,10 @@ impl Default for Keybinds {
                 key: Key::S,
                 modifiers: Modifiers::CTRL,
             },
+            save_as: KeyBinding {
+                key: Key::S,
+                modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+            },
             settings: KeyBinding {
                 key: Key::Comma,
                 modifiers: Modifiers::CTRL,
@@ -641,9 +691,15 @@ enum KeybindAction {
     Rectangle,
     Diamond,
     Triangle,
+    Pentagon,
+    Hexagon,
     Ellipse,
     Line,
+    CurvedLineClockwise,
+    CurvedLineCounterClockwise,
     Arrow,
+    CurvedArrowClockwise,
+    CurvedArrowCounterClockwise,
     Pan,
     SelectAll,
     Copy,
@@ -654,20 +710,27 @@ enum KeybindAction {
     Redo,
     NewDocument,
     Save,
+    SaveAs,
     Settings,
 }
 
 impl KeybindAction {
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 27] = [
         Self::Select,
         Self::Text,
         Self::Freehand,
         Self::Rectangle,
         Self::Diamond,
         Self::Triangle,
+        Self::Pentagon,
+        Self::Hexagon,
         Self::Ellipse,
         Self::Line,
+        Self::CurvedLineClockwise,
+        Self::CurvedLineCounterClockwise,
         Self::Arrow,
+        Self::CurvedArrowClockwise,
+        Self::CurvedArrowCounterClockwise,
         Self::Pan,
         Self::SelectAll,
         Self::Copy,
@@ -678,6 +741,7 @@ impl KeybindAction {
         Self::Redo,
         Self::NewDocument,
         Self::Save,
+        Self::SaveAs,
         Self::Settings,
     ];
 
@@ -689,9 +753,15 @@ impl KeybindAction {
             Self::Rectangle => "Rectangle tool",
             Self::Diamond => "Diamond tool",
             Self::Triangle => "Triangle tool",
+            Self::Pentagon => "Pentagon tool",
+            Self::Hexagon => "Hexagon tool",
             Self::Ellipse => "Ellipse tool",
             Self::Line => "Line tool",
+            Self::CurvedLineClockwise => "Clockwise line",
+            Self::CurvedLineCounterClockwise => "Counter-clockwise line",
             Self::Arrow => "Arrow tool",
+            Self::CurvedArrowClockwise => "Clockwise arrow",
+            Self::CurvedArrowCounterClockwise => "Counter-clockwise arrow",
             Self::Pan => "Pan canvas",
             Self::SelectAll => "Select all",
             Self::Copy => "Copy selection",
@@ -701,7 +771,8 @@ impl KeybindAction {
             Self::Undo => "Undo",
             Self::Redo => "Redo",
             Self::NewDocument => "New whiteboard",
-            Self::Save => "Save locally",
+            Self::Save => "Save",
+            Self::SaveAs => "Save as",
             Self::Settings => "Settings",
         }
     }
@@ -714,9 +785,15 @@ impl KeybindAction {
             Self::Rectangle => Some(Tool::Rectangle),
             Self::Diamond => Some(Tool::Diamond),
             Self::Triangle => Some(Tool::Triangle),
+            Self::Pentagon => Some(Tool::Pentagon),
+            Self::Hexagon => Some(Tool::Hexagon),
             Self::Ellipse => Some(Tool::Ellipse),
             Self::Line => Some(Tool::Line),
+            Self::CurvedLineClockwise => Some(Tool::CurvedLineClockwise),
+            Self::CurvedLineCounterClockwise => Some(Tool::CurvedLineCounterClockwise),
             Self::Arrow => Some(Tool::Arrow),
+            Self::CurvedArrowClockwise => Some(Tool::CurvedArrowClockwise),
+            Self::CurvedArrowCounterClockwise => Some(Tool::CurvedArrowCounterClockwise),
             Self::Pan => Some(Tool::Pan),
             Self::SelectAll
             | Self::Copy
@@ -727,6 +804,7 @@ impl KeybindAction {
             | Self::Redo
             | Self::NewDocument
             | Self::Save
+            | Self::SaveAs
             | Self::Settings => None,
         }
     }
@@ -741,9 +819,15 @@ impl Keybinds {
             KeybindAction::Rectangle => self.rectangle,
             KeybindAction::Diamond => self.diamond,
             KeybindAction::Triangle => self.triangle,
+            KeybindAction::Pentagon => self.pentagon,
+            KeybindAction::Hexagon => self.hexagon,
             KeybindAction::Ellipse => self.ellipse,
             KeybindAction::Line => self.line,
+            KeybindAction::CurvedLineClockwise => self.curved_line_clockwise,
+            KeybindAction::CurvedLineCounterClockwise => self.curved_line_counter_clockwise,
             KeybindAction::Arrow => self.arrow,
+            KeybindAction::CurvedArrowClockwise => self.curved_arrow_clockwise,
+            KeybindAction::CurvedArrowCounterClockwise => self.curved_arrow_counter_clockwise,
             KeybindAction::Pan => self.pan,
             KeybindAction::SelectAll => self.select_all,
             KeybindAction::Copy => self.copy,
@@ -754,6 +838,7 @@ impl Keybinds {
             KeybindAction::Redo => self.redo,
             KeybindAction::NewDocument => self.new_document,
             KeybindAction::Save => self.save,
+            KeybindAction::SaveAs => self.save_as,
             KeybindAction::Settings => self.settings,
         }
     }
@@ -766,9 +851,19 @@ impl Keybinds {
             KeybindAction::Rectangle => self.rectangle = binding,
             KeybindAction::Diamond => self.diamond = binding,
             KeybindAction::Triangle => self.triangle = binding,
+            KeybindAction::Pentagon => self.pentagon = binding,
+            KeybindAction::Hexagon => self.hexagon = binding,
             KeybindAction::Ellipse => self.ellipse = binding,
             KeybindAction::Line => self.line = binding,
+            KeybindAction::CurvedLineClockwise => self.curved_line_clockwise = binding,
+            KeybindAction::CurvedLineCounterClockwise => {
+                self.curved_line_counter_clockwise = binding;
+            }
             KeybindAction::Arrow => self.arrow = binding,
+            KeybindAction::CurvedArrowClockwise => self.curved_arrow_clockwise = binding,
+            KeybindAction::CurvedArrowCounterClockwise => {
+                self.curved_arrow_counter_clockwise = binding;
+            }
             KeybindAction::Pan => self.pan = binding,
             KeybindAction::SelectAll => self.select_all = binding,
             KeybindAction::Copy => self.copy = binding,
@@ -779,6 +874,7 @@ impl Keybinds {
             KeybindAction::Redo => self.redo = binding,
             KeybindAction::NewDocument => self.new_document = binding,
             KeybindAction::Save => self.save = binding,
+            KeybindAction::SaveAs => self.save_as = binding,
             KeybindAction::Settings => self.settings = binding,
         }
     }
@@ -933,6 +1029,7 @@ impl SelectionGesture {
 }
 
 impl Default for WorkspaceUi {
+    #[allow(clippy::too_many_lines)]
     fn default() -> Self {
         Self {
             active_tool: Tool::Select,
@@ -944,6 +1041,7 @@ impl Default for WorkspaceUi {
             new_document_confirmation: false,
             open_document_confirmation: false,
             pending_open_document: None,
+            document_path: None,
             restore_session: true,
             autosave_interval: AutosaveInterval::OneMinute,
             autosave_directory: settings::Settings::default().autosave_directory,
@@ -967,6 +1065,12 @@ impl Default for WorkspaceUi {
             update_installing: false,
             update_install_receiver: None,
             update_restart_requested: false,
+            toasts: ToastQueue::default(),
+            toast_repaint_requested: false,
+            help_open: false,
+            line_menu_open: false,
+            arrow_menu_open: false,
+            triangle_menu_open: false,
             capturing_keybind: None,
             status: String::from("Select a tool to start drawing"),
             collaboration_popup: None,
@@ -1179,9 +1283,26 @@ impl WorkspaceUi {
                 self.update_error = None;
                 self.update_checking = false;
                 self.update_receiver = None;
+                let status = self.update_status();
+                if let Some(version) = status.target {
+                    let kind = if status.target_asset_url.is_some() {
+                        ToastKind::Info
+                    } else {
+                        ToastKind::Warning
+                    };
+                    self.notify(
+                        kind,
+                        "Update available",
+                        format!(
+                            "Version {version} is available on the {} channel.",
+                            status.channel.label()
+                        ),
+                    );
+                }
                 true
             }
             Ok(Err(error)) => {
+                self.notify(ToastKind::Error, "Update check failed", error.clone());
                 self.update_error = Some(error);
                 self.update_checking = false;
                 self.update_receiver = None;
@@ -1189,7 +1310,9 @@ impl WorkspaceUi {
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
-                self.update_error = Some(String::from("The update check stopped unexpectedly"));
+                let error = String::from("The update check stopped unexpectedly");
+                self.notify(ToastKind::Error, "Update check failed", error.clone());
+                self.update_error = Some(error);
                 self.update_checking = false;
                 self.update_receiver = None;
                 true
@@ -1207,13 +1330,16 @@ impl WorkspaceUi {
                 self.update_installing = false;
                 self.update_install_receiver = None;
                 self.update_install_error = None;
-                self.update_message = Some(String::from(
+                let message = String::from(
                     "Update handoff started. Sketchi will restart to finish the update.",
-                ));
+                );
+                self.notify(ToastKind::Success, "Update ready", message.clone());
+                self.update_message = Some(message);
                 self.update_restart_requested = true;
                 true
             }
             Ok(Err(error)) => {
+                self.notify(ToastKind::Error, "Update failed", error.clone());
                 self.update_install_error = Some(error);
                 self.update_installing = false;
                 self.update_install_receiver = None;
@@ -1221,8 +1347,9 @@ impl WorkspaceUi {
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
-                self.update_install_error =
-                    Some(String::from("The update installation stopped unexpectedly"));
+                let error = String::from("The update installation stopped unexpectedly");
+                self.notify(ToastKind::Error, "Update failed", error.clone());
+                self.update_install_error = Some(error);
                 self.update_installing = false;
                 self.update_install_receiver = None;
                 true
@@ -1251,7 +1378,9 @@ impl WorkspaceUi {
         if let Err(error) = worker {
             self.update_checking = false;
             self.update_receiver = None;
-            self.update_error = Some(format!("Could not start the update check: {error}"));
+            let message = format!("Could not start the update check: {error}");
+            self.notify(ToastKind::Error, "Update check failed", message.clone());
+            self.update_error = Some(message);
         }
     }
 
@@ -1262,7 +1391,31 @@ impl WorkspaceUi {
 
     /// Shows a result reported by the previous update handoff.
     pub(crate) fn set_update_message(&mut self, message: String) {
+        self.notify(ToastKind::Info, "Update", message.clone());
         self.update_message = Some(message);
+    }
+
+    /// Adds a short-lived notification to the workspace toast stack.
+    pub(crate) fn notify(
+        &mut self,
+        kind: ToastKind,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.toasts.push(kind, title, message);
+        self.toast_repaint_requested = true;
+    }
+
+    fn report_error(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        let title = title.into();
+        let message = message.into();
+        self.status = format!("{title}: {message}");
+        self.notify(ToastKind::Error, title, message);
+    }
+
+    /// Returns whether a newly queued toast needs another native frame.
+    pub(crate) fn take_toast_repaint_request(&mut self) -> bool {
+        std::mem::take(&mut self.toast_repaint_requested)
     }
 
     /// Returns the current status derived from the cached release data.
@@ -1297,8 +1450,9 @@ impl WorkspaceUi {
         if let Err(error) = worker {
             self.update_installing = false;
             self.update_install_receiver = None;
-            self.update_install_error =
-                Some(format!("Could not start the update installation: {error}"));
+            let message = format!("Could not start the update installation: {error}");
+            self.notify(ToastKind::Error, "Update failed", message.clone());
+            self.update_install_error = Some(message);
         }
     }
 
@@ -1322,18 +1476,7 @@ impl WorkspaceUi {
         self.restore_session
     }
 
-    /// Returns whether the native settings window should be open.
-    pub(crate) const fn settings_open(&self) -> bool {
-        self.settings_open
-    }
-
-    /// Returns the active settings appearance mode for the native window.
-    pub(crate) const fn settings_dark_mode(&self) -> bool {
-        self.dark_mode
-    }
-
-    /// Returns whether the native settings window should be open.
-    /// Closes the native settings window and abandons an in-progress shortcut capture.
+    /// Closes the settings modal and abandons an in-progress shortcut capture.
     pub(crate) fn close_settings(&mut self) {
         self.settings_open = false;
         self.capturing_keybind = None;
@@ -1467,6 +1610,11 @@ impl WorkspaceUi {
 
         self.handle_keybind_input(ui.ctx(), editor, tools);
         self.show_canvas(ui, editor, tools, camera, &collaboration.presence);
+        if self.settings_open {
+            self.show_settings_modal(ui.ctx(), editor, tools);
+            self.toasts.show(ui.ctx(), self.dark_mode);
+            return CollaborationAction::None;
+        }
         self.show_text_editor(ui.ctx(), editor, camera);
         let collaboration_action = self.show_file_actions(ui.ctx(), editor, collaboration);
         self.show_tool_palette(ui.ctx(), tools);
@@ -1479,7 +1627,8 @@ impl WorkspaceUi {
             self.show_color_picker(ui.ctx(), editor);
         }
         self.show_zoom_controls(ui.ctx(), camera);
-        self.show_status(ui.ctx(), editor, camera);
+        self.toasts.show(ui.ctx(), self.dark_mode);
+        self.show_help(ui.ctx());
         collaboration_action
     }
 
@@ -1492,6 +1641,7 @@ impl WorkspaceUi {
         camera: &mut Camera,
         remote_presence: &[PresenceState],
     ) {
+        let settings_open = self.settings_open;
         let canvas_color = if self.dark_mode {
             self.dark_canvas_color
         } else {
@@ -1502,19 +1652,41 @@ impl WorkspaceUi {
             .show(ui, |ui| {
                 let canvas_rect = ui.max_rect();
                 camera.set_viewport(Size::new(canvas_rect.width(), canvas_rect.height()));
+                let world_top_left =
+                    camera.screen_to_world(Point::new(canvas_rect.left(), canvas_rect.top()));
+                let world_bottom_right =
+                    camera.screen_to_world(Point::new(canvas_rect.right(), canvas_rect.bottom()));
+                tools.set_canvas_bounds(canvas_core::Rect::new(
+                    Point::new(
+                        world_top_left.x.min(world_bottom_right.x),
+                        world_top_left.y.min(world_bottom_right.y),
+                    ),
+                    Size::new(
+                        (world_bottom_right.x - world_top_left.x).abs(),
+                        (world_bottom_right.y - world_top_left.y).abs(),
+                    ),
+                ));
                 let response = ui.interact(
                     canvas_rect,
                     Id::new("sketchi.canvas"),
-                    Sense::click_and_drag(),
+                    if settings_open {
+                        Sense::hover()
+                    } else {
+                        Sense::click_and_drag()
+                    },
                 );
-                let navigation_handled =
-                    self.handle_canvas_navigation(ui, &response, tools, camera, canvas_rect);
-                let dragging = response.dragged() || ui.input(|input| input.pointer.middle_down());
-                self.sync_egui_drop_input(ui.ctx());
-                self.handle_dropped_images(ui.ctx(), editor, camera, canvas_rect);
-                self.handle_clipboard_image(ui.ctx(), editor, camera, canvas_rect);
-                self.prepare_drop_preview(ui.ctx());
-                if !navigation_handled {
+                let navigation_handled = if settings_open {
+                    false
+                } else {
+                    self.handle_canvas_navigation(ui, &response, tools, camera, canvas_rect)
+                };
+                let dragging = !settings_open
+                    && (response.dragged() || ui.input(|input| input.pointer.middle_down()));
+                if !settings_open {
+                    self.sync_egui_drop_input(ui.ctx());
+                    self.handle_dropped_images(ui.ctx(), editor, camera, canvas_rect);
+                    self.handle_clipboard_image(ui.ctx(), editor, camera, canvas_rect);
+                    self.prepare_drop_preview(ui.ctx());
                     self.handle_canvas_input(ui, &response, editor, tools, camera);
                 }
                 let cursor = if navigation_handled && ui.input(|input| input.pointer.middle_down())
@@ -1533,7 +1705,8 @@ impl WorkspaceUi {
                 }
                 let document = editor.document();
                 let scene = self.renderer.draw(document);
-                let hovered_element = if self.active_tool == Tool::Select
+                let hovered_element = if !settings_open
+                    && self.active_tool == Tool::Select
                     && self.selection_gesture.is_none()
                 {
                     response.hover_pos().and_then(|position| {
@@ -1976,7 +2149,7 @@ impl WorkspaceUi {
                 format!("Embedded {imported} images")
             };
         } else if let Some(error) = last_error {
-            self.status = error;
+            self.report_error("Could not import image", error);
         }
     }
 
@@ -2020,7 +2193,7 @@ impl WorkspaceUi {
         let image = match embedded_image_from_rgba(width, height, bytes) {
             Ok(image) => image,
             Err(error) => {
-                self.status = format!("Could not paste image: {error}");
+                self.report_error("Could not paste image", error.to_string());
                 return;
             }
         };
@@ -2049,7 +2222,7 @@ impl WorkspaceUi {
                 self.selection_gesture = None;
                 self.status = String::from("Embedded pasted image");
             }
-            Err(error) => self.status = format!("Could not paste image: {error}"),
+            Err(error) => self.report_error("Could not paste image", error.to_string()),
         }
     }
 
@@ -2176,7 +2349,7 @@ impl WorkspaceUi {
                             self.selected.insert(element_id);
                             self.status = String::from("Text added");
                         }
-                        Err(error) => self.status = format!("Could not add text: {error}"),
+                        Err(error) => self.report_error("Could not add text", error.to_string()),
                     },
                     None => self.status = String::from("Empty text discarded"),
                 }
@@ -2192,7 +2365,10 @@ impl WorkspaceUi {
         text_edit: &TextEditState,
     ) {
         let Some(element) = editor.document().element(element_id).cloned() else {
-            self.status = String::from("Text object no longer exists");
+            self.report_error(
+                "Text object unavailable",
+                "The text object no longer exists.",
+            );
             return;
         };
 
@@ -2202,7 +2378,7 @@ impl WorkspaceUi {
                     self.selected.clear();
                     self.status = String::from("Empty text deleted");
                 }
-                Err(error) => self.status = format!("Could not delete text: {error}"),
+                Err(error) => self.report_error("Could not delete text", error.to_string()),
             }
             return;
         }
@@ -2249,7 +2425,7 @@ impl WorkspaceUi {
         }
 
         if let Some(error) = failed {
-            self.status = format!("Could not update text: {error}");
+            self.report_error("Could not update text", error);
         } else {
             self.selected.clear();
             self.selected.insert(element_id);
@@ -2340,7 +2516,7 @@ impl WorkspaceUi {
                         self.status = format!("Created {}", tool_name(self.active_tool));
                     }
                     Err(error) => {
-                        self.status = format!("Could not create element: {error}");
+                        self.report_error("Could not create element", error.to_string());
                     }
                 }
             }
@@ -2763,7 +2939,9 @@ impl WorkspaceUi {
                 if (next_rotation - element.transform.rotation).abs() > f32::EPSILON {
                     match editor.execute(EditorCommand::SetRotation(element.id, next_rotation)) {
                         Ok(_) => self.status = String::from("Object rotated"),
-                        Err(error) => self.status = format!("Could not rotate object: {error}"),
+                        Err(error) => {
+                            self.report_error("Could not rotate object", error.to_string());
+                        }
                     }
                 } else {
                     self.status = String::from("Object selected");
@@ -2993,21 +3171,20 @@ impl WorkspaceUi {
                 self.apply_element_action(context, editor, ElementAction::Duplicate);
             }
             Some(KeybindAction::Delete) => self.delete_selected(editor),
-            Some(KeybindAction::Undo) => {
-                self.status = match editor.undo() {
-                    Ok(_) => String::from("Undid the last operation"),
-                    Err(error) => error.to_string(),
-                };
-            }
-            Some(KeybindAction::Redo) => {
-                self.status = match editor.redo() {
-                    Ok(_) => String::from("Redid the last operation"),
-                    Err(error) => error.to_string(),
-                };
-            }
+            Some(KeybindAction::Undo) => match editor.undo() {
+                Ok(_) => self.status = String::from("Undid the last operation"),
+                Err(error) => self.report_error("Undo failed", error.to_string()),
+            },
+            Some(KeybindAction::Redo) => match editor.redo() {
+                Ok(_) => self.status = String::from("Redid the last operation"),
+                Err(error) => self.report_error("Redo failed", error.to_string()),
+            },
             Some(KeybindAction::NewDocument) => self.request_new_document(editor),
             Some(KeybindAction::Save) => {
                 self.save_document(editor);
+            }
+            Some(KeybindAction::SaveAs) => {
+                self.save_document_as(editor);
             }
             Some(KeybindAction::Settings) => {
                 self.toggle_settings();
@@ -3041,10 +3218,18 @@ impl WorkspaceUi {
             .filter_map(|id| editor.document().element(*id).cloned())
             .collect::<Vec<_>>();
         if copied.is_empty() {
-            self.status = String::from("Nothing selected to copy");
+            self.notify(
+                ToastKind::Warning,
+                "Nothing to copy",
+                "Select at least one object first.",
+            );
         } else {
             self.element_clipboard = copied;
-            self.status = String::from("Objects copied");
+            self.notify(
+                ToastKind::Success,
+                "Objects copied",
+                "The selected objects are ready to paste.",
+            );
         }
     }
 
@@ -3091,13 +3276,14 @@ impl WorkspaceUi {
     }
 
     fn new_document(&mut self, editor: &mut Editor) {
-        if !self.save_document(editor) {
+        if !self.save_document_before_replacing(editor) {
             return;
         }
         let client_id = editor.client_id();
         *editor = Editor::new(client_id);
         self.selected.clear();
         self.selection_gesture = None;
+        self.document_path = None;
         self.status = String::from("New whiteboard created");
     }
 
@@ -3121,7 +3307,7 @@ impl WorkspaceUi {
         let restored = match Self::load_editor_from_path(editor.client_id(), &path) {
             Ok(restored) => restored,
             Err(error) => {
-                self.status = format!("Could not open document: {error}");
+                self.report_error("Could not open document", error);
                 return;
             }
         };
@@ -3138,7 +3324,7 @@ impl WorkspaceUi {
         let restored = match Self::load_editor_from_path(editor.client_id(), path) {
             Ok(restored) => restored,
             Err(error) => {
-                self.status = format!("Could not open document: {error}");
+                self.report_error("Could not open document", error);
                 return false;
             }
         };
@@ -3160,6 +3346,7 @@ impl WorkspaceUi {
         self.selected.clear();
         self.selection_gesture = None;
         self.text_edit = None;
+        self.document_path = Some(path.to_owned());
         self.status = format!("Opened {}", path.display());
     }
 
@@ -3319,6 +3506,9 @@ impl WorkspaceUi {
         self.selection_gesture = None;
         self.text_edit = None;
         self.close_color_picker();
+        self.line_menu_open = false;
+        self.arrow_menu_open = false;
+        self.triangle_menu_open = false;
         tools.set_tool(tool);
         self.status = format!("{} tool selected", tool_name(tool));
     }
@@ -3332,6 +3522,7 @@ impl WorkspaceUi {
         let mut new_requested = false;
         let mut open_requested = false;
         let mut save_requested = false;
+        let mut save_as_requested = false;
         let mut settings_requested = false;
         egui::Area::new(Id::new("sketchi.file_actions"))
             .fixed_pos(egui::pos2(16.0, 16.0))
@@ -3350,10 +3541,12 @@ impl WorkspaceUi {
                         {
                             settings_requested = true;
                         }
-                        if icon_button(ui, Icon::Save, "Save locally", false, self.dark_mode)
-                            .clicked()
-                        {
+                        if icon_button(ui, Icon::Save, "Save", false, self.dark_mode).clicked() {
                             save_requested = true;
+                        }
+                        if icon_button(ui, Icon::SaveAs, "Save as", false, self.dark_mode).clicked()
+                        {
+                            save_as_requested = true;
                         }
                         if icon_button(
                             ui,
@@ -3380,6 +3573,9 @@ impl WorkspaceUi {
         }
         if save_requested {
             self.save_document(editor);
+        }
+        if save_as_requested {
+            self.save_document_as(editor);
         }
         if open_requested {
             self.request_open_document(editor);
@@ -3462,6 +3658,8 @@ impl WorkspaceUi {
             || !self.collaboration_certificate_sha256.trim().is_empty();
         let room_active =
             popup == CollaborationPopup::Create && room_id.is_some() && creator_token.is_some();
+        let joined_room =
+            popup == CollaborationPopup::Join && room_id.is_some() && creator_token.is_none();
         let mut copy_invite_clicked = false;
         let popup_response = egui::Area::new(Id::new("sketchi.collaboration_popup"))
             .anchor(Align2::RIGHT_TOP, egui::vec2(-16.0, 76.0))
@@ -3471,10 +3669,11 @@ impl WorkspaceUi {
                     ui.set_width(320.0);
                     collaboration_popup_scope(ui, self.dark_mode, |ui| {
                         ui.spacing_mut().item_spacing.y = 8.0;
-                        let title = match (popup, room_active) {
-                            (CollaborationPopup::Create, true) => "Room active",
-                            (CollaborationPopup::Create, false) => "Create room",
-                            (CollaborationPopup::Join, _) => "Join room",
+                        let title = match (popup, room_active, joined_room) {
+                            (CollaborationPopup::Create, true, _) => "Room active",
+                            (CollaborationPopup::Create, false, _) => "Create room",
+                            (CollaborationPopup::Join, _, true) => "Room joined",
+                            (CollaborationPopup::Join, _, false) => "Join room",
                         };
                         ui.horizontal(|ui| {
                             ui.label(
@@ -3495,6 +3694,19 @@ impl WorkspaceUi {
                                     .clicked()
                                 {
                                     action = CollaborationAction::CancelRoom;
+                                    self.collaboration_popup = None;
+                                }
+                                if joined_room
+                                    && collaboration_secondary_icon_button(
+                                        ui,
+                                        Icon::LogOut,
+                                        self.dark_mode,
+                                    )
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("Leave collaboration room")
+                                    .clicked()
+                                {
+                                    action = CollaborationAction::LeaveRoom;
                                     self.collaboration_popup = None;
                                 }
                             });
@@ -3593,7 +3805,11 @@ impl WorkspaceUi {
                                                 |mut clipboard| clipboard.set_text(&invite),
                                             ) {
                                                 Ok(()) => {
-                                                    self.status = String::from("Invite copied");
+                                                    self.notify(
+                                                        ToastKind::Success,
+                                                        "Invite copied",
+                                                        "The room invite is ready to share.",
+                                                    );
                                                 }
                                                 Err(error) => {
                                                     tracing::debug!(
@@ -3601,6 +3817,11 @@ impl WorkspaceUi {
                                                         "native clipboard unavailable for invite"
                                                     );
                                                     context.copy_text(invite);
+                                                    self.notify(
+                                                        ToastKind::Success,
+                                                        "Invite copied",
+                                                        "The room invite is ready to share.",
+                                                    );
                                                 }
                                             }
                                         }
@@ -3645,63 +3866,78 @@ impl WorkspaceUi {
                                 }
                             }
                             CollaborationPopup::Join => {
-                                collaboration_description(
-                                    ui,
-                                    "Use the invite copied by the room creator.",
-                                    self.dark_mode,
-                                );
-                                collaboration_text_field(
-                                    ui,
-                                    &mut self.collaboration_display_name,
-                                    "Your display name",
-                                    self.dark_mode,
-                                );
-                                if !display_name_valid {
-                                    collaboration_required_name_message(ui, self.dark_mode);
-                                }
-                                collaboration_text_field(
-                                    ui,
-                                    &mut self.collaboration_invite,
-                                    "Paste room invite token",
-                                    self.dark_mode,
-                                );
-                                egui::CollapsingHeader::new("Advanced")
-                                    .default_open(false)
-                                    .show(ui, |ui| {
-                                        collaboration_text_field(
-                                            ui,
-                                            &mut self.collaboration_endpoint,
-                                            "wss:// endpoint (optional)",
-                                            self.dark_mode,
-                                        );
-                                        collaboration_text_field(
-                                            ui,
-                                            &mut self.collaboration_certificate_sha256,
-                                            "Certificate SHA-256 pin (optional)",
-                                            self.dark_mode,
-                                        );
-                                    });
-                                if ui
-                                    .add_enabled_ui(
-                                        (collaboration.server_available || has_custom_endpoint)
-                                            && display_name_valid,
-                                        |ui| collaboration_primary_button(ui, "Join room"),
-                                    )
-                                    .inner
-                                    .clicked()
-                                {
-                                    action = CollaborationAction::Join {
-                                        invite_token: self.collaboration_invite.trim().to_owned(),
-                                        display_name: self
-                                            .collaboration_display_name
-                                            .trim()
-                                            .to_owned(),
-                                        endpoint: self.collaboration_endpoint.trim().to_owned(),
-                                        certificate_sha256: self
-                                            .collaboration_certificate_sha256
-                                            .trim()
-                                            .to_owned(),
-                                    };
+                                if joined_room {
+                                    collaboration_description(
+                                        ui,
+                                        "You are connected to this room.",
+                                        self.dark_mode,
+                                    );
+                                    if collaboration_primary_button(ui, "Leave room").clicked() {
+                                        action = CollaborationAction::LeaveRoom;
+                                        self.collaboration_popup = None;
+                                    }
+                                } else {
+                                    collaboration_description(
+                                        ui,
+                                        "Use the invite copied by the room creator.",
+                                        self.dark_mode,
+                                    );
+                                    collaboration_text_field(
+                                        ui,
+                                        &mut self.collaboration_display_name,
+                                        "Your display name",
+                                        self.dark_mode,
+                                    );
+                                    if !display_name_valid {
+                                        collaboration_required_name_message(ui, self.dark_mode);
+                                    }
+                                    collaboration_text_field(
+                                        ui,
+                                        &mut self.collaboration_invite,
+                                        "Paste room invite token",
+                                        self.dark_mode,
+                                    );
+                                    egui::CollapsingHeader::new("Advanced")
+                                        .default_open(false)
+                                        .show(ui, |ui| {
+                                            collaboration_text_field(
+                                                ui,
+                                                &mut self.collaboration_endpoint,
+                                                "wss:// endpoint (optional)",
+                                                self.dark_mode,
+                                            );
+                                            collaboration_text_field(
+                                                ui,
+                                                &mut self.collaboration_certificate_sha256,
+                                                "Certificate SHA-256 pin (optional)",
+                                                self.dark_mode,
+                                            );
+                                        });
+                                    if ui
+                                        .add_enabled_ui(
+                                            (collaboration.server_available || has_custom_endpoint)
+                                                && display_name_valid,
+                                            |ui| collaboration_primary_button(ui, "Join room"),
+                                        )
+                                        .inner
+                                        .clicked()
+                                    {
+                                        action = CollaborationAction::Join {
+                                            invite_token: self
+                                                .collaboration_invite
+                                                .trim()
+                                                .to_owned(),
+                                            display_name: self
+                                                .collaboration_display_name
+                                                .trim()
+                                                .to_owned(),
+                                            endpoint: self.collaboration_endpoint.trim().to_owned(),
+                                            certificate_sha256: self
+                                                .collaboration_certificate_sha256
+                                                .trim()
+                                                .to_owned(),
+                                        };
+                                    }
                                 }
                             }
                         }
@@ -3743,22 +3979,89 @@ impl WorkspaceUi {
     }
 
     fn save_document(&mut self, editor: &Editor) -> bool {
-        match crate::storage::save_document(&self.autosave_directory, editor.document()) {
+        let path = self
+            .document_path
+            .clone()
+            .or_else(|| self.choose_document_save_path());
+        let Some(path) = path else {
+            return false;
+        };
+        self.write_document(editor, &path)
+    }
+
+    fn save_document_as(&mut self, editor: &Editor) -> bool {
+        let Some(path) = self.choose_document_save_path() else {
+            return false;
+        };
+        self.write_document(editor, &path)
+    }
+
+    fn save_document_before_replacing(&mut self, editor: &Editor) -> bool {
+        let result = if let Some(path) = self.document_path.clone() {
+            crate::storage::save_document_to_path(&path, editor.document()).map(|()| path)
+        } else {
+            crate::storage::save_document(&self.autosave_directory, editor.document())
+        };
+        match result {
             Ok(path) => {
-                self.status = format!("Saved locally to {}", path.display());
+                self.notify(
+                    ToastKind::Info,
+                    "Canvas saved",
+                    format!("Saved a backup to {}.", path.display()),
+                );
                 true
             }
             Err(error) => {
-                self.status = format!("Could not save locally: {error}");
+                self.notify(ToastKind::Error, "Could not save canvas", error.to_string());
+                false
+            }
+        }
+    }
+
+    fn choose_document_save_path(&self) -> Option<PathBuf> {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save Sketchi document")
+            .add_filter("Sketchi JSON document", &["json"]);
+        if let Some(path) = &self.document_path {
+            if let Some(parent) = path.parent() {
+                dialog = dialog.set_directory(parent);
+            }
+            if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+                dialog = dialog.set_file_name(file_name);
+            }
+        } else if let Ok(directory) = env::current_dir() {
+            dialog = dialog.set_directory(directory);
+            dialog = dialog.set_file_name("untitled.json");
+        }
+        dialog.save_file().map(normalize_document_path)
+    }
+
+    fn write_document(&mut self, editor: &Editor, path: &Path) -> bool {
+        match crate::storage::save_document_to_path(path, editor.document()) {
+            Ok(()) => {
+                self.document_path = Some(path.to_owned());
+                self.notify(
+                    ToastKind::Success,
+                    "Document saved",
+                    format!("Saved to {}.", path.display()),
+                );
+                true
+            }
+            Err(error) => {
+                self.notify(
+                    ToastKind::Error,
+                    "Could not save document",
+                    error.to_string(),
+                );
                 false
             }
         }
     }
 
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn show_settings_window(
+    pub(crate) fn show_settings_modal(
         &mut self,
-        ui: &mut egui::Ui,
+        context: &egui::Context,
         editor: &mut Editor,
         tools: &mut ToolController,
     ) {
@@ -3767,7 +4070,7 @@ impl WorkspaceUi {
         }
 
         if self.poll_update_check() {
-            ui.ctx().request_repaint();
+            context.request_repaint();
         }
 
         if self.appearance == AppearanceMode::System {
@@ -3778,7 +4081,7 @@ impl WorkspaceUi {
             self.update_checked_in_session = true;
             if update::is_check_due(self.update_cache.checked_at_epoch) {
                 self.start_update_check();
-                ui.ctx().request_repaint();
+                context.request_repaint();
             }
         }
         let pages = [
@@ -3787,44 +4090,106 @@ impl WorkspaceUi {
             (SettingsPage::Input, "Input", Icon::InputMethod),
             (SettingsPage::About, "About", Icon::Information),
         ];
-        ui.ctx().set_visuals(settings_visuals(self.dark_mode));
-        self.handle_keybind_input(ui.ctx(), editor, tools);
-        let root_stroke = Stroke::new(
-            1.0_f32,
-            if self.dark_mode {
-                DARK_BORDER
-            } else {
-                LIGHT_BORDER
-            },
+        context.set_visuals(settings_visuals(self.dark_mode));
+        let was_capturing_keybind = self.capturing_keybind.is_some();
+        self.handle_keybind_input(context, editor, tools);
+        let viewport = context.content_rect();
+        let modal_size = Vec2::new(
+            (viewport.width() - 32.0).clamp(320.0, SETTINGS_MODAL_WIDTH),
+            (viewport.height() - 32.0).clamp(320.0, SETTINGS_MODAL_HEIGHT),
         );
-        let root_corner_radius = CornerRadius {
-            nw: 0,
-            ne: 0,
-            sw: SETTINGS_ROOT_RADIUS,
-            se: SETTINGS_ROOT_RADIUS,
-        };
-        egui::CentralPanel::default()
-            .frame(settings_window_frame(self.dark_mode).stroke(Stroke::NONE))
-            .show(ui, |ui| {
-                let root_rect = ui.max_rect();
-                let settings_body_width = ui.available_width();
-                let settings_body_height = ui.available_height();
-                ui.allocate_ui_with_layout(
-                    Vec2::new(settings_body_width, settings_body_height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    let content_height = settings_body_height;
+        let modal_position = viewport.center() - modal_size / 2.0;
+        let mut close_requested =
+            context.input(|input| input.key_pressed(Key::Escape)) && !was_capturing_keybind;
+
+        let backdrop_clicked = egui::Area::new(Id::new("sketchi.settings_backdrop"))
+            .fixed_pos(viewport.min)
+            .order(egui::Order::Middle)
+            .show(context, |ui| {
+                let (rect, response) = ui.allocate_exact_size(viewport.size(), Sense::click());
+                ui.painter().rect_filled(
+                    rect,
+                    CornerRadius::ZERO,
+                    Color32::from_black_alpha(if self.dark_mode { 120 } else { 72 }),
+                );
+                response
+            })
+            .inner
+            .clicked();
+        close_requested |= backdrop_clicked;
+
+        egui::Area::new(Id::new("sketchi.settings_modal"))
+            .fixed_pos(modal_position)
+            .order(egui::Order::Foreground)
+            .show(context, |ui| {
+                ui.set_min_size(modal_size);
+                ui.set_max_size(modal_size);
+                settings_modal_frame(self.dark_mode).show(ui, |ui| {
+                    ui.set_min_size(modal_size);
+                    ui.set_max_size(modal_size);
+                    ui.add_space(SETTINGS_HEADER_INSET);
                     ui.allocate_ui_with_layout(
-                        Vec2::new(settings_body_width, content_height),
+                        Vec2::new(ui.available_width(), 28.0),
+                        Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(16.0);
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new("Settings")
+                                    .size(18.0)
+                                    .strong()
+                                    .color(text_color(self.dark_mode)),
+                            );
+                            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add_space(12.0);
+                                let close_response = close_icon_button(
+                                    ui,
+                                    24.0,
+                                    muted_color(self.dark_mode),
+                                    crate::theme::ThemeTokens::for_dark_mode(self.dark_mode)
+                                        .destructive,
+                                );
+                                if close_response.clicked() {
+                                    close_requested = true;
+                                }
+                            });
+                        },
+                    );
+                    ui.add_space(SETTINGS_HEADER_INSET);
+                    // The body below the header uses a fixed 10px inset. Do not
+                    // let the parent layout add its default vertical gap before
+                    // that inset, or the top spacing becomes larger than the
+                    // left, right, and bottom spacing.
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.separator();
+                    let settings_body_width = ui.available_width();
+                    let settings_body_height = ui.available_height();
+                    ui.add_space(SETTINGS_BODY_INSET);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.add_space(SETTINGS_BODY_INSET);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(
+                                (settings_body_width - 2.0 * SETTINGS_BODY_INSET).max(0.0),
+                                (settings_body_height - 2.0 * SETTINGS_BODY_INSET).max(0.0),
+                            ),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let content_height =
+                        (settings_body_height - 2.0 * SETTINGS_BODY_INSET).max(0.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(
+                            (settings_body_width - 2.0 * SETTINGS_BODY_INSET).max(0.0),
+                            content_height,
+                        ),
                         egui::Layout::left_to_right(egui::Align::Min),
                         |ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
                             ui.allocate_ui_with_layout(
                                 Vec2::new(SETTINGS_NAV_WIDTH, content_height),
-                                egui::Layout::top_down(egui::Align::Center),
+                                egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
-                                    ui.add_space(12.0);
                                     ui.spacing_mut().item_spacing.y = 4.0;
                                     for (page, label, icon) in pages {
                                         if settings_nav_item(
@@ -3841,26 +4206,31 @@ impl WorkspaceUi {
                                     }
                                 },
                             );
+                            ui.add_space(SETTINGS_BODY_INSET);
                             settings_sidebar_divider(ui, content_height, self.dark_mode);
-                            ui.add_space(10.0);
+                            ui.add_space(SETTINGS_BODY_INSET);
                             let content_width = ui.available_width();
-                            let page_width = (content_width - 12.0).max(0.0);
-                            let page_content_height = (content_height - 10.0).max(0.0);
+                            let page_content_height = content_height;
                             ui.allocate_ui_with_layout(
                                 Vec2::new(content_width, content_height),
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
-                                    ui.add_space(10.0);
                                     ui.scope(|ui| {
-                                        ui.spacing_mut().scroll.fade.strength = 0.0;
-                                        egui::ScrollArea::vertical()
-                                            .id_salt(("sketchi.settings.content", selected_page))
+                                        let content_style = configure_scroll_area(ui);
+                                        let page_changed = selected_page != self.settings_page;
+                                        let mut settings_scroll = egui::ScrollArea::vertical()
+                                            .id_salt("sketchi.settings.content")
                                             .max_height(page_content_height)
                                             .auto_shrink([false, false])
                                             .scroll_bar_visibility(
                                                 settings_scroll_bar_visibility(),
-                                            )
-                                            .show(ui, |ui| {
+                                            );
+                                        if page_changed {
+                                            settings_scroll = settings_scroll.vertical_scroll_offset(0.0);
+                                        }
+                                        settings_scroll.show(ui, |ui| {
+                                                ui.set_style(content_style.clone());
+                                                let page_width = ui.available_width();
                                                 ui.set_width(page_width);
                                                 match selected_page {
                         SettingsPage::General => {
@@ -4094,27 +4464,68 @@ impl WorkspaceUi {
                             );
                             ui.add_space(20.0);
                             let mut clicked_action = None;
-                            let card_gap = 12.0;
-                            let card_width = ((ui.available_width() - card_gap) * 0.5).max(180.0);
-                            for actions in KeybindAction::ALL.chunks(2) {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = card_gap;
-                                    for &action in actions {
-                                        let binding = self.keybinds.binding(action);
-                                        let capturing = self.capturing_keybind == Some(action);
-                                        if show_keybind_card(
-                                            ui,
-                                            action,
-                                            binding,
-                                            capturing,
-                                            self.dark_mode,
-                                            card_width,
-                                        ) {
-                                            clicked_action = Some(action);
-                                        }
-                                    }
+                            let tool_actions = KeybindAction::ALL
+                                .into_iter()
+                                .filter(|action| action.tool().is_some())
+                                .collect::<Vec<_>>();
+                            let editor_actions = KeybindAction::ALL
+                                .into_iter()
+                                .filter(|action| action.tool().is_none())
+                                .collect::<Vec<_>>();
+                            let keybinds = self.keybinds;
+                            let dark_mode = self.dark_mode;
+                            let capturing_keybind = self.capturing_keybind;
+
+                            if ui.available_width() >= 560.0 {
+                                ui.scope(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 12.0;
+                                    ui.columns(2, |columns| {
+                                        let (left, right) = columns.split_at_mut(1);
+                                        let (Some(left), Some(right)) =
+                                            (left.first_mut(), right.first_mut())
+                                        else {
+                                            return;
+                                        };
+                                        show_settings_keybind_column(
+                                            left,
+                                            "Tools",
+                                            &tool_actions,
+                                            keybinds,
+                                            dark_mode,
+                                            capturing_keybind,
+                                            &mut clicked_action,
+                                        );
+                                        show_settings_keybind_column(
+                                            right,
+                                            "Editor",
+                                            &editor_actions,
+                                            keybinds,
+                                            dark_mode,
+                                            capturing_keybind,
+                                            &mut clicked_action,
+                                        );
+                                    });
                                 });
-                                ui.add_space(10.0);
+                            } else {
+                                show_settings_keybind_column(
+                                    ui,
+                                    "Tools",
+                                    &tool_actions,
+                                    keybinds,
+                                    dark_mode,
+                                    capturing_keybind,
+                                    &mut clicked_action,
+                                );
+                                ui.add_space(12.0);
+                                show_settings_keybind_column(
+                                    ui,
+                                    "Editor",
+                                    &editor_actions,
+                                    keybinds,
+                                    dark_mode,
+                                    capturing_keybind,
+                                    &mut clicked_action,
+                                );
                             }
                             if let Some(action) = clicked_action {
                                 self.capturing_keybind = Some(action);
@@ -4497,25 +4908,24 @@ impl WorkspaceUi {
                             );
                         },
                     );
-                });
-                ui.painter().rect_stroke(
-                    // StrokeKind::Inside keeps the complete stroke within the
-                    // client rect, so every edge uses the same origin without
-                    // introducing a half-pixel inset on the top and left.
-                    root_rect,
-                    root_corner_radius,
-                    root_stroke,
-                    StrokeKind::Inside,
-                );
+                            },
+                        );
+                        ui.add_space(SETTINGS_BODY_INSET);
                     });
+                });
+            });
 
+        if close_requested {
+            self.close_settings();
+            return;
+        }
         if self
             .color_picker
             .is_some_and(ColorPickerTarget::is_settings)
         {
-            self.show_color_picker(ui.ctx(), editor);
+            self.show_color_picker(context, editor);
         }
-        ui.ctx().set_visuals(sketchi_visuals(self.dark_mode));
+        context.set_visuals(sketchi_visuals(self.dark_mode));
         self.settings_page = selected_page;
     }
 
@@ -4564,20 +4974,19 @@ impl WorkspaceUi {
         false
     }
 
+    #[allow(clippy::too_many_lines)]
     fn show_tool_palette(&mut self, context: &egui::Context, tools: &mut ToolController) {
         let tool_buttons = [
             (Tool::Select, Icon::Select, "Select"),
             (Tool::Text, Icon::InputCursorMove, "Text"),
             (Tool::Freehand, Icon::Freehand, "Freehand"),
             (Tool::Rectangle, Icon::Rectangle, "Rectangle"),
-            (Tool::Diamond, Icon::PokerDiamonds, "Diamond"),
-            (Tool::Triangle, Icon::Triangle, "Triangle"),
             (Tool::Ellipse, Icon::Ellipse, "Ellipse"),
-            (Tool::Line, Icon::Line, "Line"),
-            (Tool::Arrow, Icon::ArrowLeftDownLong, "Arrow"),
-            (Tool::Pan, Icon::Pan, "Pan"),
         ];
         let mut selected_tool = None;
+        let mut line_group_rect = None;
+        let mut arrow_group_rect = None;
+        let mut triangle_group_rect = None;
         egui::Area::new(Id::new("sketchi.tool_palette"))
             .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 16.0))
             .order(egui::Order::Foreground)
@@ -4605,11 +5014,355 @@ impl WorkspaceUi {
                                 selected_tool = Some(tool);
                             }
                         }
+                        let active_triangle = matches!(
+                            self.active_tool,
+                            Tool::Triangle | Tool::Diamond | Tool::Pentagon | Tool::Hexagon
+                        );
+                        let triangle_tool = match self.active_tool {
+                            Tool::Diamond => Tool::Diamond,
+                            Tool::Pentagon => Tool::Pentagon,
+                            Tool::Hexagon => Tool::Hexagon,
+                            _ => Tool::Triangle,
+                        };
+                        let triangle_icon = match triangle_tool {
+                            Tool::Diamond => Icon::PokerDiamonds,
+                            Tool::Pentagon => Icon::Pentagon,
+                            Tool::Hexagon => Icon::Hexagon,
+                            _ => Icon::Triangle,
+                        };
+                        let triangle_label = tool_name(triangle_tool).to_owned();
+                        let triangle_response = tool_family_button(
+                            ui,
+                            triangle_icon,
+                            &triangle_label,
+                            active_triangle,
+                            self.triangle_menu_open,
+                            self.dark_mode,
+                        );
+                        if triangle_response.clicked() {
+                            selected_tool = Some(triangle_tool);
+                        }
+                        if triangle_response.clicked_by(PointerButton::Secondary) {
+                            let opening = !self.triangle_menu_open;
+                            self.triangle_menu_open = opening;
+                            if opening {
+                                self.line_menu_open = false;
+                                self.arrow_menu_open = false;
+                            }
+                        }
+                        triangle_group_rect = Some(triangle_response.rect);
+                        let active_line = matches!(
+                            self.active_tool,
+                            Tool::Line
+                                | Tool::CurvedLineClockwise
+                                | Tool::CurvedLineCounterClockwise
+                        );
+                        let line_tool = match self.active_tool {
+                            Tool::CurvedLineClockwise => Tool::CurvedLineClockwise,
+                            Tool::CurvedLineCounterClockwise => Tool::CurvedLineCounterClockwise,
+                            _ => Tool::Line,
+                        };
+                        let line_icon = match line_tool {
+                            Tool::CurvedLineClockwise => Icon::CurvedLineClockwise,
+                            Tool::CurvedLineCounterClockwise => Icon::CurvedLineCounterClockwise,
+                            _ => Icon::Line,
+                        };
+                        let line_label = tool_name(line_tool).to_owned();
+                        let line_response = tool_family_button(
+                            ui,
+                            line_icon,
+                            &line_label,
+                            active_line,
+                            self.line_menu_open,
+                            self.dark_mode,
+                        );
+                        if line_response.clicked() {
+                            selected_tool = Some(line_tool);
+                        }
+                        if line_response.clicked_by(PointerButton::Secondary) {
+                            let opening = !self.line_menu_open;
+                            self.line_menu_open = opening;
+                            if opening {
+                                self.arrow_menu_open = false;
+                                self.triangle_menu_open = false;
+                            }
+                        }
+                        line_group_rect = Some(line_response.rect);
+
+                        let active_arrow = matches!(
+                            self.active_tool,
+                            Tool::Arrow
+                                | Tool::CurvedArrowClockwise
+                                | Tool::CurvedArrowCounterClockwise
+                        );
+                        let arrow_tool = match self.active_tool {
+                            Tool::CurvedArrowClockwise => Tool::CurvedArrowClockwise,
+                            Tool::CurvedArrowCounterClockwise => Tool::CurvedArrowCounterClockwise,
+                            _ => Tool::Arrow,
+                        };
+                        let arrow_icon = match arrow_tool {
+                            Tool::CurvedArrowClockwise => Icon::CurvedArrowClockwise,
+                            Tool::CurvedArrowCounterClockwise => Icon::CurvedArrowCounterClockwise,
+                            _ => Icon::ArrowLeftDownLong,
+                        };
+                        let arrow_label = tool_name(arrow_tool).to_owned();
+                        let arrow_response = tool_family_button(
+                            ui,
+                            arrow_icon,
+                            &arrow_label,
+                            active_arrow,
+                            self.arrow_menu_open,
+                            self.dark_mode,
+                        );
+                        if arrow_response.clicked() {
+                            selected_tool = Some(arrow_tool);
+                        }
+                        if arrow_response.clicked_by(PointerButton::Secondary) {
+                            let opening = !self.arrow_menu_open;
+                            self.arrow_menu_open = opening;
+                            if opening {
+                                self.line_menu_open = false;
+                                self.triangle_menu_open = false;
+                            }
+                        }
+                        arrow_group_rect = Some(arrow_response.rect);
+                        if icon_button(
+                            ui,
+                            Icon::Pan,
+                            "Pan",
+                            self.active_tool == Tool::Pan,
+                            self.dark_mode,
+                        )
+                        .clicked()
+                        {
+                            selected_tool = Some(Tool::Pan);
+                        }
                     });
                 });
             });
         if let Some(tool) = selected_tool {
             self.choose_tool(tool, tools);
+        }
+        if self.line_menu_open
+            && let Some(anchor) = line_group_rect
+        {
+            self.show_line_tools_menu(context, tools, anchor, &mut selected_tool);
+        }
+        if self.arrow_menu_open
+            && let Some(anchor) = arrow_group_rect
+        {
+            self.show_arrow_tools_menu(context, tools, anchor, &mut selected_tool);
+        }
+        if self.triangle_menu_open
+            && let Some(anchor) = triangle_group_rect
+        {
+            self.show_triangle_tools_menu(context, tools, anchor, &mut selected_tool);
+        }
+    }
+
+    fn show_triangle_tools_menu(
+        &mut self,
+        context: &egui::Context,
+        tools: &mut ToolController,
+        anchor: Rect,
+        selected_tool: &mut Option<Tool>,
+    ) {
+        let mut popup_selection = None;
+        let popup_rect = egui::Area::new(Id::new("sketchi.triangle_tools_menu"))
+            .pivot(Align2::CENTER_TOP)
+            .fixed_pos(Pos2::new(anchor.center().x, anchor.bottom() + 4.0))
+            .order(egui::Order::Foreground)
+            .show(context, |ui| {
+                toolbar_frame(self.dark_mode).show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for (tool, icon, name) in [
+                            (Tool::Triangle, Icon::Triangle, "Triangle"),
+                            (Tool::Diamond, Icon::PokerDiamonds, "Diamond"),
+                            (Tool::Pentagon, Icon::Pentagon, "Pentagon"),
+                            (Tool::Hexagon, Icon::Hexagon, "Hexagon"),
+                        ] {
+                            let shortcut = KeybindAction::ALL
+                                .into_iter()
+                                .find(|action| action.tool() == Some(tool))
+                                .map(|action| key_binding_label(self.keybinds.binding(action)));
+                            let tooltip = shortcut.map_or_else(
+                                || String::from(name),
+                                |shortcut| format!("{name} · {shortcut}"),
+                            );
+                            if icon_button(
+                                ui,
+                                icon,
+                                &tooltip,
+                                self.active_tool == tool,
+                                self.dark_mode,
+                            )
+                            .clicked()
+                            {
+                                popup_selection = Some(tool);
+                            }
+                        }
+                    });
+                });
+            })
+            .response
+            .rect;
+        if let Some(tool) = popup_selection {
+            *selected_tool = Some(tool);
+            self.triangle_menu_open = false;
+            self.choose_tool(tool, tools);
+            return;
+        }
+        let outside_click = context.input(|input| {
+            input.pointer.button_pressed(PointerButton::Primary)
+                && input.pointer.interact_pos().is_some_and(|position| {
+                    !anchor.contains(position) && !popup_rect.contains(position)
+                })
+        });
+        if outside_click {
+            self.triangle_menu_open = false;
+        }
+    }
+
+    fn show_line_tools_menu(
+        &mut self,
+        context: &egui::Context,
+        tools: &mut ToolController,
+        anchor: Rect,
+        selected_tool: &mut Option<Tool>,
+    ) {
+        let mut popup_selection = None;
+        let popup_rect = egui::Area::new(Id::new("sketchi.line_tools_menu"))
+            .pivot(Align2::CENTER_TOP)
+            .fixed_pos(Pos2::new(anchor.center().x, anchor.bottom() + 4.0))
+            .order(egui::Order::Foreground)
+            .show(context, |ui| {
+                toolbar_frame(self.dark_mode).show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for (tool, icon, name) in [
+                            (Tool::Line, Icon::Line, "Line"),
+                            (
+                                Tool::CurvedLineClockwise,
+                                Icon::CurvedLineClockwise,
+                                "Clockwise line",
+                            ),
+                            (
+                                Tool::CurvedLineCounterClockwise,
+                                Icon::CurvedLineCounterClockwise,
+                                "Counter-clockwise line",
+                            ),
+                        ] {
+                            let shortcut = KeybindAction::ALL
+                                .into_iter()
+                                .find(|action| action.tool() == Some(tool))
+                                .map(|action| key_binding_label(self.keybinds.binding(action)));
+                            let tooltip = shortcut.map_or_else(
+                                || String::from(name),
+                                |shortcut| format!("{name} · {shortcut}"),
+                            );
+                            if icon_button(
+                                ui,
+                                icon,
+                                &tooltip,
+                                self.active_tool == tool,
+                                self.dark_mode,
+                            )
+                            .clicked()
+                            {
+                                popup_selection = Some(tool);
+                            }
+                        }
+                    });
+                });
+            })
+            .response
+            .rect;
+        if let Some(tool) = popup_selection {
+            *selected_tool = Some(tool);
+            self.line_menu_open = false;
+            self.choose_tool(tool, tools);
+            return;
+        }
+        let outside_click = context.input(|input| {
+            input.pointer.button_pressed(PointerButton::Primary)
+                && input.pointer.interact_pos().is_some_and(|position| {
+                    !anchor.contains(position) && !popup_rect.contains(position)
+                })
+        });
+        if outside_click {
+            self.line_menu_open = false;
+        }
+    }
+
+    fn show_arrow_tools_menu(
+        &mut self,
+        context: &egui::Context,
+        tools: &mut ToolController,
+        anchor: Rect,
+        selected_tool: &mut Option<Tool>,
+    ) {
+        let mut popup_selection = None;
+        let popup_rect = egui::Area::new(Id::new("sketchi.arrow_tools_menu"))
+            .pivot(Align2::CENTER_TOP)
+            .fixed_pos(Pos2::new(anchor.center().x, anchor.bottom() + 4.0))
+            .order(egui::Order::Foreground)
+            .show(context, |ui| {
+                toolbar_frame(self.dark_mode).show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for (tool, icon, name) in [
+                            (Tool::Arrow, Icon::ArrowLeftDownLong, "Arrow"),
+                            (
+                                Tool::CurvedArrowClockwise,
+                                Icon::CurvedArrowClockwise,
+                                "Clockwise arrow",
+                            ),
+                            (
+                                Tool::CurvedArrowCounterClockwise,
+                                Icon::CurvedArrowCounterClockwise,
+                                "Counter-clockwise arrow",
+                            ),
+                        ] {
+                            let shortcut = KeybindAction::ALL
+                                .into_iter()
+                                .find(|action| action.tool() == Some(tool))
+                                .map(|action| key_binding_label(self.keybinds.binding(action)));
+                            let tooltip = shortcut.map_or_else(
+                                || String::from(name),
+                                |shortcut| format!("{name} · {shortcut}"),
+                            );
+                            if icon_button(
+                                ui,
+                                icon,
+                                &tooltip,
+                                self.active_tool == tool,
+                                self.dark_mode,
+                            )
+                            .clicked()
+                            {
+                                popup_selection = Some(tool);
+                            }
+                        }
+                    });
+                });
+            })
+            .response
+            .rect;
+        if let Some(tool) = popup_selection {
+            *selected_tool = Some(tool);
+            self.arrow_menu_open = false;
+            self.choose_tool(tool, tools);
+            return;
+        }
+        let outside_click = context.input(|input| {
+            input.pointer.button_pressed(PointerButton::Primary)
+                && input.pointer.interact_pos().is_some_and(|position| {
+                    !anchor.contains(position) && !popup_rect.contains(position)
+                })
+        });
+        if outside_click {
+            self.arrow_menu_open = false;
         }
     }
 
@@ -4633,16 +5386,16 @@ impl WorkspaceUi {
             });
 
         if undo_requested {
-            self.status = match editor.undo() {
-                Ok(_) => String::from("Undid the last operation"),
-                Err(error) => error.to_string(),
-            };
+            match editor.undo() {
+                Ok(_) => self.status = String::from("Undid the last operation"),
+                Err(error) => self.report_error("Undo failed", error.to_string()),
+            }
         }
         if redo_requested {
-            self.status = match editor.redo() {
-                Ok(_) => String::from("Redid the last operation"),
-                Err(error) => error.to_string(),
-            };
+            match editor.redo() {
+                Ok(_) => self.status = String::from("Redid the last operation"),
+                Err(error) => self.report_error("Redo failed", error.to_string()),
+            }
         }
     }
 
@@ -4687,20 +5440,27 @@ impl WorkspaceUi {
                     .next()
                     .and_then(|id| document.element(*id))
                     .is_some_and(|element| element.kind == ElementKind::Freehand));
-        let no_fill_properties =
-            matches!(self.active_tool, Tool::Freehand | Tool::Line | Tool::Arrow)
-                || (self.selected.len() == 1
-                    && self
-                        .selected
-                        .iter()
-                        .next()
-                        .and_then(|id| document.element(*id))
-                        .is_some_and(|element| {
-                            matches!(
-                                element.kind,
-                                ElementKind::Freehand | ElementKind::Line | ElementKind::Arrow
-                            )
-                        }));
+        let no_fill_properties = matches!(
+            self.active_tool,
+            Tool::Freehand
+                | Tool::Line
+                | Tool::CurvedLineClockwise
+                | Tool::CurvedLineCounterClockwise
+                | Tool::Arrow
+                | Tool::CurvedArrowClockwise
+                | Tool::CurvedArrowCounterClockwise
+        ) || (self.selected.len() == 1
+            && self
+                .selected
+                .iter()
+                .next()
+                .and_then(|id| document.element(*id))
+                .is_some_and(|element| {
+                    matches!(
+                        element.kind,
+                        ElementKind::Freehand | ElementKind::Line | ElementKind::Arrow
+                    )
+                }));
         let stroke_preset_limit = stroke_preset_count();
         let panel_height = (context.content_rect().height() - 104.0).max(280.0);
         egui::Area::new(Id::new("sketchi.properties"))
@@ -4712,11 +5472,12 @@ impl WorkspaceUi {
                     // properties scrollbar starts.
                     ui.set_width(260.0);
                     ui.scope(|ui| {
-                        ui.spacing_mut().scroll.fade.strength = 0.0;
+                        let content_style = configure_scroll_area(ui);
                         egui::ScrollArea::vertical()
                             .max_height(panel_height)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
+                                ui.set_style(content_style.clone());
                                 if !text_selection && !image_selection {
                                     ui.label(
                                         egui::RichText::new(if self.selected.len() > 1 {
@@ -5246,9 +6007,7 @@ impl WorkspaceUi {
                                 ui.add_space(10.0);
                                 section_label(ui, "Opacity", self.dark_mode);
                                 let mut opacity = style.opacity;
-                                // Leave room for the properties scroll bar and the
-                                // slider handle so the two controls never overlap.
-                                let slider_width = (ui.available_width() - 18.0).max(80.0);
+                                let slider_width = ui.available_width().max(80.0);
                                 let track = if self.dark_mode {
                                     DARK_BORDER
                                 } else {
@@ -5593,7 +6352,13 @@ impl WorkspaceUi {
                                 .on_hover_text("Copy color")
                                 .clicked()
                                 {
-                                    context.copy_text(format_hex_color(picker_color));
+                                    let color = format_hex_color(picker_color);
+                                    context.copy_text(color.clone());
+                                    self.notify(
+                                        ToastKind::Success,
+                                        "Color copied",
+                                        format!("{color} is ready to paste."),
+                                    );
                                 }
                             });
                         });
@@ -5689,10 +6454,11 @@ impl WorkspaceUi {
                 }
             }
             self.draft_style = next_style;
-            self.status = failed.map_or_else(
-                || String::from("Style updated"),
-                |error| format!("Could not update style: {error}"),
-            );
+            if let Some(error) = failed {
+                self.report_error("Could not update style", error);
+            } else {
+                self.status = String::from("Style updated");
+            }
         }
     }
 
@@ -5821,8 +6587,13 @@ impl WorkspaceUi {
             }
             ElementAction::CopyLink => {
                 if let Some(element_id) = self.selected.iter().next() {
-                    context.copy_text(format!("sketchi://element/{element_id}"));
-                    self.status = String::from("Element link copied");
+                    let link = format!("sketchi://element/{element_id}");
+                    context.copy_text(link);
+                    self.notify(
+                        ToastKind::Success,
+                        "Element link copied",
+                        "The link is ready to paste.",
+                    );
                 }
             }
         }
@@ -5893,31 +6664,207 @@ impl WorkspaceUi {
         }
     }
 
-    fn show_status(&self, context: &egui::Context, editor: &Editor, camera: &Camera) {
-        egui::Area::new(Id::new("sketchi.status"))
+    fn show_help(&mut self, context: &egui::Context) {
+        let button_response = egui::Area::new(Id::new("sketchi.help_button"))
             .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-16.0, -16.0))
             .order(egui::Order::Foreground)
             .show(context, |ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{}  ·  {} objects  ·  {}",
-                        tool_name(self.active_tool),
-                        editor.document().len(),
-                        zoom_percent(camera.zoom())
-                    ))
-                    .small()
-                    .color(muted_color(self.dark_mode)),
+                let (rect, response) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
+                let (fill, icon_color) =
+                    help_button_colors(self.dark_mode, self.help_open, response.hovered());
+                ui.painter().rect(
+                    rect,
+                    CornerRadius::same(8),
+                    fill,
+                    Stroke::new(
+                        1.0,
+                        if self.help_open {
+                            ACCENT
+                        } else if self.dark_mode {
+                            DARK_BORDER
+                        } else {
+                            LIGHT_BORDER
+                        },
+                    ),
+                    StrokeKind::Inside,
                 );
-                ui.label(
-                    egui::RichText::new(&self.status)
-                        .small()
-                        .color(muted_color(self.dark_mode)),
-                );
+                paint_lucide_icon(ui.painter(), Icon::BadgeInfo, rect, icon_color);
+                response.on_hover_text("Help")
             });
+        let button_rect = button_response.response.rect;
+        if button_response.inner.clicked() {
+            self.help_open = !self.help_open;
+        }
+        if !self.help_open {
+            return;
+        }
+
+        let tool_actions = KeybindAction::ALL
+            .into_iter()
+            .filter(|action| action.tool().is_some())
+            .collect::<Vec<_>>();
+        let editor_actions = KeybindAction::ALL
+            .into_iter()
+            .filter(|action| action.tool().is_none())
+            .collect::<Vec<_>>();
+        let panel_rect = self.show_help_panel(context, &tool_actions, &editor_actions);
+        let outside_click = context.input(|input| {
+            input.pointer.button_pressed(PointerButton::Primary)
+                && input.pointer.interact_pos().is_some_and(|position| {
+                    !button_rect.contains(position) && !panel_rect.contains(position)
+                })
+        });
+        if outside_click {
+            self.help_open = false;
+        }
+    }
+
+    fn show_help_panel(
+        &mut self,
+        context: &egui::Context,
+        tool_actions: &[KeybindAction],
+        editor_actions: &[KeybindAction],
+    ) -> Rect {
+        egui::Area::new(Id::new("sketchi.help_panel"))
+            .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-16.0, -68.0))
+            .order(egui::Order::Foreground)
+            .show(context, |ui| {
+                help_panel_frame(self.dark_mode).show(ui, |ui| {
+                    ui.set_width(620.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Help")
+                                .size(18.0)
+                                .strong()
+                                .color(text_color(self.dark_mode)),
+                        );
+                        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                            if close_icon_button(
+                                ui,
+                                24.0,
+                                muted_color(self.dark_mode),
+                                crate::theme::ThemeTokens::for_dark_mode(self.dark_mode)
+                                    .destructive,
+                            )
+                            .clicked()
+                            {
+                                self.help_open = false;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("•").size(16.0).strong().color(ACCENT));
+                        ui.label(
+                            egui::RichText::new("Right-click a shape tool to choose its variants.")
+                                .size(12.0)
+                                .color(muted_color(self.dark_mode)),
+                        );
+                    });
+                    ui.add_space(14.0);
+                    ui.label(
+                        egui::RichText::new("Keyboard shortcuts")
+                            .size(15.0)
+                            .strong()
+                            .color(text_color(self.dark_mode)),
+                    );
+                    ui.add_space(6.0);
+                    ui.scope(|ui| {
+                        let content_style = configure_scroll_area(ui);
+                        egui::ScrollArea::vertical()
+                            .max_height(520.0)
+                            .auto_shrink([false, true])
+                            .scroll_bar_visibility(settings_scroll_bar_visibility())
+                            .show(ui, |ui| {
+                                ui.set_style(content_style.clone());
+                                ui.columns(2, |columns| {
+                                    let (left, right) = columns.split_at_mut(1);
+                                    let (Some(left), Some(right)) =
+                                        (left.first_mut(), right.first_mut())
+                                    else {
+                                        return;
+                                    };
+                                    show_help_keybind_column(
+                                        left,
+                                        "Tools",
+                                        tool_actions,
+                                        self.keybinds,
+                                        self.dark_mode,
+                                    );
+                                    show_help_keybind_column(
+                                        right,
+                                        "Editor",
+                                        editor_actions,
+                                        self.keybinds,
+                                        self.dark_mode,
+                                    );
+                                });
+                            });
+                    });
+                });
+            })
+            .response
+            .rect
     }
 }
 
-fn settings_window_frame(dark_mode: bool) -> egui::Frame {
+fn help_panel_frame(dark_mode: bool) -> egui::Frame {
+    egui::Frame::new()
+        .fill(if dark_mode {
+            SETTINGS_CARD_DARK
+        } else {
+            LIGHT_PANEL
+        })
+        .stroke(Stroke::new(
+            1.0,
+            if dark_mode { DARK_BORDER } else { LIGHT_BORDER },
+        ))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(14))
+        .shadow(egui::Shadow {
+            offset: [0, 4],
+            blur: 18,
+            spread: 1,
+            color: Color32::from_rgba_unmultiplied(0, 0, 0, if dark_mode { 88 } else { 38 }),
+        })
+}
+
+fn show_help_keybind_column(
+    ui: &mut egui::Ui,
+    title: &str,
+    actions: &[KeybindAction],
+    keybinds: Keybinds,
+    dark_mode: bool,
+) {
+    ui.label(
+        egui::RichText::new(title)
+            .strong()
+            .color(text_color(dark_mode)),
+    );
+    ui.add_space(6.0);
+    for &action in actions {
+        settings_keybind_card_frame(dark_mode).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(action.label())
+                            .size(12.0)
+                            .color(text_color(dark_mode)),
+                    )
+                    .truncate(),
+                );
+                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                    shortcut_pill(ui, keybinds.binding(action), dark_mode);
+                });
+            });
+        });
+        ui.add_space(5.0);
+    }
+}
+
+fn settings_modal_frame(dark_mode: bool) -> egui::Frame {
     egui::Frame::new()
         .fill(if dark_mode {
             SETTINGS_ROOT_DARK
@@ -5928,13 +6875,14 @@ fn settings_window_frame(dark_mode: bool) -> egui::Frame {
             1.0_f32,
             if dark_mode { DARK_BORDER } else { LIGHT_BORDER },
         ))
-        .corner_radius(CornerRadius {
-            nw: 0,
-            ne: 0,
-            sw: SETTINGS_ROOT_RADIUS,
-            se: SETTINGS_ROOT_RADIUS,
-        })
+        .corner_radius(CornerRadius::same(SETTINGS_ROOT_RADIUS))
         .inner_margin(Margin::ZERO)
+        .shadow(egui::Shadow {
+            offset: [0, 4],
+            blur: 18,
+            spread: 1,
+            color: Color32::from_rgba_unmultiplied(0, 0, 0, if dark_mode { 88 } else { 38 }),
+        })
 }
 
 fn settings_group_frame(dark_mode: bool) -> egui::Frame {
@@ -5957,7 +6905,39 @@ fn settings_group_frame(dark_mode: bool) -> egui::Frame {
 }
 
 fn settings_scroll_bar_visibility() -> egui::containers::scroll_area::ScrollBarVisibility {
-    egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden
+    egui::containers::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
+}
+
+const LIGHT_SCROLLBAR_HANDLE: Color32 = Color32::from_rgb(190, 192, 200);
+const LIGHT_SCROLLBAR_TRACK: Color32 = Color32::from_rgb(242, 243, 246);
+
+fn configure_scroll_area(ui: &mut egui::Ui) -> egui::Style {
+    let content_style = ui.style().as_ref().clone();
+    let mut scroll_style = content_style.clone();
+    let dark_mode = scroll_style.visuals.dark_mode;
+    let scroll = &mut scroll_style.spacing.scroll;
+    scroll.floating = false;
+    scroll.content_margin = Margin::ZERO;
+    scroll.bar_width = 6.0;
+    scroll.handle_min_length = 24.0;
+    scroll.bar_inner_margin = 3.0;
+    scroll.bar_outer_margin = 0.0;
+    scroll.foreground_color = false;
+    scroll.fade.strength = 0.0;
+
+    let primary = ACCENT;
+    scroll_style.visuals.widgets.hovered.bg_fill = primary;
+    scroll_style.visuals.widgets.hovered.weak_bg_fill = primary;
+    scroll_style.visuals.widgets.active.bg_fill = primary;
+    scroll_style.visuals.widgets.active.weak_bg_fill = primary;
+
+    if !dark_mode {
+        scroll_style.visuals.extreme_bg_color = LIGHT_SCROLLBAR_TRACK;
+        scroll_style.visuals.widgets.inactive.bg_fill = LIGHT_SCROLLBAR_HANDLE;
+        scroll_style.visuals.widgets.inactive.weak_bg_fill = LIGHT_SCROLLBAR_HANDLE;
+    }
+    ui.set_style(scroll_style);
+    content_style
 }
 
 fn show_mossbyte_agency_credit(ui: &mut egui::Ui, dark_mode: bool) {
@@ -6396,6 +7376,33 @@ fn show_keybind_card(
         });
     });
     clicked
+}
+
+fn show_settings_keybind_column(
+    ui: &mut egui::Ui,
+    title: &str,
+    actions: &[KeybindAction],
+    keybinds: Keybinds,
+    dark_mode: bool,
+    capturing_keybind: Option<KeybindAction>,
+    clicked_action: &mut Option<KeybindAction>,
+) {
+    ui.label(
+        egui::RichText::new(title)
+            .size(13.0)
+            .strong()
+            .color(text_color(dark_mode)),
+    );
+    ui.add_space(8.0);
+    for &action in actions {
+        let binding = keybinds.binding(action);
+        let capturing = capturing_keybind == Some(action);
+        let card_width = ui.available_width();
+        if show_keybind_card(ui, action, binding, capturing, dark_mode, card_width) {
+            *clicked_action = Some(action);
+        }
+        ui.add_space(10.0);
+    }
 }
 
 fn settings_keybind_card_frame(dark_mode: bool) -> egui::Frame {
@@ -6972,6 +7979,82 @@ fn icon_button(
     };
     paint_lucide_icon(ui.painter(), icon, rect, icon_color);
     response.on_hover_text(tooltip)
+}
+
+fn help_button_colors(dark_mode: bool, active: bool, hovered: bool) -> (Color32, Color32) {
+    if active {
+        (ACCENT, Color32::WHITE)
+    } else if hovered {
+        (
+            if dark_mode {
+                Color32::from_rgb(58, 60, 68)
+            } else {
+                Color32::from_rgb(241, 242, 246)
+            },
+            text_color(dark_mode),
+        )
+    } else {
+        (
+            if dark_mode {
+                SETTINGS_CARD_DARK
+            } else {
+                Color32::from_rgb(238, 239, 246)
+            },
+            text_color(dark_mode),
+        )
+    }
+}
+
+fn tool_family_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    tooltip: &str,
+    selected: bool,
+    open: bool,
+    dark_mode: bool,
+) -> egui::Response {
+    let size = Vec2::splat(32.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let fill = if selected {
+        ACCENT
+    } else if response.hovered() {
+        if dark_mode {
+            Color32::from_rgb(58, 60, 68)
+        } else {
+            Color32::from_rgb(241, 242, 246)
+        }
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(4),
+        fill,
+        Stroke::NONE,
+        StrokeKind::Inside,
+    );
+    let icon_rect = Rect::from_min_max(rect.min, Pos2::new(rect.right() - 6.0, rect.bottom()));
+    let icon_color = if selected {
+        Color32::WHITE
+    } else {
+        text_color(dark_mode)
+    };
+    paint_lucide_icon(ui.painter(), icon, icon_rect, icon_color);
+    ui.painter().text(
+        Pos2::new(rect.right() - 6.5, rect.bottom() - 6.5),
+        Align2::CENTER_CENTER,
+        if open {
+            Icon::ArrowUpS.glyph().to_string()
+        } else {
+            Icon::ArrowDownS.glyph().to_string()
+        },
+        FontId::new(
+            9.0,
+            egui::FontFamily::Name(lucide_icons::FONT_FAMILY.into()),
+        ),
+        icon_color,
+    );
+    response.on_hover_text(format!("{tooltip} · Right-click for variants"))
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -8015,6 +9098,29 @@ fn paint_element(
                 true,
             );
         }
+        ElementKind::Pentagon | ElementKind::Hexagon => {
+            let sides = if element.kind == ElementKind::Pentagon {
+                5
+            } else {
+                6
+            };
+            let base_points = regular_polygon_points(rect, sides, element.transform.rotation);
+            painter.add(egui::Shape::convex_polygon(
+                base_points.clone(),
+                fill,
+                Stroke::NONE,
+            ));
+            paint_fill_pattern(painter, element.style.fill_style, fill_color, &base_points);
+            paint_sloppiness_outline(
+                painter,
+                &base_points,
+                stroke,
+                element.style.stroke_style,
+                element.style.sloppiness,
+                element.id.as_uuid().as_u128(),
+                true,
+            );
+        }
         ElementKind::Ellipse => {
             if element.transform.rotation.abs() > f32::EPSILON {
                 let base_points = rotated_screen_points(
@@ -8099,13 +9205,15 @@ fn paint_element(
                             .collect::<Vec<_>>()
                     },
                 );
-            let points = sloppy_polyline(
-                &base_points,
-                element.style.sloppiness,
-                element.id.as_uuid().as_u128(),
-                stroke.width,
-                false,
-            );
+            let arrowhead_points = (element.kind == ElementKind::Arrow).then(|| {
+                sloppy_polyline(
+                    &base_points,
+                    element.style.sloppiness,
+                    element.id.as_uuid().as_u128(),
+                    stroke.width,
+                    false,
+                )
+            });
             paint_sloppiness_outline(
                 painter,
                 &base_points,
@@ -8115,9 +9223,10 @@ fn paint_element(
                 element.id.as_uuid().as_u128(),
                 false,
             );
-            if element.kind == ElementKind::Arrow
-                && let (Some(start), Some(end)) = (points.first(), points.last())
+            if let Some(points) = arrowhead_points.as_deref()
+                && let (Some(start), Some(end)) = (points.iter().rev().nth(1), points.last())
             {
+                // Keep the arrowhead tangent to the same sloppy path as the shaft.
                 paint_arrowhead(painter, *start, *end, stroke);
             }
         }
@@ -8681,6 +9790,24 @@ fn triangle_points(rect: Rect, rotation: f32) -> Vec<Pos2> {
     rotated_screen_points(points, center, rotation)
 }
 
+fn regular_polygon_points(rect: Rect, sides: usize, rotation: f32) -> Vec<Pos2> {
+    let center = rect.center();
+    let radius = rect.size() / 2.0;
+    let sides = sides.max(3);
+    let points = (0..sides)
+        .map(|index| {
+            let angle = -std::f32::consts::FRAC_PI_2
+                + std::f32::consts::TAU * f32::from(u16::try_from(index).unwrap_or(u16::MAX))
+                    / f32::from(u16::try_from(sides).unwrap_or(u16::MAX));
+            Pos2::new(
+                center.x + radius.x * angle.cos(),
+                center.y + radius.y * angle.sin(),
+            )
+        })
+        .collect();
+    rotated_screen_points(points, center, rotation)
+}
+
 fn closed_path_is_degenerate(points: &[Pos2], stroke_width: f32) -> bool {
     if points.len() < 3
         || points
@@ -8842,11 +9969,13 @@ fn paint_selection(painter: &Painter, elements: &[&Element], camera: Camera, dar
 fn presence_tool_kind(tool: Tool) -> ToolKind {
     match tool {
         Tool::Select | Tool::Text => ToolKind::Select,
-        Tool::Rectangle | Tool::Diamond => ToolKind::Rectangle,
+        Tool::Rectangle | Tool::Diamond | Tool::Pentagon | Tool::Hexagon => ToolKind::Rectangle,
         Tool::Triangle => ToolKind::Triangle,
         Tool::Ellipse => ToolKind::Ellipse,
-        Tool::Line => ToolKind::Line,
-        Tool::Arrow => ToolKind::Arrow,
+        Tool::Line | Tool::CurvedLineClockwise | Tool::CurvedLineCounterClockwise => ToolKind::Line,
+        Tool::Arrow | Tool::CurvedArrowClockwise | Tool::CurvedArrowCounterClockwise => {
+            ToolKind::Arrow
+        }
         Tool::Freehand => ToolKind::Freehand,
         Tool::Pan => ToolKind::Pan,
     }
@@ -9105,9 +10234,15 @@ fn canvas_cursor(tool: Tool, dragging: bool) -> CursorIcon {
         | Tool::Rectangle
         | Tool::Diamond
         | Tool::Triangle
+        | Tool::Pentagon
+        | Tool::Hexagon
         | Tool::Ellipse
         | Tool::Line
+        | Tool::CurvedLineClockwise
+        | Tool::CurvedLineCounterClockwise
         | Tool::Arrow
+        | Tool::CurvedArrowClockwise
+        | Tool::CurvedArrowCounterClockwise
         | Tool::Freehand => CursorIcon::Crosshair,
     }
 }
@@ -9200,9 +10335,15 @@ fn tool_name(tool: Tool) -> &'static str {
         Tool::Rectangle => "Rectangle",
         Tool::Diamond => "Diamond",
         Tool::Triangle => "Triangle",
+        Tool::Pentagon => "Pentagon",
+        Tool::Hexagon => "Hexagon",
         Tool::Ellipse => "Ellipse",
         Tool::Line => "Line",
+        Tool::CurvedLineClockwise => "Clockwise line",
+        Tool::CurvedLineCounterClockwise => "Counter-clockwise line",
         Tool::Arrow => "Arrow",
+        Tool::CurvedArrowClockwise => "Clockwise arrow",
+        Tool::CurvedArrowCounterClockwise => "Counter-clockwise arrow",
         Tool::Freehand => "Freehand",
         Tool::Pan => "Pan",
     }
@@ -9286,6 +10427,14 @@ fn zoom_percent(zoom: f32) -> String {
     format!("{:.0}%", zoom * 100.0)
 }
 
+fn normalize_document_path(path: PathBuf) -> PathBuf {
+    if path.extension().is_none() {
+        path.with_extension("json")
+    } else {
+        path
+    }
+}
+
 fn zoom_delta_for_scroll(scroll_y: f32) -> f32 {
     (scroll_y * 0.002).clamp(-0.25, 0.25)
 }
@@ -9301,13 +10450,14 @@ mod tests {
     use crate::editor::Editor;
 
     use super::{
-        COLLABORATION_CONTROL_GAP, COLLABORATION_COPY_BUTTON_WIDTH, COMPACT_STROKE_PRESET_COUNT,
-        CONTROL_CORNER_RADIUS, ColorPickerTarget, CustomFontSizeState, DARK_BORDER, DARK_PALETTE,
-        ElementAction, INTERMEDIATE_DARK_PALETTE, KeyBinding, KeybindAction, Keybinds,
-        LEGACY_DARK_PALETTE, LEGACY_STROKE_COLORS, LIGHT_BORDER, LIGHT_CANVAS, LIGHT_MUTED,
-        LayerAction, MOSSBYTE_AGENCY_BUTTON_WIDTH, MOSSBYTE_AGENCY_ROW_GAP, MOSSBYTE_AGENCY_URL,
-        PREVIOUS_DARK_PALETTE, PREVIOUS_ORDERED_DARK_PALETTE, PREVIOUS_STROKE_COLORS,
-        PreparedImage, SETTINGS_CARD_BORDER_DARK, SETTINGS_CARD_DARK, SETTINGS_CONTROL_DARK,
+        ACCENT, COLLABORATION_CONTROL_GAP, COLLABORATION_COPY_BUTTON_WIDTH,
+        COMPACT_STROKE_PRESET_COUNT, CONTROL_CORNER_RADIUS, ColorPickerTarget, CustomFontSizeState,
+        DARK_BORDER, DARK_PALETTE, ElementAction, INTERMEDIATE_DARK_PALETTE, KeyBinding,
+        KeybindAction, Keybinds, LEGACY_DARK_PALETTE, LEGACY_STROKE_COLORS, LIGHT_BORDER,
+        LIGHT_CANVAS, LIGHT_MUTED, LayerAction, MOSSBYTE_AGENCY_BUTTON_WIDTH,
+        MOSSBYTE_AGENCY_ROW_GAP, MOSSBYTE_AGENCY_URL, PREVIOUS_DARK_PALETTE,
+        PREVIOUS_ORDERED_DARK_PALETTE, PREVIOUS_STROKE_COLORS, PreparedImage,
+        SETTINGS_CARD_BORDER_DARK, SETTINGS_CARD_DARK, SETTINGS_CONTROL_DARK,
         SETTINGS_CONTROL_RADIUS, SETTINGS_ROOT_DARK, SETTINGS_ROOT_RADIUS, STROKE_COLORS,
         WorkspaceUi, apply_palette_with_default_migration, apply_text_resize_font_size,
         char_cursor_to_byte_index, collaboration_avatar_center_x, collaboration_avatar_stack_width,
@@ -9316,14 +10466,14 @@ mod tests {
         collaboration_participant_initial, collaboration_popup_should_dismiss,
         collaboration_primary_button, collaboration_text_field, color_picker_patch,
         confirmation_frame, custom_font_size_selected, delete_previous_word, fill_choice_patch,
-        format_hex_color, grid_step_for_zoom, insert_text_at_cursor, insert_text_event,
-        key_binding_label, mossbyte_agency_credit_layout, next_char_cursor, next_word_cursor,
-        next_z_index, padded_selection_bounds, parse_hex_color, pattern_fill_choice_patch,
-        platform_label, preset_font_size_selected, previous_char_cursor, previous_word_cursor,
-        reordered_layer_ids, resolve_drop_screen_position, rotated_text_origin,
-        selection_drag_position, selection_handle_cursor_tolerance,
+        format_hex_color, grid_step_for_zoom, help_button_colors, insert_text_at_cursor,
+        insert_text_event, key_binding_label, mossbyte_agency_credit_layout, next_char_cursor,
+        next_word_cursor, next_z_index, padded_selection_bounds, parse_hex_color,
+        pattern_fill_choice_patch, platform_label, preset_font_size_selected, previous_char_cursor,
+        previous_word_cursor, reordered_layer_ids, resolve_drop_screen_position,
+        rotated_text_origin, selection_drag_position, selection_handle_cursor_tolerance,
         selection_handle_drag_tolerance, settings_group_frame, settings_keybind_card_frame,
-        settings_scroll_bar_visibility, settings_visuals, settings_window_frame,
+        settings_modal_frame, settings_scroll_bar_visibility, settings_visuals,
         sloppiness_amplitude, sloppy_polyline, stroke_preset_count, text_create_command,
         text_update_command, to_color32, to_core_color, zoom_delta_for_scroll, zoom_percent,
     };
@@ -9367,7 +10517,7 @@ mod tests {
     fn default_keybinds_cover_all_toolbar_and_editing_actions() {
         let keybinds = Keybinds::default();
 
-        assert_eq!(KeybindAction::ALL.len(), 20);
+        assert_eq!(KeybindAction::ALL.len(), 27);
         let labels = KeybindAction::ALL
             .into_iter()
             .map(KeybindAction::label)
@@ -9834,36 +10984,49 @@ mod tests {
     }
 
     #[test]
-    fn settings_window_has_an_outer_border_in_both_themes() {
+    fn settings_modal_has_an_outer_border_in_both_themes() {
         assert_eq!(
-            settings_window_frame(false).stroke,
+            settings_modal_frame(false).stroke,
             Stroke::new(1.0_f32, LIGHT_BORDER)
         );
         assert_eq!(
-            settings_window_frame(true).stroke,
+            settings_modal_frame(true).stroke,
             Stroke::new(1.0_f32, DARK_BORDER)
         );
     }
 
     #[test]
-    fn settings_scrollbar_is_hidden() {
+    fn settings_scrollbar_is_visible_when_needed() {
         assert_eq!(
             settings_scroll_bar_visibility(),
-            egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden
+            egui::containers::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
         );
     }
 
     #[test]
-    fn settings_root_preserves_its_window_corner_shape() {
-        let frame = settings_window_frame(false);
+    fn help_button_uses_an_active_fill_when_open() {
+        let active = help_button_colors(false, true, false);
+        let inactive = help_button_colors(false, false, false);
+        assert_eq!(active, (ACCENT, Color32::WHITE));
+        assert_ne!(active.0, inactive.0);
+    }
+
+    #[test]
+    fn error_feedback_is_exposed_as_a_toast_without_the_status_footer() {
+        let mut workspace = WorkspaceUi::default();
+
+        workspace.report_error("Could not open document", "invalid JSON");
+
+        assert!(workspace.status.contains("Could not open document"));
+        assert_eq!(workspace.toasts.len(), 1);
+    }
+
+    #[test]
+    fn settings_modal_preserves_its_rounded_corner_shape() {
+        let frame = settings_modal_frame(false);
         assert_eq!(
             frame.corner_radius,
-            CornerRadius {
-                nw: 0,
-                ne: 0,
-                sw: SETTINGS_ROOT_RADIUS,
-                se: SETTINGS_ROOT_RADIUS,
-            }
+            CornerRadius::same(SETTINGS_ROOT_RADIUS)
         );
         assert_eq!(frame.inner_margin, Margin::ZERO);
         assert!(frame.stroke.width.total_cmp(&1.0).is_eq());
@@ -9892,7 +11055,7 @@ mod tests {
 
     #[test]
     fn settings_card_frame_has_a_distinct_flat_border() {
-        let root = settings_window_frame(false);
+        let root = settings_modal_frame(false);
         let card = settings_group_frame(false);
         assert_eq!(
             card.corner_radius,
@@ -9902,7 +11065,7 @@ mod tests {
         assert_ne!(card.stroke.color, Color32::TRANSPARENT);
         assert_ne!(card.stroke.color, root.stroke.color);
 
-        let dark_root = settings_window_frame(true);
+        let dark_root = settings_modal_frame(true);
         let dark_card = settings_group_frame(true);
         assert_ne!(dark_card.stroke.color, Color32::TRANSPARENT);
         assert_ne!(dark_card.stroke.color, dark_root.stroke.color);
@@ -10627,6 +11790,28 @@ mod tests {
         assert!(architect.abs() < f32::EPSILON);
         assert!(artist > 3.0);
         assert!(cartoonist > artist * 1.7);
+    }
+
+    #[test]
+    fn straight_arrow_path_uses_sloppiness_before_painting_arrowhead() {
+        let points = [Pos2::new(0.0, 0.0), Pos2::new(100.0, 0.0)];
+
+        for sloppiness in [
+            canvas_core::Sloppiness::Artist,
+            canvas_core::Sloppiness::Cartoonist,
+        ] {
+            let path = sloppy_polyline(&points, sloppiness, 42, 2.0, false);
+
+            assert_eq!(path.first().copied(), points.first().copied());
+            assert_eq!(path.last().copied(), points.last().copied());
+            assert!(path.iter().any(|point| point.y.abs() > f32::EPSILON));
+            assert!(
+                path.iter()
+                    .rev()
+                    .nth(1)
+                    .is_some_and(|point| point.y.abs() > f32::EPSILON)
+            );
+        }
     }
 
     #[test]

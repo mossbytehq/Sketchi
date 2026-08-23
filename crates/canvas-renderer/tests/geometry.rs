@@ -180,6 +180,56 @@ fn renderer_extracts_and_hits_a_diamond() {
 }
 
 #[test]
+fn renderer_extracts_and_hits_pentagon_and_hexagon() {
+    let pentagon_id = ElementId::from_u128(22);
+    let hexagon_id = ElementId::from_u128(23);
+    let mut document = CrdtDocument::new();
+    for (counter, element) in [
+        (
+            1,
+            Element::pentagon(
+                pentagon_id,
+                Transform::new(Point::new(10.0, 20.0), Size::new(100.0, 80.0)),
+            ),
+        ),
+        (
+            2,
+            Element::hexagon(
+                hexagon_id,
+                Transform::new(Point::new(140.0, 20.0), Size::new(100.0, 80.0)),
+            ),
+        ),
+    ] {
+        document
+            .apply(&Operation::new(
+                OperationId::new(canvas_core::ClientId::from_u128(1), counter),
+                LamportTimestamp::new(counter),
+                VersionVector::default(),
+                OperationKind::Create { element },
+            ))
+            .unwrap();
+    }
+
+    let scene = Renderer::new().draw(&document.document());
+    assert!(scene.primitives().any(|primitive| matches!(
+        primitive,
+        RenderPrimitive::Pentagon { id, .. } if *id == pentagon_id
+    )));
+    assert!(scene.primitives().any(|primitive| matches!(
+        primitive,
+        RenderPrimitive::Hexagon { id, .. } if *id == hexagon_id
+    )));
+    assert_eq!(
+        hit_test(&document.document(), Point::new(60.0, 60.0), 0.0),
+        Some(pentagon_id)
+    );
+    assert_eq!(
+        hit_test(&document.document(), Point::new(190.0, 60.0), 0.0),
+        Some(hexagon_id)
+    );
+}
+
+#[test]
 fn renderer_extracts_and_hits_a_triangle() {
     let element_id = ElementId::from_u128(22);
     let operation = Operation::new(

@@ -38,6 +38,28 @@ pub enum RenderPrimitive {
         /// Visual style.
         style: Style,
     },
+    /// Pentagon outline and fill.
+    Pentagon {
+        /// Source element ID.
+        id: ElementId,
+        /// World-space bounds.
+        rect: Rect,
+        /// Element rotation in radians.
+        rotation: f32,
+        /// Visual style.
+        style: Style,
+    },
+    /// Hexagon outline and fill.
+    Hexagon {
+        /// Source element ID.
+        id: ElementId,
+        /// World-space bounds.
+        rect: Rect,
+        /// Element rotation in radians.
+        rotation: f32,
+        /// Visual style.
+        style: Style,
+    },
     /// Ellipse outline and fill.
     Ellipse {
         /// Source element ID.
@@ -110,6 +132,8 @@ impl RenderPrimitive {
             Self::Rectangle { id, .. }
             | Self::Diamond { id, .. }
             | Self::Triangle { id, .. }
+            | Self::Pentagon { id, .. }
+            | Self::Hexagon { id, .. }
             | Self::Ellipse { id, .. }
             | Self::Line { id, .. }
             | Self::Arrow { id, .. }
@@ -172,6 +196,18 @@ fn to_primitive(element: &Element) -> RenderPrimitive {
             style: element.style,
         },
         ElementKind::Triangle => RenderPrimitive::Triangle {
+            id: element.id,
+            rect,
+            rotation: element.transform.rotation,
+            style: element.style,
+        },
+        ElementKind::Pentagon => RenderPrimitive::Pentagon {
+            id: element.id,
+            rect,
+            rotation: element.transform.rotation,
+            style: element.style,
+        },
+        ElementKind::Hexagon => RenderPrimitive::Hexagon {
             id: element.id,
             rect,
             rotation: element.transform.rotation,
@@ -281,6 +317,8 @@ fn is_unfilled_bounded_shape(element: &Element) -> bool {
             ElementKind::Rectangle
                 | ElementKind::Diamond
                 | ElementKind::Triangle
+                | ElementKind::Pentagon
+                | ElementKind::Hexagon
                 | ElementKind::Ellipse
         )
 }
@@ -325,6 +363,23 @@ fn element_contains(element: &Element, point: Point, tolerance: f32) -> bool {
             let local = rotate_around(point, center, -element.transform.rotation);
             point_in_triangle_or_near(local, triangle_points(rect), tolerance.max(0.0))
         }
+        ElementKind::Pentagon | ElementKind::Hexagon => {
+            let center = Point::new(
+                rect.min.x + rect.size.width / 2.0,
+                rect.min.y + rect.size.height / 2.0,
+            );
+            let local = rotate_around(point, center, -element.transform.rotation);
+            let sides = if element.kind == ElementKind::Pentagon {
+                5
+            } else {
+                6
+            };
+            point_in_polygon_or_near(
+                local,
+                &regular_polygon_points(rect, sides),
+                tolerance.max(0.0),
+            )
+        }
         ElementKind::Ellipse => {
             let radius_x = rect.size.width / 2.0 + tolerance;
             let radius_y = rect.size.height / 2.0 + tolerance;
@@ -360,6 +415,49 @@ fn triangle_points(rect: Rect) -> [Point; 3] {
         Point::new(rect.max().x, rect.max().y),
         Point::new(rect.min.x, rect.max().y),
     ]
+}
+
+fn regular_polygon_points(rect: Rect, sides: usize) -> Vec<Point> {
+    let center = Point::new(
+        rect.min.x + rect.size.width / 2.0,
+        rect.min.y + rect.size.height / 2.0,
+    );
+    let radius_x = rect.size.width / 2.0;
+    let radius_y = rect.size.height / 2.0;
+    (0..sides)
+        .map(|index| {
+            let angle = -std::f32::consts::FRAC_PI_2
+                + std::f32::consts::TAU * f32::from(u16::try_from(index).unwrap_or(u16::MAX))
+                    / f32::from(u16::try_from(sides).unwrap_or(u16::MAX));
+            Point::new(
+                center.x + radius_x * angle.cos(),
+                center.y + radius_y * angle.sin(),
+            )
+        })
+        .collect()
+}
+
+fn point_in_polygon_or_near(point: Point, points: &[Point], tolerance: f32) -> bool {
+    if points.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    for (start, end) in points
+        .iter()
+        .copied()
+        .zip(points.iter().copied().cycle().skip(1))
+        .take(points.len())
+    {
+        if distance_to_segment(point, start, end) <= tolerance {
+            return true;
+        }
+        if (start.y > point.y) != (end.y > point.y)
+            && point.x < (end.x - start.x) * (point.y - start.y) / (end.y - start.y) + start.x
+        {
+            inside = !inside;
+        }
+    }
+    inside
 }
 
 fn point_in_triangle_or_near(point: Point, points: [Point; 3], tolerance: f32) -> bool {

@@ -66,7 +66,19 @@ pub fn journal_path(directory: &str) -> PathBuf {
 
 #[cfg(windows)]
 fn document_backup_path(path: &Path) -> PathBuf {
-    path.with_file_name(format!(".{DOCUMENT_FILE_NAME}.bak"))
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sketchi.document");
+    path.with_file_name(format!(".{file_name}.bak"))
+}
+
+fn document_temporary_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sketchi.document");
+    path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
 }
 
 /// Loads the last locally saved materialized document, when present.
@@ -110,15 +122,28 @@ pub fn load_document_from_path(path: impl AsRef<Path>) -> Result<Document, Stora
 /// cannot be encoded or written.
 pub fn save_document(directory: &str, document: &Document) -> Result<PathBuf, StorageError> {
     let path = document_path(directory);
-    let Some(parent) = path.parent() else {
-        return Err(StorageError::DocumentIo(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "document path has no parent directory",
-        )));
-    };
+    save_document_to_path(&path, document)?;
+    Ok(path)
+}
+
+/// Saves a materialized document to an explicit user-selected file path.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] when the parent directory cannot be created or the
+/// file cannot be encoded or written.
+pub fn save_document_to_path(
+    path: impl AsRef<Path>,
+    document: &Document,
+) -> Result<(), StorageError> {
+    let path = path.as_ref();
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     fs::create_dir_all(parent).map_err(StorageError::DocumentIo)?;
     let bytes = serde_json::to_vec_pretty(document)?;
-    let temporary_path = parent.join(format!(".{DOCUMENT_FILE_NAME}.{}.tmp", std::process::id()));
+    let temporary_path = document_temporary_path(path);
     fs::write(&temporary_path, bytes).map_err(StorageError::DocumentIo)?;
     #[cfg(windows)]
     if path.exists() {
@@ -136,13 +161,13 @@ pub fn save_document(directory: &str, document: &Document) -> Result<PathBuf, St
             return Err(StorageError::DocumentIo(error));
         }
         let _ = fs::remove_file(&backup_path);
-        return Ok(path);
+        return Ok(());
     }
-    if let Err(error) = fs::rename(&temporary_path, &path) {
+    if let Err(error) = fs::rename(&temporary_path, path) {
         let _ = fs::remove_file(&temporary_path);
         return Err(StorageError::DocumentIo(error));
     }
-    Ok(path)
+    Ok(())
 }
 
 /// Opens the durable sync journal below the configured data directory.

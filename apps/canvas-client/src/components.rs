@@ -4,8 +4,9 @@ use std::{fmt::Debug, hash::Hash, ops::RangeInclusive};
 
 use egui::epaint::Hsva;
 use egui::{
-    Align, Align2, Color32, CornerRadius, FontId, Frame, InnerResponse, Margin, Mesh, Pos2, Rect,
-    RectAlign, Response, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui, Vec2, WidgetText,
+    Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, InnerResponse, Margin, Mesh,
+    Pos2, Rect, RectAlign, Response, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui, Vec2,
+    WidgetText,
 };
 
 use crate::lucide_icons::{self, LucideIcon};
@@ -18,6 +19,28 @@ const DROPDOWN_POPUP_HORIZONTAL_PADDING: i8 = 6;
 const DROPDOWN_POPUP_VERTICAL_PADDING: i8 = 10;
 const DROPDOWN_POPUP_ITEM_SPACING: f32 = 4.0;
 const DROPDOWN_OPTION_PADDING: Vec2 = Vec2::new(6.0, 3.0);
+
+pub(crate) fn close_icon_button(
+    ui: &mut Ui,
+    size: f32,
+    normal_color: Color32,
+    hover_color: Color32,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let response = response.on_hover_cursor(CursorIcon::PointingHand);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "×",
+        FontId::proportional((size * 0.75).max(14.0)),
+        if response.hovered() {
+            hover_color
+        } else {
+            normal_color
+        },
+    );
+    response
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DropdownPopupStyle {
@@ -250,11 +273,13 @@ const SWATCH_LIGHT_MUTED: Color32 = Color32::from_rgb(91, 97, 108);
 const SWATCH_FRAME_INSET: f32 = 1.0;
 const SWATCH_FRAME_RADIUS: u8 = 5;
 
-fn swatch_needs_contrast_border(fill: Color32, transparent: bool) -> bool {
+fn swatch_needs_contrast_border(fill: Color32, transparent: bool, dark_mode: bool) -> bool {
     transparent
-        || fill == Color32::WHITE
-        || (fill.r() < 80 && fill.g() < 80 && fill.b() < 80)
-        || (fill.r() > 220 && fill.g() > 220 && fill.b() > 220)
+        || if dark_mode {
+            fill.r() < 80 && fill.g() < 80 && fill.b() < 80
+        } else {
+            fill == Color32::WHITE || (fill.r() > 220 && fill.g() > 220 && fill.b() > 220)
+        }
 }
 
 fn swatch_border_color(fill: Color32, dark_mode: bool) -> Color32 {
@@ -331,7 +356,7 @@ fn paint_color_swatch(
             Stroke::new(2.0_f32, SWATCH_ACCENT),
             StrokeKind::Outside,
         );
-    } else if swatch_needs_contrast_border(fill, transparent) {
+    } else if swatch_needs_contrast_border(fill, transparent, dark_mode) {
         ui.painter().rect_stroke(
             frame_rect,
             frame_radius,
@@ -1283,14 +1308,22 @@ mod tests {
         assert!(swatch_needs_contrast_border(
             Color32::from_rgb(246, 247, 249),
             false,
+            false,
         ));
-        assert!(swatch_needs_contrast_border(Color32::WHITE, false));
+        assert!(swatch_needs_contrast_border(Color32::WHITE, false, false));
         assert!(swatch_needs_contrast_border(
             Color32::from_rgb(20, 20, 24),
             false,
+            true,
         ));
         assert!(!swatch_needs_contrast_border(
             Color32::from_rgb(224, 49, 49),
+            false,
+            false,
+        ));
+        assert!(!swatch_needs_contrast_border(
+            Color32::from_rgb(20, 20, 24),
+            false,
             false,
         ));
     }
@@ -1308,10 +1341,11 @@ mod tests {
     }
 
     #[test]
-    fn dark_swatch_border_remains_visible_in_both_modes() {
+    fn dark_swatch_border_is_only_needed_on_dark_surfaces() {
         let dark_fill = Color32::from_rgb(26, 27, 30);
 
-        assert_eq!(swatch_border_color(dark_fill, false), SWATCH_LIGHT_BORDER);
+        assert!(!swatch_needs_contrast_border(dark_fill, false, false));
+        assert!(swatch_needs_contrast_border(dark_fill, false, true));
         assert_eq!(
             swatch_border_color(dark_fill, true),
             SWATCH_DARK_FILL_BORDER

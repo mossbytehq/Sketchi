@@ -9,12 +9,18 @@ pub(crate) enum LucideIcon {
     New,
     Import,
     Save,
+    SaveAs,
     RefreshCcw,
     Information,
+    BadgeInfo,
+    Warning,
+    Success,
+    Error,
     InputMethod,
     Router,
     Connector,
     CircleStop,
+    LogOut,
     Keyboard,
     ListSettings,
     Settings,
@@ -28,10 +34,16 @@ pub(crate) enum LucideIcon {
     Rectangle,
     PokerDiamonds,
     Triangle,
+    Pentagon,
+    Hexagon,
     Rounded,
     Ellipse,
     Line,
+    CurvedLineClockwise,
+    CurvedLineCounterClockwise,
     ArrowLeftDownLong,
+    CurvedArrowClockwise,
+    CurvedArrowCounterClockwise,
     ArrowDownS,
     ArrowUpS,
     Pan,
@@ -75,12 +87,18 @@ impl LucideIcon {
             Self::New => Icon::Plus,
             Self::Import => Icon::HardDriveUpload,
             Self::Save => Icon::HardDriveDownload,
+            Self::SaveAs => Icon::FilePen,
             Self::RefreshCcw => Icon::RefreshCcw,
             Self::Information => Icon::Info,
+            Self::BadgeInfo => Icon::BadgeInfo,
+            Self::Warning => Icon::TriangleAlert,
+            Self::Success => Icon::CircleCheck,
+            Self::Error => Icon::CircleX,
             Self::InputMethod => Icon::SlidersHorizontal,
             Self::Router => Icon::Network,
             Self::Connector => Icon::Waypoints,
             Self::CircleStop => Icon::CircleStop,
+            Self::LogOut => Icon::LogOut,
             Self::Keyboard => Icon::Keyboard,
             Self::ListSettings => Icon::Settings2,
             Self::Settings => Icon::Settings,
@@ -96,11 +114,17 @@ impl LucideIcon {
             Self::Rounded => Icon::SquareRoundCorner,
             Self::Ellipse => Icon::Circle,
             Self::Line => Icon::Slash,
+            Self::CurvedLineClockwise | Self::CurvedArrowClockwise => Icon::CornerLeftDown,
+            Self::CurvedLineCounterClockwise | Self::CurvedArrowCounterClockwise => {
+                Icon::CornerRightUp
+            }
             Self::ArrowLeftDownLong => Icon::MoveDownLeft,
             Self::ArrowDownS | Self::ExpandUpDown => Icon::ChevronDown,
             Self::ArrowUpS | Self::ContractUpDown => Icon::ChevronUp,
             Self::Pan => Icon::Hand,
             Self::Triangle => Icon::Triangle,
+            Self::Pentagon => Icon::Pentagon,
+            Self::Hexagon => Icon::Hexagon,
             Self::Undo => Icon::Undo2,
             Self::Redo => Icon::Redo2,
             Self::Sun => Icon::Sun,
@@ -189,11 +213,29 @@ mod tests {
         );
         assert_eq!(LucideIcon::Freehand.glyph(), Icon::PenLine.unicode());
         assert_eq!(LucideIcon::Line.glyph(), Icon::Slash.unicode());
+        assert_eq!(
+            LucideIcon::CurvedLineClockwise.glyph(),
+            Icon::CornerLeftDown.unicode()
+        );
+        assert_eq!(
+            LucideIcon::CurvedLineCounterClockwise.glyph(),
+            Icon::CornerRightUp.unicode()
+        );
+        assert_eq!(
+            LucideIcon::CurvedArrowClockwise.glyph(),
+            Icon::CornerLeftDown.unicode()
+        );
+        assert_eq!(
+            LucideIcon::CurvedArrowCounterClockwise.glyph(),
+            Icon::CornerRightUp.unicode()
+        );
         assert_eq!(LucideIcon::PenNib.glyph(), Icon::PenTool.unicode());
         assert_eq!(LucideIcon::QuillPen.glyph(), Icon::Feather.unicode());
         assert_eq!(LucideIcon::Brush.glyph(), Icon::Paintbrush.unicode());
         assert_eq!(LucideIcon::Pan.glyph(), Icon::Hand.unicode());
         assert_eq!(LucideIcon::Triangle.glyph(), Icon::Triangle.unicode());
+        assert_eq!(LucideIcon::Pentagon.glyph(), Icon::Pentagon.unicode());
+        assert_eq!(LucideIcon::Hexagon.glyph(), Icon::Hexagon.unicode());
     }
 
     #[test]
@@ -244,6 +286,7 @@ mod tests {
         assert_eq!(LucideIcon::New.glyph(), Icon::Plus.unicode());
         assert_eq!(LucideIcon::Import.glyph(), Icon::HardDriveUpload.unicode());
         assert_eq!(LucideIcon::Save.glyph(), Icon::HardDriveDownload.unicode());
+        assert_eq!(LucideIcon::SaveAs.glyph(), Icon::FilePen.unicode());
         assert_eq!(LucideIcon::RefreshCcw.glyph(), Icon::RefreshCcw.unicode());
         assert_eq!(LucideIcon::InputCursorMove.glyph(), Icon::Type.unicode());
         assert_eq!(LucideIcon::HandDrawn.glyph(), Icon::PencilLine.unicode());

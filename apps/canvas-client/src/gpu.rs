@@ -50,24 +50,6 @@ pub(crate) struct GpuState {
 }
 
 impl GpuState {
-    pub(crate) const fn settings_clear_color(dark_mode: bool) -> wgpu::Color {
-        if dark_mode {
-            wgpu::Color {
-                r: 31.0 / 255.0,
-                g: 32.0 / 255.0,
-                b: 37.0 / 255.0,
-                a: 1.0,
-            }
-        } else {
-            wgpu::Color {
-                r: 246.0 / 255.0,
-                g: 247.0 / 255.0,
-                b: 249.0 / 255.0,
-                a: 1.0,
-            }
-        }
-    }
-
     /// Creates and configures a presentation surface for a native window.
     pub(crate) fn new(window: Arc<Window>, instance: &wgpu::Instance) -> Result<Self, GpuError> {
         let size = window.inner_size();
@@ -183,9 +165,8 @@ impl GpuState {
                 label: Some("Sketchi egui frame encoder"),
             });
 
-        // A native settings window gets a fresh egui-wgpu renderer when it is
-        // reopened, while the egui context retains its font atlas. In that
-        // case egui may not emit a new delta for Managed(0), leaving every
+        // If a renderer is recreated while the egui context retains its font
+        // atlas, egui may not emit a new delta for Managed(0), leaving every
         // text mesh without a GPU texture. Seed the renderer from the current
         // atlas before applying this frame's incremental deltas.
         let font_texture_id = egui::TextureId::Managed(0);

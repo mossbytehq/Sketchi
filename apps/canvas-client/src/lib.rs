@@ -18,6 +18,7 @@ pub mod storage;
 pub mod supervisor;
 #[allow(dead_code)]
 mod theme;
+mod toast;
 pub mod tools;
 mod ui;
 mod update;

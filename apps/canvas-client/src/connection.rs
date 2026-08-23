@@ -676,6 +676,7 @@ pub struct CollaborationClient {
     presence: BTreeMap<canvas_core::ClientId, PresenceState>,
     presence_throttle: PresenceThrottle,
     create_request_id: Option<u64>,
+    cancel_pending: bool,
     connection_generation: Arc<AtomicU64>,
     welcome_generation: Option<u64>,
     sync_generation: Option<u64>,
@@ -730,6 +731,7 @@ impl CollaborationClient {
             presence_throttle: PresenceThrottle::new(Duration::from_millis(50))
                 .map_err(|error| ConnectionError::InvalidInvite(error.to_string()))?,
             create_request_id: None,
+            cancel_pending: false,
             connection_generation,
             welcome_generation: None,
             sync_generation: None,
@@ -817,7 +819,7 @@ impl CollaborationClient {
         let Some(room_id) = self.room_id else {
             return Ok(());
         };
-        if !self.is_synchronized_for_current_connection() {
+        if self.cancel_pending || !self.is_synchronized_for_current_connection() {
             return Ok(());
         }
         let pending = self.synchronization.pending_operations()?;
@@ -902,6 +904,15 @@ impl CollaborationClient {
                 self.status = String::from("Connected; waiting for room sync…");
                 self.welcome_generation = Some(received.generation);
                 self.sync_generation = None;
+                if self.cancel_pending
+                    && let (Some(room_id), Some(creator_token)) =
+                        (self.room_id, self.creator_token.as_deref())
+                {
+                    self.send(ClientMessage::CancelRoom {
+                        room_id,
+                        creator_token: creator_token.to_owned(),
+                    })?;
+                }
             }
             ServerMessage::RoomCreated {
                 room_id,
@@ -959,6 +970,7 @@ impl CollaborationClient {
                 }
             }
             ServerMessage::Error { code, message, .. } => {
+                self.cancel_pending = false;
                 if matches!(
                     code,
                     canvas_protocol::ErrorCode::RoomNotFound
@@ -996,6 +1008,8 @@ impl CollaborationClient {
         self.sent_operations.clear();
         self.welcome_generation = None;
         self.sync_generation = None;
+        self.cancel_pending = false;
+        self.presence_throttle.clear();
         status.clone_into(&mut self.status);
         self.refresh_handshake();
     }
@@ -1033,7 +1047,23 @@ impl CollaborationClient {
             room_id,
             creator_token,
         })?;
+        self.cancel_pending = true;
         self.status = String::from("Cancelling collaboration room…");
+        Ok(())
+    }
+
+    /// Leaves the current room without cancelling it for other participants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectionError::QueueFull`] when the leave request cannot be
+    /// queued or [`ConnectionError::Closed`] when the runtime has stopped.
+    pub fn leave_room(&mut self) -> Result<(), ConnectionError> {
+        let Some(room_id) = self.room_id else {
+            return Ok(());
+        };
+        self.send(ClientMessage::LeaveRoom { room_id })?;
+        self.reset_room_state("You left the collaboration room.");
         Ok(())
     }
 
@@ -1047,7 +1077,7 @@ impl CollaborationClient {
         room_id: RoomId,
         state: PresenceState,
     ) -> Result<(), ConnectionError> {
-        if !self.is_synchronized_for_current_connection() {
+        if self.cancel_pending || !self.is_synchronized_for_current_connection() {
             return Ok(());
         }
         if let Some(message) = self.presence_throttle.offer(room_id, state, Instant::now()) {
@@ -1057,7 +1087,7 @@ impl CollaborationClient {
     }
 
     fn flush_presence(&mut self) -> Result<(), ConnectionError> {
-        if !self.is_synchronized_for_current_connection() {
+        if self.cancel_pending || !self.is_synchronized_for_current_connection() {
             return Ok(());
         }
         if let Some(message) = self.presence_throttle.flush(Instant::now()) {
@@ -1139,6 +1169,71 @@ impl Drop for CollaborationClient {
 mod tests {
     use super::*;
 
+    fn test_client(room_id: Option<RoomId>) -> Option<(CollaborationClient, NetworkEndpoints)> {
+        let (channels, endpoints) = bounded_channels();
+        let handshake = Arc::clone(&channels.handshake);
+        let shutdown = channels.shutdown.clone();
+        let connection_generation = Arc::clone(&channels.connection_generation);
+        let presence_throttle = PresenceThrottle::new(Duration::from_millis(50)).ok()?;
+        let journal = Journal::open_in_memory().ok()?;
+        let client = CollaborationClient {
+            channels,
+            handshake,
+            runtime: None,
+            shutdown,
+            synchronization: SyncController::new(journal),
+            room_id,
+            capability_token: room_id.map(|_| String::from("capability-token")),
+            creator_token: None,
+            token_expires_at_epoch: None,
+            readiness: ReadyMessage {
+                endpoint: String::from("wss://127.0.0.1:3000/ws"),
+                certificate_sha256: "ab".repeat(32),
+            },
+            next_request_id: 1,
+            sent_operations: BTreeSet::new(),
+            status: String::from("In collaboration room"),
+            server_available: true,
+            client_id: canvas_core::ClientId::from_u128(1),
+            display_name: String::from("Test user"),
+            participants: BTreeMap::new(),
+            presence: BTreeMap::new(),
+            presence_throttle,
+            create_request_id: None,
+            cancel_pending: false,
+            connection_generation,
+            welcome_generation: Some(1),
+            sync_generation: Some(1),
+        };
+        Some((client, endpoints))
+    }
+
+    #[test]
+    fn leaving_room_clears_reconnect_join_and_queues_leave_message() {
+        let room_id = RoomId::from_u128(7);
+        let Some((mut client, mut endpoints)) = test_client(Some(room_id)) else {
+            return;
+        };
+        client.refresh_handshake();
+
+        assert!(client.leave_room().is_ok());
+        assert_eq!(client.room_id(), None);
+        assert_eq!(client.status, "You left the collaboration room.");
+        assert!(matches!(
+            endpoints.outbound.try_recv(),
+            Ok(ClientMessage::LeaveRoom { room_id: left_room }) if left_room == room_id
+        ));
+
+        let Ok(handshake) = client.handshake.lock() else {
+            return;
+        };
+        assert_eq!(handshake.len(), 1);
+        assert!(matches!(
+            handshake.first(),
+            Some(ClientMessage::Hello { .. })
+        ));
+    }
+
     #[test]
     fn poll_surfaces_finished_runtime_error_before_closed_inbound_channel() {
         let (channels, endpoints) = bounded_channels();
@@ -1181,6 +1276,7 @@ mod tests {
             presence: BTreeMap::new(),
             presence_throttle,
             create_request_id: None,
+            cancel_pending: false,
             connection_generation: Arc::new(AtomicU64::new(0)),
             welcome_generation: None,
             sync_generation: None,
@@ -1231,6 +1327,7 @@ mod tests {
             presence: BTreeMap::new(),
             presence_throttle,
             create_request_id: None,
+            cancel_pending: false,
             connection_generation,
             welcome_generation: Some(1),
             sync_generation: Some(1),
@@ -1290,6 +1387,7 @@ mod tests {
             presence: BTreeMap::new(),
             presence_throttle,
             create_request_id: None,
+            cancel_pending: false,
             connection_generation,
             welcome_generation: None,
             sync_generation: None,
@@ -1311,6 +1409,73 @@ mod tests {
         assert!(matches!(
             endpoints.outbound.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn pending_room_cancellation_is_retried_after_reconnect() {
+        let (channels, mut endpoints) = bounded_channels();
+        let journal = Journal::open_in_memory();
+        assert!(journal.is_ok());
+        let Ok(journal) = journal else {
+            return;
+        };
+        let presence_throttle = PresenceThrottle::new(Duration::from_millis(50));
+        assert!(presence_throttle.is_ok());
+        let Ok(presence_throttle) = presence_throttle else {
+            return;
+        };
+        let connection_generation = Arc::clone(&channels.connection_generation);
+        let mut client = CollaborationClient {
+            channels,
+            handshake: Arc::new(Mutex::new(Vec::new())),
+            runtime: None,
+            shutdown: ShutdownSignal {
+                sender: watch::channel(false).0,
+            },
+            synchronization: SyncController::new(journal),
+            room_id: Some(RoomId::from_u128(1)),
+            capability_token: Some(String::from("capability-token")),
+            creator_token: Some(String::from("creator-token")),
+            token_expires_at_epoch: None,
+            readiness: ReadyMessage {
+                endpoint: String::from("wss://127.0.0.1:3000/ws"),
+                certificate_sha256: "ab".repeat(32),
+            },
+            next_request_id: 1,
+            sent_operations: BTreeSet::new(),
+            status: String::from("Cancelling collaboration room…"),
+            server_available: true,
+            client_id: canvas_core::ClientId::from_u128(1),
+            display_name: String::from("Test user"),
+            participants: BTreeMap::new(),
+            presence: BTreeMap::new(),
+            presence_throttle,
+            create_request_id: None,
+            cancel_pending: true,
+            connection_generation,
+            welcome_generation: None,
+            sync_generation: None,
+        };
+        client.connection_generation.store(2, Ordering::Release);
+
+        assert!(
+            client
+                .observe(&ReceivedServerMessage {
+                    generation: 2,
+                    message: ServerMessage::Welcome {
+                        session_id: canvas_protocol::SessionId::new(),
+                        server_version: String::from("test"),
+                    },
+                })
+                .is_ok()
+        );
+        assert!(matches!(
+            endpoints.outbound.try_recv(),
+            Ok(ClientMessage::CancelRoom {
+                room_id,
+                creator_token,
+            }) if room_id == RoomId::from_u128(1) && creator_token == "creator-token"
         ));
     }
 
@@ -1423,6 +1588,7 @@ mod tests {
             presence: BTreeMap::new(),
             presence_throttle,
             create_request_id: None,
+            cancel_pending: false,
             connection_generation,
             welcome_generation: Some(1),
             sync_generation: Some(1),
@@ -1789,6 +1955,12 @@ impl PresenceThrottle {
         } else {
             None
         }
+    }
+
+    /// Drops any coalesced presence belonging to the previous room.
+    fn clear(&mut self) {
+        self.next_allowed = None;
+        self.pending = None;
     }
 
     /// Returns whether a coalesced presence state is waiting to be sent.

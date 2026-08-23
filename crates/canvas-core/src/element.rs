@@ -16,6 +16,10 @@ pub enum ElementKind {
     Diamond,
     /// Triangle bounded by the element transform.
     Triangle,
+    /// Pentagon bounded by the element transform.
+    Pentagon,
+    /// Hexagon bounded by the element transform.
+    Hexagon,
     /// Ellipse bounded by the element transform.
     Ellipse,
     /// Straight line between the transform corners or points.
@@ -487,6 +491,18 @@ impl Element {
     #[must_use]
     pub fn triangle(id: ElementId, transform: Transform) -> Self {
         Self::new(id, ElementKind::Triangle, transform)
+    }
+
+    /// Creates a pentagon element.
+    #[must_use]
+    pub fn pentagon(id: ElementId, transform: Transform) -> Self {
+        Self::new(id, ElementKind::Pentagon, transform)
+    }
+
+    /// Creates a hexagon element.
+    #[must_use]
+    pub fn hexagon(id: ElementId, transform: Transform) -> Self {
+        Self::new(id, ElementKind::Hexagon, transform)
     }
 
     /// Creates a text element.
