@@ -147,16 +147,16 @@ pub fn save_document_to_path(
     fs::write(&temporary_path, bytes).map_err(StorageError::DocumentIo)?;
     #[cfg(windows)]
     if path.exists() {
-        let backup_path = document_backup_path(&path);
+        let backup_path = document_backup_path(path);
         if backup_path.exists() {
             fs::remove_file(&backup_path).map_err(StorageError::DocumentIo)?;
         }
-        if let Err(error) = fs::rename(&path, &backup_path) {
+        if let Err(error) = fs::rename(path, &backup_path) {
             let _ = fs::remove_file(&temporary_path);
             return Err(StorageError::DocumentIo(error));
         }
-        if let Err(error) = fs::rename(&temporary_path, &path) {
-            let _ = fs::rename(&backup_path, &path);
+        if let Err(error) = fs::rename(&temporary_path, path) {
+            let _ = fs::rename(&backup_path, path);
             let _ = fs::remove_file(&temporary_path);
             return Err(StorageError::DocumentIo(error));
         }
