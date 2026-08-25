@@ -20,7 +20,7 @@
     </Feature>
   </Package>
   <Fragment>
-    <StandardDirectory Id="ProgramFiles6432Folder">
+    <StandardDirectory Id="ProgramFilesFolder">
       <Directory Id="INSTALLFOLDER" Name="Sketchi" />
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder">
@@ -43,7 +43,7 @@
             Icon="SketchiIcon" />
         <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall" />
         <RegistryValue
-            Root="HKLM"
+            Root="HKCU"
             Key="Software\Sketchi"
             Name="installed"
             Type="integer"
