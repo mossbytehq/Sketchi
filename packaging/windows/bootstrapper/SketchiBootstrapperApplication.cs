@@ -48,7 +48,7 @@ public sealed class SketchiBootstrapperApplication : BootstrapperApplication
             WinRT.ComWrappersSupport.InitializeComWrappers();
             Application.Start(_ =>
             {
-                _ = new App(this);
+                new App(this);
             });
         });
         uiThread.SetApartmentState(ApartmentState.STA);
