@@ -116,8 +116,10 @@ jobs:
             throw "WinUI bootstrapper was not published"
           }
           foreach ($requiredPayload in @(
+            "Sketchi.Bootstrapper.dll",
             "Sketchi.Bootstrapper.deps.json",
             "Sketchi.Bootstrapper.runtimeconfig.json",
+            "WixToolset.BootstrapperApplicationApi.dll",
             "mbanative.dll"
           )) {
             if (-not (Test-Path (Join-Path $bootstrapperDir $requiredPayload))) {
@@ -441,10 +443,14 @@ jobs:
           SKETCHI_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           $setup = "$env:GITHUB_WORKSPACE\dist\staging\Sketchi-$env:SKETCHI_VERSION-windows-x86_64-setup.exe"
+          $log = Join-Path $env:RUNNER_TEMP "sketchi-setup-smoke.log"
           $install = Start-Process $setup -Wait -PassThru -ArgumentList @(
-            "/quiet", "/norestart"
+            "/quiet", "/norestart", "/log", $log
           )
           if ($install.ExitCode -ne 0) {
+            if (Test-Path $log) {
+              Get-Content -LiteralPath $log
+            }
             throw "Windows setup installation failed with exit code $($install.ExitCode)"
           }
           $installDir = Join-Path ${env:ProgramFiles} "Sketchi"
@@ -458,9 +464,12 @@ jobs:
             throw "Installed Sketchi server smoke check failed"
           }
           $uninstall = Start-Process $setup -Wait -PassThru -ArgumentList @(
-            "/uninstall", "/quiet", "/norestart"
+            "/uninstall", "/quiet", "/norestart", "/log", $log
           )
           if ($uninstall.ExitCode -ne 0) {
+            if (Test-Path $log) {
+              Get-Content -LiteralPath $log
+            }
             throw "Windows setup uninstall failed with exit code $($uninstall.ExitCode)"
           }
       - name: Remove Windows signing certificate
