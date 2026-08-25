@@ -50,7 +50,11 @@ public sealed partial class MainWindow : Window
     internal void CloseFromBootstrapper()
     {
         allowBootstrapperClose = true;
-        DispatcherQueue.TryEnqueue(Close);
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            Close();
+            Application.Current.Exit();
+        });
     }
 
     private void InstallButton_Click(object sender, RoutedEventArgs e)

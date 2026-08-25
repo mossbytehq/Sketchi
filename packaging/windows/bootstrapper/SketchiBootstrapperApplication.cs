@@ -8,6 +8,7 @@ namespace Sketchi.Bootstrapper;
 public sealed class SketchiBootstrapperApplication : BootstrapperApplication
 {
     private IBootstrapperCommand command = null!;
+    private readonly ManualResetEventSlim completion = new();
     private MainWindow? window;
     private nint windowHandle;
     private bool applying;
@@ -40,6 +41,7 @@ public sealed class SketchiBootstrapperApplication : BootstrapperApplication
         if (nonInteractiveMode)
         {
             Engine.Detect();
+            completion.Wait();
             return;
         }
 
@@ -54,6 +56,7 @@ public sealed class SketchiBootstrapperApplication : BootstrapperApplication
         uiThread.SetApartmentState(ApartmentState.STA);
         uiThread.IsBackground = false;
         uiThread.Start();
+        uiThread.Join();
     }
 
     internal void AttachWindow(MainWindow window)
@@ -64,7 +67,7 @@ public sealed class SketchiBootstrapperApplication : BootstrapperApplication
 
         if (Command.Action == LaunchAction.Help)
         {
-            Engine.Quit(0);
+            Quit(0);
             return;
         }
 
@@ -90,7 +93,7 @@ public sealed class SketchiBootstrapperApplication : BootstrapperApplication
     {
         if (!applying)
         {
-            Engine.Quit(0);
+            Quit(0);
         }
     }
 
@@ -137,7 +140,7 @@ public sealed class SketchiBootstrapperApplication : BootstrapperApplication
             window?.SetStatus(IsUninstall ? "Sketchi was removed." : "Sketchi was installed.");
             window?.CloseFromBootstrapper();
         }
-        Engine.Quit(args.Status < 0 ? args.Status : 0);
+        Quit(args.Status < 0 ? args.Status : 0);
     }
 
     private void ShowFailure(string message)
@@ -145,10 +148,16 @@ public sealed class SketchiBootstrapperApplication : BootstrapperApplication
         applying = false;
         if (nonInteractiveMode)
         {
-            Engine.Quit(1);
+            Quit(1);
             return;
         }
         window?.SetApplying(false);
         window?.SetStatus(message);
+    }
+
+    private void Quit(int exitCode)
+    {
+        completion.Set();
+        Engine.Quit(exitCode);
     }
 }
