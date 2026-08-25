@@ -11,6 +11,7 @@
     <UseWinUI>true</UseWinUI>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <SelfContained>true</SelfContained>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
     <EnableMsixTooling>true</EnableMsixTooling>
     <PublishSingleFile>false</PublishSingleFile>
     <PublishReadyToRun>false</PublishReadyToRun>

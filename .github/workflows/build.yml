@@ -115,6 +115,15 @@ jobs:
           if (-not (Test-Path $bootstrapper)) {
             throw "WinUI bootstrapper was not published"
           }
+          foreach ($requiredPayload in @(
+            "Sketchi.Bootstrapper.deps.json",
+            "Sketchi.Bootstrapper.runtimeconfig.json",
+            "mbanative.dll"
+          )) {
+            if (-not (Test-Path (Join-Path $bootstrapperDir $requiredPayload))) {
+              throw "WinUI bootstrapper payload is missing $requiredPayload"
+            }
+          }
       - name: Verify staged contents
         shell: bash
         run: |
