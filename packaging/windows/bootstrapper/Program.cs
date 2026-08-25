@@ -1,4 +1,4 @@
-using WixToolset.Mba.Core;
+using WixToolset.BootstrapperApplicationApi;
 
 namespace Sketchi.Bootstrapper;
 

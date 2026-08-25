@@ -1,16 +1,20 @@
 using System.Threading;
 using Microsoft.UI.Xaml;
 using WinRT.Interop;
-using WixToolset.Mba.Core;
+using WixToolset.BootstrapperApplicationApi;
 
 namespace Sketchi.Bootstrapper;
 
 public sealed class SketchiBootstrapperApplication : BootstrapperApplication
 {
+    private IBootstrapperCommand command = null!;
     private MainWindow? window;
     private nint windowHandle;
     private bool applying;
     private bool nonInteractiveMode;
+
+    internal IBootstrapperCommand Command => command;
+    internal IEngine Engine => engine;
 
     public bool IsUninstall => Command.Action == LaunchAction.Uninstall;
 
@@ -21,7 +25,13 @@ public sealed class SketchiBootstrapperApplication : BootstrapperApplication
         ApplyComplete += OnApplyComplete;
     }
 
-    protected override void OnStartup(StartupEventArgs args)
+    protected override void OnCreate(CreateEventArgs args)
+    {
+        base.OnCreate(args);
+        command = args.Command;
+    }
+
+    protected override void Run()
     {
         // Burn uses None for quiet execution and Passive for non-interactive
         // progress. Treat every mode other than Full as non-interactive so
