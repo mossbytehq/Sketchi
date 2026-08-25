@@ -474,6 +474,7 @@ fn download_asset(url: &str, destination: &std::path::Path) -> Result<(), Update
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn ensure_writable_directory(directory: &Path) -> Result<(), UpdateError> {
     let probe = directory.join(format!(".Sketchi-update-probe-{}", std::process::id()));
     match OpenOptions::new().create_new(true).write(true).open(&probe) {
@@ -677,12 +678,14 @@ fn install_windows_setup(executable: &Path, destination: &Path) -> Result<(), Up
 $ErrorActionPreference = "Stop"
 try {
     Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue
-    $install = Start-Process -FilePath $Installer -Wait -PassThru
+    $install = Start-Process -FilePath $Installer -Verb RunAs -Wait -PassThru
     if ($install.ExitCode -ne 0) {
         throw "installer exited with code $($install.ExitCode)"
     }
     [System.IO.File]::WriteAllText($Result, "success")
-    Start-Process -FilePath $Exe
+    # The installer may have been elevated by UAC. Launch through Explorer so
+    # the desktop client returns to the user's normal integrity level.
+    Start-Process -FilePath "explorer.exe" -ArgumentList ('"{0}"' -f $Exe)
 } catch {
     [System.IO.File]::WriteAllText($Result, ("failure: " + $_.Exception.Message))
 } finally {
@@ -702,27 +705,68 @@ try {
 
 #[cfg(target_os = "windows")]
 fn install_windows_archive(executable: &Path, destination: &Path) -> Result<(), UpdateError> {
-    let parent = executable.parent().ok_or_else(|| {
+    executable.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "current executable has no parent")
     })?;
-    ensure_writable_directory(parent)?;
 
     let script_path =
         std::env::temp_dir().join(format!("Sketchi-update-{}-install.ps1", std::process::id()));
     let result_path = update_result_path()?;
     fs::write(
         &script_path,
-        r#"param([string]$Zip, [string]$Exe, [int]$ProcessId, [string]$Result)
+        r#"param([string]$Zip, [string]$Exe, [int]$ProcessId, [string]$Result, [switch]$Elevated)
 $ErrorActionPreference = "Stop"
 $parent = Split-Path -Parent $Exe
 $stage = Join-Path $env:TEMP ("Sketchi-update-" + $ProcessId)
+
+if (-not $Elevated) {
+    $probe = Join-Path $parent (".Sketchi-update-probe-" + $ProcessId)
+    $writable = $false
+    try {
+        [System.IO.File]::WriteAllText($probe, "")
+        $writable = $true
+    } catch {
+        $writable = $false
+    } finally {
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+    }
+
+    if (-not $writable) {
+        $arguments = @(
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle", "Hidden",
+            "-ExecutionPolicy", "Bypass",
+            "-File", ('"{0}"' -f $PSCommandPath),
+            "-Zip", ('"{0}"' -f $Zip),
+            "-Exe", ('"{0}"' -f $Exe),
+            "-ProcessId", $ProcessId,
+            "-Result", ('"{0}"' -f $Result),
+            "-Elevated"
+        ) -join " "
+        try {
+            Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $arguments | Out-Null
+        } catch {
+            # The elevated child never started, so it cannot clean up these handoff files.
+            Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+            [System.IO.File]::WriteAllText($Result, ("failure: " + $_.Exception.Message))
+        }
+        exit 0
+    }
+}
+
 try {
     Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     Expand-Archive -LiteralPath $Zip -DestinationPath $stage -Force
     Copy-Item -Path (Join-Path $stage '*') -Destination $parent -Recurse -Force
     [System.IO.File]::WriteAllText($Result, "success")
-    Start-Process -FilePath $Exe
+    if ($Elevated) {
+        Start-Process -FilePath "explorer.exe" -ArgumentList ('"{0}"' -f $Exe)
+    } else {
+        Start-Process -FilePath $Exe
+    }
 } catch {
     [System.IO.File]::WriteAllText($Result, ("failure: " + $_.Exception.Message))
 } finally {
@@ -820,6 +864,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use super::{GitHubAsset, GitHubRelease, LinuxAssetKind, auto_update_asset};
+    #[cfg(target_os = "windows")]
+    use super::{GitHubAsset, GitHubRelease, auto_update_asset};
 
     #[test]
     fn stable_channel_ignores_edge_only_updates() {
@@ -954,6 +1000,38 @@ mod tests {
         assert!(super::is_supported_asset_name("sketchi-0.3.1-1.x86_64.rpm"));
         assert!(!super::is_supported_asset_name(
             "sketchi-0.3.1_amd64.tar.gz"
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_asset_selection_matches_release_channel() {
+        let release = GitHubRelease {
+            tag_name: String::from("v0.3.1"),
+            html_url: String::from("https://github.com/mossbytehq/Sketchi/releases/tag/v0.3.1"),
+            prerelease: false,
+            draft: false,
+            assets: vec![GitHubAsset {
+                name: String::from("Sketchi-0.3.1-windows-x86_64-setup.exe"),
+                browser_download_url: String::from(
+                    "https://github.com/mossbytehq/Sketchi/releases/download/v0.3.1/Sketchi-0.3.1-windows-x86_64-setup.exe",
+                ),
+                digest: None,
+            }],
+        };
+
+        assert!(
+            auto_update_asset(&release)
+                .is_some_and(|asset| { asset.name.ends_with("-windows-x86_64-setup.exe") })
+        );
+        assert!(super::is_supported_asset_name(
+            "Sketchi-0.3.1-windows-x86_64-setup.exe"
+        ));
+        assert!(super::is_supported_asset_name(
+            "Sketchi-0.3.1-windows-x86_64.zip"
+        ));
+        assert!(!super::is_supported_asset_name(
+            "Sketchi-0.3.1-windows-x86_64.msi"
         ));
     }
 }

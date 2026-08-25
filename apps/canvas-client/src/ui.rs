@@ -292,6 +292,7 @@ pub(crate) struct WorkspaceUi {
     new_document_confirmation: bool,
     open_document_confirmation: bool,
     pending_open_document: Option<(PathBuf, Editor)>,
+    pending_file_dialog: Option<FileDialogRequest>,
     document_path: Option<PathBuf>,
     restore_session: bool,
     autosave_interval: AutosaveInterval,
@@ -714,6 +715,13 @@ enum KeybindAction {
     Settings,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileDialogRequest {
+    Open,
+    SaveAs { continue_open: bool },
+    AutosaveDirectory,
+}
+
 impl KeybindAction {
     const ALL: [Self; 27] = [
         Self::Select,
@@ -1041,6 +1049,7 @@ impl Default for WorkspaceUi {
             new_document_confirmation: false,
             open_document_confirmation: false,
             pending_open_document: None,
+            pending_file_dialog: None,
             document_path: None,
             restore_session: true,
             autosave_interval: AutosaveInterval::OneMinute,
@@ -2483,7 +2492,10 @@ impl WorkspaceUi {
         if response.drag_started() {
             if self.active_tool == Tool::Pan {
                 tools.cancel();
-            } else if let Some(position) = response.interact_pointer_pos() {
+            } else if let Some(position) = drag_start_screen_position(
+                ui.input(|input| input.pointer.press_origin()),
+                response.interact_pointer_pos(),
+            ) {
                 tools.pointer_down(ElementId::new(), screen_to_world(*camera, position));
             }
         }
@@ -3295,7 +3307,11 @@ impl WorkspaceUi {
         }
     }
 
-    fn request_open_document(&mut self, editor: &mut Editor) {
+    fn request_open_document(&mut self) {
+        self.pending_file_dialog = Some(FileDialogRequest::Open);
+    }
+
+    fn open_document_from_dialog(&mut self, editor: &mut Editor) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Open Sketchi document")
             .add_filter("Sketchi JSON document", &["json"])
@@ -3317,6 +3333,36 @@ impl WorkspaceUi {
             self.pending_open_document = Some((path, restored));
             self.open_document_confirmation = true;
         }
+    }
+
+    /// Runs a queued native file dialog after the egui frame has completed.
+    ///
+    /// Windows native dialogs can re-enter the window message loop. Opening
+    /// one while `egui::Context::run_ui` is still building a frame can crash the
+    /// desktop process, so dialog creation is deliberately kept outside that
+    /// callback.
+    pub(crate) fn process_pending_file_dialog(&mut self, editor: &mut Editor) -> bool {
+        let Some(request) = self.pending_file_dialog.take() else {
+            return false;
+        };
+
+        match request {
+            FileDialogRequest::Open => self.open_document_from_dialog(editor),
+            FileDialogRequest::SaveAs { continue_open } => {
+                let Some(path) = self.choose_document_save_path() else {
+                    return true;
+                };
+                if self.write_document(editor, &path)
+                    && continue_open
+                    && let Some((path, restored)) = self.pending_open_document.take()
+                {
+                    self.open_document_confirmation = false;
+                    self.replace_editor(editor, &path, restored);
+                }
+            }
+            FileDialogRequest::AutosaveDirectory => self.choose_autosave_directory_from_dialog(),
+        }
+        true
     }
 
     #[cfg(test)]
@@ -3578,7 +3624,7 @@ impl WorkspaceUi {
             self.save_document_as(editor);
         }
         if open_requested {
-            self.request_open_document(editor);
+            self.request_open_document();
         }
         if settings_requested {
             self.toggle_settings();
@@ -3981,21 +4027,22 @@ impl WorkspaceUi {
     }
 
     fn save_document(&mut self, editor: &Editor) -> bool {
-        let path = self
-            .document_path
-            .clone()
-            .or_else(|| self.choose_document_save_path());
-        let Some(path) = path else {
-            return false;
-        };
-        self.write_document(editor, &path)
+        if let Some(path) = self.document_path.clone() {
+            self.write_document(editor, &path)
+        } else {
+            self.pending_file_dialog = Some(FileDialogRequest::SaveAs {
+                continue_open: self.open_document_confirmation
+                    && self.pending_open_document.is_some(),
+            });
+            false
+        }
     }
 
-    fn save_document_as(&mut self, editor: &Editor) -> bool {
-        let Some(path) = self.choose_document_save_path() else {
-            return false;
-        };
-        self.write_document(editor, &path)
+    fn save_document_as(&mut self, _editor: &Editor) -> bool {
+        self.pending_file_dialog = Some(FileDialogRequest::SaveAs {
+            continue_open: false,
+        });
+        false
     }
 
     fn save_document_before_replacing(&mut self, editor: &Editor) -> bool {
@@ -4289,7 +4336,7 @@ impl WorkspaceUi {
                                             &mut self.autosave_directory,
                                             self.dark_mode,
                                         ) {
-                                            self.choose_autosave_directory();
+                                            self.request_choose_autosave_directory();
                                         }
                                     },
                                 );
@@ -6601,7 +6648,11 @@ impl WorkspaceUi {
         }
     }
 
-    fn choose_autosave_directory(&mut self) {
+    fn request_choose_autosave_directory(&mut self) {
+        self.pending_file_dialog = Some(FileDialogRequest::AutosaveDirectory);
+    }
+
+    fn choose_autosave_directory_from_dialog(&mut self) {
         let current = PathBuf::from(&self.autosave_directory);
         let mut dialog = rfd::FileDialog::new().set_title("Choose automatic save folder");
         if current.is_dir() {
@@ -8438,16 +8489,7 @@ fn text_choice_card(
     selected: bool,
     dark_mode: bool,
 ) -> (Rect, egui::Response) {
-    let (rect, response) = choice_card_with_size(ui, size, selected, dark_mode);
-    if selected {
-        ui.painter().rect_stroke(
-            rect.shrink(0.5),
-            CornerRadius::same(5),
-            Stroke::new(1.0_f32, ACCENT),
-            StrokeKind::Inside,
-        );
-    }
-    (rect, response)
+    choice_card_with_size(ui, size, selected, dark_mode)
 }
 
 fn choice_card_with_size(
@@ -8475,6 +8517,14 @@ fn choice_card_with_size(
         Color32::from_rgb(247, 248, 250)
     };
     ui.painter().rect_filled(rect, CornerRadius::same(5), fill);
+    if selected {
+        ui.painter().rect_stroke(
+            rect.shrink(0.5),
+            CornerRadius::same(5),
+            Stroke::new(1.0_f32, ACCENT),
+            StrokeKind::Inside,
+        );
+    }
     (rect, response)
 }
 
@@ -8989,7 +9039,7 @@ fn paint_element(
     let rect = Rect::from_min_size(Pos2::new(min.x, min.y), size);
     let stroke_color = apply_opacity(to_color32(element.style.stroke), element.style.opacity);
     let stroke = Stroke::new(
-        (element.style.stroke_width * camera.zoom()).clamp(1.0, 12.0),
+        screen_stroke_width(element.style.stroke_width),
         stroke_color,
     );
     let fill_color = element.style.fill.map_or(Color32::TRANSPARENT, |color| {
@@ -9207,15 +9257,6 @@ fn paint_element(
                             .collect::<Vec<_>>()
                     },
                 );
-            let arrowhead_points = (element.kind == ElementKind::Arrow).then(|| {
-                sloppy_polyline(
-                    &base_points,
-                    element.style.sloppiness,
-                    element.id.as_uuid().as_u128(),
-                    stroke.width,
-                    false,
-                )
-            });
             paint_sloppiness_outline(
                 painter,
                 &base_points,
@@ -9225,11 +9266,13 @@ fn paint_element(
                 element.id.as_uuid().as_u128(),
                 false,
             );
-            if let Some(points) = arrowhead_points.as_deref()
-                && let (Some(start), Some(end)) = (points.iter().rev().nth(1), points.last())
+            if element.kind == ElementKind::Arrow
+                && let Some((start, end)) = arrowhead_tangent_points(&base_points)
             {
-                // Keep the arrowhead tangent to the same sloppy path as the shaft.
-                paint_arrowhead(painter, *start, *end, stroke);
+                // Keep the pointer tangent to the intended path. Artist-mode
+                // deformation can move the shaft's penultimate sample enough
+                // to make a pointer based on that noisy segment look detached.
+                paint_arrowhead(painter, start, end, stroke);
             }
         }
         ElementKind::Freehand => {
@@ -9262,6 +9305,19 @@ fn paint_element(
             image_textures,
             document_revision,
         ),
+    }
+}
+
+/// Converts the document's stroke setting to a stable screen-space width.
+///
+/// Shapes and paths still scale with the camera, but their visual weight does
+/// not become heavier merely because the user zoomed in. This also keeps
+/// arrowheads and roughened outlines visually consistent at high zoom levels.
+fn screen_stroke_width(stroke_width: f32) -> f32 {
+    if stroke_width.is_finite() {
+        stroke_width.clamp(1.0, 12.0)
+    } else {
+        1.0
     }
 }
 
@@ -10173,8 +10229,19 @@ fn paint_arrowhead(painter: &Painter, start: Pos2, end: Pos2, stroke: Stroke) {
     painter.line_segment([end, base - side * 5.0], stroke);
 }
 
+fn arrowhead_tangent_points(points: &[Pos2]) -> Option<(Pos2, Pos2)> {
+    let mut reversed = points.iter().rev();
+    let end = *reversed.next()?;
+    let start = *reversed.next()?;
+    Some((start, end))
+}
+
 fn screen_to_world(camera: Camera, position: Pos2) -> Point {
     camera.screen_to_world(Point::new(position.x, position.y))
+}
+
+fn drag_start_screen_position(press_origin: Option<Pos2>, current: Option<Pos2>) -> Option<Pos2> {
+    press_origin.or(current)
 }
 
 #[cfg(test)]
@@ -10462,18 +10529,19 @@ mod tests {
         SETTINGS_CARD_BORDER_DARK, SETTINGS_CARD_DARK, SETTINGS_CONTROL_DARK,
         SETTINGS_CONTROL_RADIUS, SETTINGS_ROOT_DARK, SETTINGS_ROOT_RADIUS, STROKE_COLORS,
         WorkspaceUi, apply_palette_with_default_migration, apply_text_resize_font_size,
-        char_cursor_to_byte_index, collaboration_avatar_center_x, collaboration_avatar_stack_width,
-        collaboration_display_name_is_valid, collaboration_invite_field_width,
-        collaboration_invite_preview, collaboration_participant_avatar_colors,
-        collaboration_participant_initial, collaboration_popup_should_dismiss,
-        collaboration_primary_button, collaboration_text_field, color_picker_patch,
-        confirmation_frame, custom_font_size_selected, delete_previous_word, fill_choice_patch,
-        format_hex_color, grid_step_for_zoom, help_button_colors, insert_text_at_cursor,
-        insert_text_event, key_binding_label, mossbyte_agency_credit_layout, next_char_cursor,
-        next_word_cursor, next_z_index, padded_selection_bounds, parse_hex_color,
-        pattern_fill_choice_patch, platform_label, preset_font_size_selected, previous_char_cursor,
-        previous_word_cursor, reordered_layer_ids, resolve_drop_screen_position,
-        rotated_text_origin, selection_drag_position, selection_handle_cursor_tolerance,
+        arrowhead_tangent_points, char_cursor_to_byte_index, collaboration_avatar_center_x,
+        collaboration_avatar_stack_width, collaboration_display_name_is_valid,
+        collaboration_invite_field_width, collaboration_invite_preview,
+        collaboration_participant_avatar_colors, collaboration_participant_initial,
+        collaboration_popup_should_dismiss, collaboration_primary_button, collaboration_text_field,
+        color_picker_patch, confirmation_frame, custom_font_size_selected, delete_previous_word,
+        drag_start_screen_position, fill_choice_patch, format_hex_color, grid_step_for_zoom,
+        help_button_colors, insert_text_at_cursor, insert_text_event, key_binding_label,
+        mossbyte_agency_credit_layout, next_char_cursor, next_word_cursor, next_z_index,
+        padded_selection_bounds, parse_hex_color, pattern_fill_choice_patch, platform_label,
+        preset_font_size_selected, previous_char_cursor, previous_word_cursor, reordered_layer_ids,
+        resolve_drop_screen_position, rotated_text_origin, screen_stroke_width,
+        selection_drag_position, selection_handle_cursor_tolerance,
         selection_handle_drag_tolerance, settings_group_frame, settings_keybind_card_frame,
         settings_modal_frame, settings_scroll_bar_visibility, settings_visuals,
         sloppiness_amplitude, sloppy_polyline, stroke_preset_count, text_create_command,
@@ -11508,6 +11576,18 @@ mod tests {
     }
 
     #[test]
+    fn element_stroke_width_remains_screen_consistent_at_high_zoom() {
+        let normal = screen_stroke_width(2.0);
+        let zoomed = screen_stroke_width(2.0);
+
+        assert!((normal - 2.0).abs() < f32::EPSILON);
+        assert!((normal - zoomed).abs() < f32::EPSILON);
+        assert!((screen_stroke_width(f32::NAN) - 1.0).abs() < f32::EPSILON);
+        assert!((screen_stroke_width(0.25) - 1.0).abs() < f32::EPSILON);
+        assert!((screen_stroke_width(20.0) - 12.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn group_selection_padding_stays_five_screen_pixels_wide() {
         let padded = padded_selection_bounds(
             canvas_core::Rect::new(Point::new(10.0, 20.0), canvas_core::Size::new(40.0, 30.0)),
@@ -11516,6 +11596,21 @@ mod tests {
 
         assert_eq!(padded.min, Point::new(7.5, 17.5));
         assert_eq!(padded.size, canvas_core::Size::new(45.0, 35.0));
+    }
+
+    #[test]
+    fn drawing_starts_at_the_pointer_press_origin() {
+        let origin = Pos2::new(40.0, 50.0);
+        let after_drag_threshold = Pos2::new(43.0, 53.0);
+
+        assert_eq!(
+            drag_start_screen_position(Some(origin), Some(after_drag_threshold)),
+            Some(origin)
+        );
+        assert_eq!(
+            drag_start_screen_position(None, Some(after_drag_threshold)),
+            Some(after_drag_threshold)
+        );
     }
 
     #[test]
@@ -11814,6 +11909,29 @@ mod tests {
                     .is_some_and(|point| point.y.abs() > f32::EPSILON)
             );
         }
+    }
+
+    #[test]
+    fn arrowhead_uses_the_intended_path_tangent() {
+        let intended = [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(80.0, 20.0),
+            Pos2::new(100.0, 0.0),
+        ];
+        let roughened = [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(80.0, 45.0),
+            Pos2::new(100.0, 0.0),
+        ];
+
+        assert_eq!(
+            arrowhead_tangent_points(&intended),
+            Some((Pos2::new(80.0, 20.0), Pos2::new(100.0, 0.0)))
+        );
+        assert_ne!(
+            arrowhead_tangent_points(&intended),
+            arrowhead_tangent_points(&roughened)
+        );
     }
 
     #[test]

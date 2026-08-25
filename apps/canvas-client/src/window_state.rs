@@ -1,6 +1,9 @@
 //! Persistent native-window state for the desktop client.
 
-use std::{fs, io, path::PathBuf};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -62,10 +65,67 @@ fn path() -> Option<PathBuf> {
         .map(|directories| directories.config_dir().join("window-state.json"))
 }
 
+fn temporary_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("window-state.json");
+    path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
+}
+
+#[cfg(windows)]
+fn backup_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        ".{}.bak",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("window-state.json")
+    ))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temporary_path = temporary_path(path);
+    if let Err(error) = fs::write(&temporary_path, bytes) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+
+    #[cfg(windows)]
+    if path.exists() {
+        let backup_path = backup_path(path);
+        if backup_path.exists() {
+            fs::remove_file(&backup_path)?;
+        }
+        if let Err(error) = fs::rename(path, &backup_path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&temporary_path, path) {
+            let _ = fs::rename(&backup_path, path);
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+        let _ = fs::remove_file(backup_path);
+        return Ok(());
+    }
+
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Loads the last saved window state.
 pub(crate) fn load() -> Result<Option<WindowState>, WindowStateError> {
     let Some(path) = path() else {
         return Ok(None);
+    };
+    #[cfg(windows)]
+    let path = if path.exists() {
+        path
+    } else {
+        backup_path(&path)
     };
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -86,7 +146,7 @@ pub(crate) fn save(state: &WindowState) -> Result<(), WindowStateError> {
     };
     fs::create_dir_all(parent).map_err(WindowStateError::Write)?;
     let bytes = serde_json::to_vec_pretty(state)?;
-    fs::write(path, bytes).map_err(WindowStateError::Write)
+    atomic_write(&path, &bytes).map_err(WindowStateError::Write)
 }
 
 #[cfg(test)]

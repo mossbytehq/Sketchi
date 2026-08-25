@@ -382,6 +382,9 @@ impl ApplicationHandler for DesktopApplication {
                     }
                     self.flush_collaboration_operations();
                 });
+                if self.ui.process_pending_file_dialog(&mut self.editor) {
+                    window.request_redraw();
+                }
                 if self.ui.take_toast_repaint_request() {
                     window.request_redraw();
                 }
@@ -646,6 +649,9 @@ impl DesktopApplication {
             };
             match collaboration.poll() {
                 Ok(messages) => messages,
+                // A full outbound queue is expected backpressure. Keep the
+                // current room alive so the next event-loop turn can retry.
+                Err(ConnectionError::QueueFull) => return false,
                 Err(error) => {
                     let message = error.to_string();
                     if let Some(collaboration) = self.collaboration.as_mut() {

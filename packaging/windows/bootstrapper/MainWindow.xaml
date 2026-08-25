@@ -1,0 +1,52 @@
+<Window
+    x:Class="Sketchi.Bootstrapper.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Title="Sketchi Setup">
+  <Grid MinWidth="560" MinHeight="360" Background="#F7F8FA">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="56" />
+      <RowDefinition Height="*" />
+      <RowDefinition Height="72" />
+    </Grid.RowDefinitions>
+
+    <Grid x:Name="AppTitleBar" Grid.Row="0" Padding="24,0" Background="#F7F8FA">
+      <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Spacing="10">
+        <Border Width="28" Height="28" CornerRadius="7" Background="#3B82F6">
+          <TextBlock Text="S" Foreground="White" FontSize="16" FontWeight="SemiBold"
+                     HorizontalAlignment="Center" VerticalAlignment="Center" />
+        </Border>
+        <TextBlock Text="Sketchi" FontSize="16" FontWeight="SemiBold"
+                   VerticalAlignment="Center" Foreground="#1F2937" />
+      </StackPanel>
+    </Grid>
+
+    <StackPanel Grid.Row="1" Margin="48,20,48,12" Spacing="16">
+      <TextBlock x:Name="HeadingText" Text="Install Sketchi" FontSize="30"
+                 FontWeight="SemiBold" Foreground="#111827" />
+      <TextBlock Text="A collaborative whiteboard for visual thinking."
+                 FontSize="15" Foreground="#4B5563" />
+      <Border Margin="0,12,0,0" Padding="18" CornerRadius="12" Background="White"
+              BorderBrush="#E5E7EB" BorderThickness="1">
+        <StackPanel Spacing="10">
+          <TextBlock Text="What you get" FontSize="16" FontWeight="SemiBold"
+                     Foreground="#1F2937" />
+          <TextBlock Text="Sketchi and its local collaboration server will be installed for all users."
+                     TextWrapping="Wrap" Foreground="#4B5563" />
+          <TextBlock x:Name="StatusText" Text="Preparing setup…" TextWrapping="Wrap"
+                     Foreground="#6B7280" />
+          <ProgressBar x:Name="ProgressBar" IsIndeterminate="True" Visibility="Collapsed" />
+        </StackPanel>
+      </Border>
+    </StackPanel>
+
+    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right"
+                VerticalAlignment="Center" Margin="24,0,32,0" Spacing="12">
+      <Button x:Name="CancelButton" Content="Cancel" MinWidth="96" Click="CancelButton_Click" />
+      <Button x:Name="InstallButton" Content="Install" MinWidth="128" Click="InstallButton_Click" />
+    </StackPanel>
+  </Grid>
+</Window>

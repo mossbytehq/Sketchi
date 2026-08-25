@@ -114,10 +114,8 @@ impl LucideIcon {
             Self::Rounded => Icon::SquareRoundCorner,
             Self::Ellipse => Icon::Circle,
             Self::Line => Icon::Slash,
-            Self::CurvedLineClockwise | Self::CurvedArrowClockwise => Icon::CornerLeftDown,
-            Self::CurvedLineCounterClockwise | Self::CurvedArrowCounterClockwise => {
-                Icon::CornerRightUp
-            }
+            Self::CurvedLineClockwise | Self::CurvedArrowClockwise => Icon::Redo,
+            Self::CurvedLineCounterClockwise | Self::CurvedArrowCounterClockwise => Icon::Undo,
             Self::ArrowLeftDownLong => Icon::MoveDownLeft,
             Self::ArrowDownS | Self::ExpandUpDown => Icon::ChevronDown,
             Self::ArrowUpS | Self::ContractUpDown => Icon::ChevronUp,
@@ -215,19 +213,19 @@ mod tests {
         assert_eq!(LucideIcon::Line.glyph(), Icon::Slash.unicode());
         assert_eq!(
             LucideIcon::CurvedLineClockwise.glyph(),
-            Icon::CornerLeftDown.unicode()
+            Icon::Redo.unicode()
         );
         assert_eq!(
             LucideIcon::CurvedLineCounterClockwise.glyph(),
-            Icon::CornerRightUp.unicode()
+            Icon::Undo.unicode()
         );
         assert_eq!(
             LucideIcon::CurvedArrowClockwise.glyph(),
-            Icon::CornerLeftDown.unicode()
+            Icon::Redo.unicode()
         );
         assert_eq!(
             LucideIcon::CurvedArrowCounterClockwise.glyph(),
-            Icon::CornerRightUp.unicode()
+            Icon::Undo.unicode()
         );
         assert_eq!(LucideIcon::PenNib.glyph(), Icon::PenTool.unicode());
         assert_eq!(LucideIcon::QuillPen.glyph(), Icon::Feather.unicode());

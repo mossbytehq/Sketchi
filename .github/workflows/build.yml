@@ -73,6 +73,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: ${{ matrix.target }}
+      - uses: actions/setup-dotnet@v4
+        if: runner.os == 'Windows'
+        with:
+          dotnet-version: 8.0.x
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: sketchi-release-${{ matrix.target }}
@@ -96,6 +100,21 @@ jobs:
       - name: Stage server package
         shell: bash
         run: cargo run --locked --package xtask -- package-server --target "${{ matrix.target }}" --target-dir target --out-dir dist/staging
+      - name: Build Windows WinUI bootstrapper
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bootstrapperDir = Join-Path $env:GITHUB_WORKSPACE "dist\staging\sketchi-bootstrapper"
+          Remove-Item -LiteralPath $bootstrapperDir -Recurse -Force -ErrorAction SilentlyContinue
+          dotnet publish "$env:GITHUB_WORKSPACE\packaging\windows\bootstrapper\Sketchi.Bootstrapper.csproj" `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            --output $bootstrapperDir
+          $bootstrapper = Join-Path $bootstrapperDir "Sketchi.Bootstrapper.exe"
+          if (-not (Test-Path $bootstrapper)) {
+            throw "WinUI bootstrapper was not published"
+          }
       - name: Verify staged contents
         shell: bash
         run: |
@@ -181,6 +200,10 @@ jobs:
             (Join-Path $stage.FullName "Sketchi-server.exe"),
             (Join-Path $serverStage.FullName "Sketchi-server.exe")
           ) | Select-Object -Unique
+          $bootstrapper = Join-Path $env:GITHUB_WORKSPACE "dist\staging\sketchi-bootstrapper\Sketchi.Bootstrapper.exe"
+          if (Test-Path $bootstrapper) {
+            $files += $bootstrapper
+          }
           foreach ($file in $files) {
             if (-not (Test-Path $file)) {
               throw "Cannot sign missing file $file"
@@ -282,6 +305,30 @@ jobs:
           if (-not (Test-Path $msi)) {
             throw "Windows MSI installer was not found"
           }
+          $bootstrapperDir = Join-Path $env:GITHUB_WORKSPACE "dist\staging\sketchi-bootstrapper"
+          $bootstrapper = Join-Path $bootstrapperDir "Sketchi.Bootstrapper.exe"
+          if (-not (Test-Path $bootstrapper)) {
+            throw "WinUI bootstrapper was not published"
+          }
+          $payloadWxs = Join-Path $env:RUNNER_TEMP "sketchi-bootstrapper-payload.wxs"
+          $payloadLines = Get-ChildItem -LiteralPath $bootstrapperDir -Recurse -File |
+            Where-Object { $_.FullName -ne $bootstrapper } |
+            ForEach-Object {
+              $relative = [IO.Path]::GetRelativePath($bootstrapperDir, $_.FullName).Replace('\', '/')
+              $source = [Security.SecurityElement]::Escape($_.FullName)
+              $name = [Security.SecurityElement]::Escape($relative)
+              "      <Payload SourceFile=`"$source`" Name=`"$name`" />"
+            }
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+            <Fragment>
+              <PayloadGroup Id="SketchiBootstrapperPayloads">
+          $($payloadLines -join [Environment]::NewLine)
+              </PayloadGroup>
+            </Fragment>
+          </Wix>
+          "@ | Set-Content -LiteralPath $payloadWxs -Encoding utf8
 
           $wixDir = Join-Path $env:RUNNER_TEMP "wix"
           $wix = Join-Path $wixDir "wix.exe"
@@ -290,12 +337,12 @@ jobs:
             exit $LASTEXITCODE
           }
           $setup = Join-Path $env:GITHUB_WORKSPACE "dist\staging\Sketchi-$env:SKETCHI_VERSION-windows-x86_64-setup.exe"
-          & $wix build "$env:GITHUB_WORKSPACE\packaging\windows\bundle.wxs" `
+          & $wix build "$env:GITHUB_WORKSPACE\packaging\windows\bundle.wxs" $payloadWxs `
             -arch x64 `
             -ext WixToolset.BootstrapperApplications.wixext `
             -d "Version=$env:SKETCHI_VERSION" `
             -d "IconFile=$($stage.FullName)\Sketchi.ico" `
-            -d "LicenseRtf=$env:GITHUB_WORKSPACE\packaging\windows\license.rtf" `
+            -d "BootstrapperExe=$bootstrapper" `
             -d "MsiFile=$msi" `
             -o $setup
           if ($LASTEXITCODE -ne 0) {

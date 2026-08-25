@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Wix
-    xmlns="http://wixtoolset.org/schemas/v4/wxs"
-    xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+    xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Bundle
       Name="Sketchi Setup"
       Manufacturer="Sketchi contributors"
@@ -9,11 +8,8 @@
       UpgradeCode="1D3C7C2F-1B62-4E9A-9F64-8D2C2D8D0A41"
       IconSourceFile="$(var.IconFile)"
       Compressed="yes">
-    <BootstrapperApplication>
-      <bal:WixStandardBootstrapperApplication
-          LicenseFile="$(var.LicenseRtf)"
-          Theme="rtfLicense"
-          ShowVersion="yes" />
+    <BootstrapperApplication SourceFile="$(var.BootstrapperExe)">
+      <PayloadGroupRef Id="SketchiBootstrapperPayloads" />
     </BootstrapperApplication>
     <Chain>
       <MsiPackage SourceFile="$(var.MsiFile)" />

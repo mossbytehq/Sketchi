@@ -43,7 +43,7 @@
             Icon="SketchiIcon" />
         <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall" />
         <RegistryValue
-            Root="HKCU"
+            Root="HKLM"
             Key="Software\Sketchi"
             Name="installed"
             Type="integer"

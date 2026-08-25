@@ -1,6 +1,11 @@
 //! Persistent application preferences used by the desktop client.
 
-use std::{collections::BTreeMap, fs, io, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs, io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use canvas_core::Style;
 use directories::ProjectDirs;
@@ -217,10 +222,67 @@ fn path() -> Option<PathBuf> {
         .map(|directories| directories.config_dir().join("settings.json"))
 }
 
+fn temporary_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("settings.json");
+    path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
+}
+
+#[cfg(windows)]
+fn backup_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        ".{}.bak",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("settings.json")
+    ))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temporary_path = temporary_path(path);
+    if let Err(error) = fs::write(&temporary_path, bytes) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+
+    #[cfg(windows)]
+    if path.exists() {
+        let backup_path = backup_path(path);
+        if backup_path.exists() {
+            fs::remove_file(&backup_path)?;
+        }
+        if let Err(error) = fs::rename(path, &backup_path) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&temporary_path, path) {
+            let _ = fs::rename(&backup_path, path);
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+        let _ = fs::remove_file(backup_path);
+        return Ok(());
+    }
+
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Loads preferences, returning `None` when no settings have been saved yet.
 pub(crate) fn load() -> Result<Option<Settings>, SettingsError> {
     let Some(path) = path() else {
         return Ok(None);
+    };
+    #[cfg(windows)]
+    let path = if path.exists() {
+        path
+    } else {
+        backup_path(&path)
     };
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -240,7 +302,7 @@ pub(crate) fn save(settings: &Settings) -> Result<(), SettingsError> {
     };
     fs::create_dir_all(parent).map_err(SettingsError::Write)?;
     let bytes = serde_json::to_vec_pretty(settings)?;
-    fs::write(path, bytes).map_err(SettingsError::Write)
+    atomic_write(&path, &bytes).map_err(SettingsError::Write)
 }
 
 #[cfg(test)]

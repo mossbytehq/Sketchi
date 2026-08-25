@@ -28,6 +28,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
+      - uses: actions/setup-dotnet@v4
+        if: runner.os == 'Windows'
+        with:
+          dotnet-version: 8.0.x
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: sketchi-${{ matrix.target }}
@@ -39,3 +43,16 @@ jobs:
         run: cargo test --workspace --all-targets --locked
       - name: Release build
         run: cargo build --workspace --release --locked --target ${{ matrix.target }}
+      - name: Build Windows WinUI bootstrapper
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $output = Join-Path $env:RUNNER_TEMP "sketchi-bootstrapper-ci"
+          dotnet publish "$env:GITHUB_WORKSPACE\packaging\windows\bootstrapper\Sketchi.Bootstrapper.csproj" `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            --output $output
+          if (-not (Test-Path (Join-Path $output "Sketchi.Bootstrapper.exe"))) {
+            throw "WinUI bootstrapper did not publish successfully"
+          }
