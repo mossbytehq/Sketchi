@@ -133,6 +133,7 @@ pub(crate) enum UpdateError {
     #[error("could not stage the update: {0}")]
     Io(#[from] io::Error),
     /// The current installation directory cannot be modified by the updater.
+    #[cfg(target_os = "linux")]
     #[error(
         "automatic updates require a user-writable installation directory ({0}); use your package manager to update this installation"
     )]
