@@ -10,7 +10,7 @@ use std::{
 use canvas_core::{
     ClientId, Color, Document, EdgeStyle, EditorCommand, Element, ElementId, ElementKind,
     EmbeddedImage, FillStyle, Point, Size, Sloppiness, StrokeStyle, Style, StylePatch, TextAlign,
-    TextFontFamily, Transform,
+    TextFontFamily, Transform, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS,
 };
 use canvas_protocol::{PresenceState, ToolKind};
 use canvas_renderer::{Camera, RenderPrimitive, Renderer, Scene};
@@ -1155,7 +1155,7 @@ impl WorkspaceUi {
             );
         }
         settings::Settings {
-            version: 6,
+            version: 7,
             client_id: self.client_id,
             appearance: match self.appearance {
                 AppearanceMode::System => settings::Appearance::System,
@@ -1170,6 +1170,10 @@ impl WorkspaceUi {
                 AutosaveInterval::Never => settings::AutosaveInterval::Never,
             },
             autosave_directory: self.autosave_directory.clone(),
+            last_document_path: self
+                .document_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
             light_canvas_color: self.light_canvas_color.to_array(),
             dark_canvas_color: self.dark_canvas_color.to_array(),
             canvas_background: self.canvas_background,
@@ -1183,6 +1187,17 @@ impl WorkspaceUi {
             update_channel: self.update_channel,
             update_cache: self.update_cache.clone(),
         }
+    }
+
+    /// Returns the currently opened document path, when one is known.
+    #[must_use]
+    pub(crate) fn document_path(&self) -> Option<&Path> {
+        self.document_path.as_deref()
+    }
+
+    /// Clears a persisted document association after it fails to load.
+    pub(crate) fn clear_document_path(&mut self) {
+        self.document_path = None;
     }
 
     /// Applies persisted preferences with bounds and malformed-shortcut recovery.
@@ -1209,6 +1224,12 @@ impl WorkspaceUi {
             self.autosave_directory
                 .clone_from(&persisted.autosave_directory);
         }
+        self.document_path = persisted
+            .last_document_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_file());
         self.light_canvas_color = Color32::from_rgba_unmultiplied(
             persisted.light_canvas_color[0],
             persisted.light_canvas_color[1],
@@ -3384,12 +3405,12 @@ impl WorkspaceUi {
     }
 
     fn load_editor_from_path(
-        client_id: canvas_core::ClientId,
+        _client_id: canvas_core::ClientId,
         path: &Path,
     ) -> Result<Editor, String> {
         let document =
             crate::storage::load_document_from_path(path).map_err(|error| error.to_string())?;
-        Editor::from_document(client_id, &document).map_err(|error| error.to_string())
+        Editor::from_document_with_fresh_identity(&document).map_err(|error| error.to_string())
     }
 
     fn replace_editor(&mut self, editor: &mut Editor, path: &Path, restored: Editor) {
@@ -4083,8 +4104,16 @@ impl WorkspaceUi {
             if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
                 dialog = dialog.set_file_name(file_name);
             }
-        } else if let Ok(directory) = env::current_dir() {
-            dialog = dialog.set_directory(directory);
+        } else {
+            // Installed Windows shortcuts run from Program Files, which is
+            // normally not writable by a standard user. Start Save As in the
+            // configured per-user data directory instead.
+            let directory = PathBuf::from(&self.autosave_directory);
+            if directory.is_dir() || fs::create_dir_all(&directory).is_ok() {
+                dialog = dialog.set_directory(directory);
+            } else if let Ok(directory) = env::current_dir() {
+                dialog = dialog.set_directory(directory);
+            }
             dialog = dialog.set_file_name("untitled.json");
         }
         dialog.save_file().map(normalize_document_path)
@@ -9424,6 +9453,18 @@ fn paint_image(
             }
             (decoded.width, decoded.height, decoded.rgba)
         } else {
+            if image.bytes.len() > MAX_IMAGE_BYTES {
+                paint_image_placeholder(
+                    painter,
+                    rect,
+                    stroke,
+                    corner_radius,
+                    rotation,
+                    element.style.sloppiness,
+                    element.id.as_uuid().as_u128(),
+                );
+                return;
+            }
             let Ok(decoded) = image::load_from_memory(&image.bytes) else {
                 paint_image_placeholder(
                     painter,
@@ -9437,6 +9478,24 @@ fn paint_image(
                 return;
             };
             let (width, height) = decoded.dimensions();
+            let pixels = u64::from(width).saturating_mul(u64::from(height));
+            if width == 0
+                || height == 0
+                || width > MAX_IMAGE_DIMENSION
+                || height > MAX_IMAGE_DIMENSION
+                || pixels > MAX_IMAGE_PIXELS
+            {
+                paint_image_placeholder(
+                    painter,
+                    rect,
+                    stroke,
+                    corner_radius,
+                    rotation,
+                    element.style.sloppiness,
+                    element.id.as_uuid().as_u128(),
+                );
+                return;
+            }
             let rgba = decoded.to_rgba8().into_raw();
             (width, height, rgba)
         };

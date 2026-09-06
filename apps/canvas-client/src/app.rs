@@ -1,6 +1,7 @@
 //! Desktop application shell boundary.
 
 use std::{
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -146,21 +147,36 @@ impl DesktopShell {
             .is_none_or(|state| state.restore_session);
         ui.set_restore_session(restore_session);
         let editor = if restore_session {
-            match storage::load_document(&settings_state.autosave_directory) {
-                Ok(Some(document)) => {
-                    match Editor::from_document(settings_state.client_id, &document) {
-                        Ok(editor) => editor,
-                        Err(error) => {
-                            tracing::warn!(error = %error, "Sketchi could not restore autosave");
-                            Editor::new(settings_state.client_id)
-                        }
-                    }
-                }
-                Ok(None) => Editor::new(settings_state.client_id),
+            let last_document = settings_state
+                .last_document_path
+                .as_deref()
+                .map(std::path::Path::new)
+                .filter(|path| path.is_file())
+                .map(|path| storage::load_document_from_path(path))
+                .transpose();
+            let document = match last_document {
+                Ok(Some(document)) => Some(document),
+                Ok(None) => storage::load_document(&settings_state.autosave_directory)
+                    .inspect_err(|error| tracing::warn!(error = %error, "Sketchi could not read autosave"))
+                    .ok()
+                    .flatten(),
                 Err(error) => {
-                    tracing::warn!(error = %error, "Sketchi could not read autosave");
-                    Editor::new(settings_state.client_id)
+                    tracing::warn!(error = %error, "Sketchi could not decode the last document; trying autosave");
+                    ui.clear_document_path();
+                    storage::load_document(&settings_state.autosave_directory)
+                        .inspect_err(|error| tracing::warn!(error = %error, "Sketchi could not read autosave"))
+                        .ok()
+                        .flatten()
                 }
+            };
+            match document {
+                Some(document) => Editor::from_document_with_fresh_identity(&document)
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(error = %error, "Sketchi could not restore document");
+                        ui.clear_document_path();
+                        Editor::new(settings_state.client_id)
+                    }),
+                None => Editor::new(settings_state.client_id),
             }
         } else {
             Editor::new(settings_state.client_id)
@@ -387,6 +403,8 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
                 };
                 let raw_input = egui_state.take_egui_input(window.as_ref());
                 let context = self.egui.clone();
+                let document_path_before = self.ui.document_path().map(Path::to_path_buf);
+                let editor_identity_before = self.editor.client_id();
                 let full_output = context.run_ui(raw_input, |ui| {
                     let collaboration = self.collaboration_view();
                     let action = self.ui.show(
@@ -413,6 +431,17 @@ impl ApplicationHandler<UserEvent> for DesktopApplication {
                 });
                 if self.ui.process_pending_file_dialog(&mut self.editor) {
                     window.request_redraw();
+                }
+                if self.collaboration.is_some()
+                    && (self.ui.document_path().map(Path::to_path_buf) != document_path_before
+                        || self.editor.client_id() != editor_identity_before)
+                {
+                    // A document switch is a new local sync context. End the
+                    // old room so its queued operations cannot leak into the
+                    // newly opened canvas.
+                    self.collaboration = None;
+                    self.collaboration_created_room = false;
+                    self.collaboration_error = None;
                 }
                 if self.ui.take_toast_repaint_request() {
                     window.request_redraw();
@@ -924,6 +953,11 @@ impl DesktopApplication {
             return;
         }
         if force && !self.ui.restore_session_enabled() {
+            return;
+        }
+        // Do not replace a useful recovery copy with an empty canvas after the
+        // user has created a new document or failed to restore the previous one.
+        if self.editor.document().is_empty() {
             return;
         }
         match storage::save_document(

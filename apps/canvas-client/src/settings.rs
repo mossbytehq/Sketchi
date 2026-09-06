@@ -18,7 +18,7 @@ use crate::{
     update::{UpdateCache, UpdateChannel},
 };
 
-const SETTINGS_VERSION: u32 = 6;
+const SETTINGS_VERSION: u32 = 7;
 
 /// Persisted appearance preference.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -94,6 +94,9 @@ pub(crate) struct Settings {
     pub(crate) autosave_interval: AutosaveInterval,
     /// Automatic-save destination.
     pub(crate) autosave_directory: String,
+    /// Last explicitly opened or saved document, restored on the next launch.
+    #[serde(default)]
+    pub(crate) last_document_path: Option<String>,
     /// Light canvas background RGBA.
     pub(crate) light_canvas_color: [u8; 4],
     /// Dark canvas background RGBA.
@@ -128,6 +131,7 @@ impl Default for Settings {
             appearance: Appearance::System,
             autosave_interval: AutosaveInterval::OneMinute,
             autosave_directory: default_autosave_directory(),
+            last_document_path: None,
             light_canvas_color: rgba(252, 252, 253, 255),
             dark_canvas_color: rgba(26, 27, 30, 255),
             canvas_background: CanvasBackground::DotGrid,

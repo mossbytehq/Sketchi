@@ -95,6 +95,15 @@ impl Editor {
         Ok(editor)
     }
 
+    /// Creates an editor for a restored document with a fresh operation
+    /// identity. This prevents materialized files from replaying sequence
+    /// numbers that may already exist in a collaboration room.
+    pub fn from_document_with_fresh_identity(
+        document: &Document,
+    ) -> Result<Self, EditorError> {
+        Self::from_document(canvas_core::ClientId::new(), document)
+    }
+
     /// Executes a command locally and queues its operation for transport.
     ///
     /// # Errors
@@ -227,8 +236,28 @@ impl Editor {
     /// [`EditorError::Core`] when the inverse operation is rejected.
     pub fn undo(&mut self) -> Result<OperationId, EditorError> {
         let entry = self.undo.pop().ok_or(EditorError::NothingToUndo)?;
-        let operation = self.apply_command(entry.inverse.clone())?;
-        self.redo.push(entry);
+        let (inverse, redo_entry) = match entry.inverse.clone() {
+            EditorCommand::Create(mut element)
+                if self.crdt.is_tombstoned(element.id) =>
+            {
+                // Deleted IDs are permanent CRDT tombstones. Recreate the
+                // object under a fresh identity and carry that identity into
+                // redo so the compensating edit remains effective.
+                element.id = canvas_core::ElementId::new();
+                let id = element.id;
+                let recreated = EditorCommand::Create(element.clone());
+                (
+                    recreated.clone(),
+                    HistoryEntry {
+                        command: EditorCommand::Delete(id),
+                        inverse: recreated,
+                    },
+                )
+            }
+            inverse => (inverse, entry.clone()),
+        };
+        let operation = self.apply_command(inverse)?;
+        self.redo.push(redo_entry);
         Ok(operation.id)
     }
 
@@ -240,8 +269,16 @@ impl Editor {
     /// [`EditorError::Core`] when the replay is rejected.
     pub fn redo(&mut self) -> Result<OperationId, EditorError> {
         let entry = self.redo.pop().ok_or(EditorError::NothingToRedo)?;
-        let operation = self.apply_command(entry.command.clone())?;
-        self.undo.push(entry);
+        let (command, inverse) = match entry.command.clone() {
+            EditorCommand::Create(mut element) if self.crdt.is_tombstoned(element.id) => {
+                element.id = canvas_core::ElementId::new();
+                let inverse = EditorCommand::Delete(element.id);
+                (EditorCommand::Create(element), inverse)
+            }
+            command => (command, entry.inverse.clone()),
+        };
+        let operation = self.apply_command(command.clone())?;
+        self.undo.push(HistoryEntry { command, inverse });
         Ok(operation.id)
     }
 
