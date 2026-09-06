@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use canvas_core::Style;
+use canvas_core::{ClientId, Style};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -85,6 +85,9 @@ pub(crate) struct KeyBinding {
 pub(crate) struct Settings {
     /// Settings schema version.
     pub(crate) version: u32,
+    /// Stable identity used for operation IDs across restarts.
+    #[serde(default = "default_client_id")]
+    pub(crate) client_id: ClientId,
     /// Canvas appearance mode.
     pub(crate) appearance: Appearance,
     /// Automatic-save interval.
@@ -121,6 +124,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             version: SETTINGS_VERSION,
+            client_id: ClientId::new(),
             appearance: Appearance::System,
             autosave_interval: AutosaveInterval::OneMinute,
             autosave_directory: default_autosave_directory(),
@@ -174,6 +178,10 @@ impl Default for Settings {
             update_cache: UpdateCache::default(),
         }
     }
+}
+
+fn default_client_id() -> ClientId {
+    ClientId::new()
 }
 
 impl AutosaveInterval {

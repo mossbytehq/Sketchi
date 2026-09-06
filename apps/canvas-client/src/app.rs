@@ -1,7 +1,7 @@
 //! Desktop application shell boundary.
 
 use std::{
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -13,7 +13,7 @@ use winit::{
     application::ApplicationHandler,
     dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, KeyEvent, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey},
     window::{Icon as WindowIcon, Theme, Window, WindowId},
 };
@@ -39,6 +39,11 @@ pub struct AppState {
     pub editor: Editor,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum UserEvent {
+    RepaintScheduled,
+}
+
 /// Errors raised while creating the desktop shell.
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -52,7 +57,7 @@ pub enum AppError {
 
 /// Native window and rendering-context foundation.
 pub struct DesktopShell {
-    event_loop: EventLoop<()>,
+    event_loop: EventLoop<UserEvent>,
     /// Shared immediate-mode UI context for editor chrome and overlays.
     pub egui: egui::Context,
     /// GPU instance used by the eventual surface renderer.
@@ -76,8 +81,9 @@ impl DesktopShell {
             "desktop backend environment"
         );
         tracing::info!("creating native event loop");
-        let event_loop =
-            EventLoop::new().map_err(|error| AppError::EventLoop(error.to_string()))?;
+        let event_loop = EventLoop::<UserEvent>::with_user_event()
+            .build()
+            .map_err(|error| AppError::EventLoop(error.to_string()))?;
         let egui = egui::Context::default();
         lucide_icons::install(&egui);
         let (local_server, local_server_error) = match LocalServer::spawn_default() {
@@ -114,6 +120,8 @@ impl DesktopShell {
             local_server,
             local_server_error,
         } = self;
+        let repaint_proxy = event_loop.create_proxy();
+        let repaint_deadline = Arc::new(Mutex::new(None));
         let saved_window_state = match window_state::load() {
             Ok(state) => state,
             Err(error) => {
@@ -139,21 +147,23 @@ impl DesktopShell {
         ui.set_restore_session(restore_session);
         let editor = if restore_session {
             match storage::load_document(&settings_state.autosave_directory) {
-                Ok(Some(document)) => match Editor::from_document(ClientId::new(), &document) {
-                    Ok(editor) => editor,
-                    Err(error) => {
-                        tracing::warn!(error = %error, "Sketchi could not restore autosave");
-                        Editor::new(ClientId::new())
+                Ok(Some(document)) => {
+                    match Editor::from_document(settings_state.client_id, &document) {
+                        Ok(editor) => editor,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "Sketchi could not restore autosave");
+                            Editor::new(settings_state.client_id)
+                        }
                     }
-                },
-                Ok(None) => Editor::new(ClientId::new()),
+                }
+                Ok(None) => Editor::new(settings_state.client_id),
                 Err(error) => {
                     tracing::warn!(error = %error, "Sketchi could not read autosave");
-                    Editor::new(ClientId::new())
+                    Editor::new(settings_state.client_id)
                 }
             }
         } else {
-            Editor::new(ClientId::new())
+            Editor::new(settings_state.client_id)
         };
         let mut application = DesktopApplication {
             window: None,
@@ -177,6 +187,8 @@ impl DesktopShell {
             collaboration: None,
             collaboration_created_room: false,
             collaboration_error: local_server_error,
+            repaint_proxy,
+            repaint_deadline,
         };
         let result = event_loop.run_app(&mut application);
         if let Err(error) = result {
@@ -208,9 +220,11 @@ struct DesktopApplication {
     collaboration: Option<CollaborationClient>,
     collaboration_created_room: bool,
     collaboration_error: Option<String>,
+    repaint_proxy: EventLoopProxy<UserEvent>,
+    repaint_deadline: Arc<Mutex<Option<Instant>>>,
 }
 
-impl ApplicationHandler for DesktopApplication {
+impl ApplicationHandler<UserEvent> for DesktopApplication {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             let mut attributes = Window::default_attributes()
@@ -236,8 +250,21 @@ impl ApplicationHandler for DesktopApplication {
                 Ok(window) => {
                     let window = Arc::new(window);
                     let repaint_window = Arc::clone(&window);
-                    self.egui.set_request_repaint_callback(move |_info| {
-                        repaint_window.request_redraw();
+                    let repaint_proxy = self.repaint_proxy.clone();
+                    let repaint_deadline = Arc::clone(&self.repaint_deadline);
+                    self.egui.set_request_repaint_callback(move |info| {
+                        if info.delay.is_zero() {
+                            if let Ok(mut deadline) = repaint_deadline.lock() {
+                                *deadline = None;
+                            }
+                            repaint_window.request_redraw();
+                        } else if let Some(next) = Instant::now().checked_add(info.delay)
+                            && let Ok(mut deadline) = repaint_deadline.lock()
+                            && deadline.is_none_or(|current| next < current)
+                        {
+                            *deadline = Some(next);
+                            let _ = repaint_proxy.send_event(UserEvent::RepaintScheduled);
+                        }
                     });
                     let size = window.inner_size();
                     self.ui
@@ -283,6 +310,8 @@ impl ApplicationHandler for DesktopApplication {
             }
         }
     }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {}
 
     #[allow(clippy::too_many_lines)]
     fn window_event(
@@ -437,6 +466,17 @@ impl ApplicationHandler for DesktopApplication {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let next_repaint = self.repaint_deadline.lock().ok().and_then(|mut deadline| {
+            if deadline.is_some_and(|next| next <= Instant::now()) {
+                *deadline = None;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+                None
+            } else {
+                *deadline
+            }
+        });
         let collaboration_changed = self.poll_collaboration();
         if collaboration_changed && let Some(window) = &self.window {
             window.request_redraw();
@@ -481,10 +521,15 @@ impl ApplicationHandler for DesktopApplication {
             .collaboration
             .is_some()
             .then(|| Instant::now() + Duration::from_millis(50));
-        let next_wakeup = [next_autosave, next_update_poll, next_collaboration_poll]
-            .into_iter()
-            .flatten()
-            .min();
+        let next_wakeup = [
+            next_autosave,
+            next_update_poll,
+            next_collaboration_poll,
+            next_repaint,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         if let Some(next_wakeup) = next_wakeup {
             event_loop.set_control_flow(ControlFlow::WaitUntil(next_wakeup));
         } else {
@@ -532,6 +577,11 @@ impl DesktopApplication {
         };
         match CollaborationClient::start(self.editor.client_id(), journal, intent) {
             Ok(collaboration) => {
+                if creating_room && let Err(error) = self.editor.reseed_for_new_room() {
+                    drop(collaboration);
+                    self.report_collaboration_error(error.to_string());
+                    return;
+                }
                 self.collaboration = Some(collaboration);
                 self.collaboration_created_room = creating_room;
                 self.collaboration_error = None;
@@ -1036,6 +1086,7 @@ fn should_request_redraw(
     drop_event: bool,
 ) -> bool {
     (egui_repaint && !matches!(event, WindowEvent::RedrawRequested))
+        || matches!(event, WindowEvent::CursorMoved { .. })
         || matches!(
             event,
             WindowEvent::MouseInput { .. } | WindowEvent::Touch { .. }
@@ -1047,7 +1098,10 @@ fn should_request_redraw(
 #[cfg(test)]
 mod tests {
     use super::{lucide_icons, normalized_display_name, should_request_redraw};
-    use winit::event::WindowEvent;
+    use winit::{
+        dpi::PhysicalPosition,
+        event::{DeviceId, WindowEvent},
+    };
 
     #[test]
     fn redraw_requested_does_not_schedule_another_redraw() {
@@ -1068,6 +1122,19 @@ mod tests {
             false,
             false,
             true,
+        ));
+    }
+
+    #[test]
+    fn cursor_motion_requests_a_preview_redraw() {
+        assert!(should_request_redraw(
+            &WindowEvent::CursorMoved {
+                device_id: DeviceId::dummy(),
+                position: PhysicalPosition::new(100.0, 100.0),
+            },
+            false,
+            false,
+            false,
         ));
     }
 

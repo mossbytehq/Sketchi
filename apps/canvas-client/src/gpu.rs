@@ -39,6 +39,11 @@ pub(crate) enum GpuSurfaceError {
     Other,
 }
 
+type TextureBatch = (
+    Vec<(egui::TextureId, egui::epaint::ImageDelta)>,
+    Vec<egui::TextureId>,
+);
+
 /// The wgpu presentation state owned by the native client shell.
 pub(crate) struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -47,6 +52,7 @@ pub(crate) struct GpuState {
     config: wgpu::SurfaceConfiguration,
     adapter_info: wgpu::AdapterInfo,
     egui_renderer: egui_wgpu::Renderer,
+    pending_texture_batches: Vec<TextureBatch>,
 }
 
 impl GpuState {
@@ -104,6 +110,7 @@ impl GpuState {
             config,
             adapter_info,
             egui_renderer,
+            pending_texture_batches: Vec::new(),
         })
     }
 
@@ -144,10 +151,20 @@ impl GpuState {
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
             | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
-            wgpu::CurrentSurfaceTexture::Timeout => return Err(GpuSurfaceError::Timeout),
-            wgpu::CurrentSurfaceTexture::Outdated => return Err(GpuSurfaceError::Outdated),
-            wgpu::CurrentSurfaceTexture::Lost => return Err(GpuSurfaceError::Lost),
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.remember_texture_delta(&full_output);
+                return Err(GpuSurfaceError::Timeout);
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.remember_texture_delta(&full_output);
+                return Err(GpuSurfaceError::Outdated);
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.remember_texture_delta(&full_output);
+                return Err(GpuSurfaceError::Lost);
+            }
             wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Validation => {
+                self.remember_texture_delta(&full_output);
                 return Err(GpuSurfaceError::Other);
             }
         };
@@ -180,6 +197,15 @@ impl GpuState {
                 font_texture_id,
                 &font_delta,
             );
+        }
+        for (texture_deltas, texture_frees) in std::mem::take(&mut self.pending_texture_batches) {
+            for (id, image_delta) in &texture_deltas {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, *id, image_delta);
+            }
+            for id in &texture_frees {
+                self.egui_renderer.free_texture(id);
+            }
         }
         for (id, image_delta) in &full_output.textures_delta.set {
             self.egui_renderer
@@ -224,6 +250,18 @@ impl GpuState {
         }
         output.present();
         Ok(())
+    }
+
+    fn remember_texture_delta(&mut self, output: &egui::FullOutput) {
+        let texture_deltas = output
+            .textures_delta
+            .set
+            .iter()
+            .map(|(id, delta)| (*id, delta.clone()))
+            .collect();
+        let texture_frees = output.textures_delta.free.clone();
+        self.pending_texture_batches
+            .push((texture_deltas, texture_frees));
     }
 }
 

@@ -17,7 +17,8 @@ use axum::{
 };
 use canvas_core::ClientId;
 use canvas_protocol::{
-    ClientMessage, ErrorCode, RoomId, ServerMessage, SessionId, decode_client, encode_server,
+    ClientMessage, ErrorCode, MAX_OPERATIONS_PER_MESSAGE, RoomId, ServerMessage, SessionId,
+    decode_client, encode_server,
 };
 use futures_util::{SinkExt, StreamExt};
 use hyper::{Request, body::Incoming};
@@ -1022,16 +1023,36 @@ async fn send_sync_frames_locked(
     participants: Vec<canvas_protocol::Participant>,
     version: canvas_core::VersionVector,
 ) {
-    let _ = sender
-        .send(ServerMessage::Snapshot { room_id, snapshot })
-        .await;
-    if !operations.is_empty() {
+    let snapshot_message = ServerMessage::Snapshot { room_id, snapshot };
+    if encode_server(&snapshot_message).is_err() {
         let _ = sender
-            .send(ServerMessage::Operations {
-                room_id,
-                operations,
+            .send(ServerMessage::Error {
+                request_id: None,
+                code: ErrorCode::Internal,
+                message: "room snapshot is too large to synchronize".to_owned(),
             })
             .await;
+        return;
+    }
+    let _ = sender.send(snapshot_message).await;
+    for chunk in operations.chunks(MAX_OPERATIONS_PER_MESSAGE) {
+        let message = ServerMessage::Operations {
+            room_id,
+            operations: chunk.to_vec(),
+        };
+        if encode_server(&message).is_err() {
+            let _ = sender
+                .send(ServerMessage::Error {
+                    request_id: None,
+                    code: ErrorCode::Internal,
+                    message: "room operations are too large to synchronize".to_owned(),
+                })
+                .await;
+            return;
+        }
+        if sender.send(message).await.is_err() {
+            return;
+        }
     }
     for state in presence {
         let _ = sender

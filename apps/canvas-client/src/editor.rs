@@ -263,6 +263,27 @@ impl Editor {
         &self.pending
     }
 
+    /// Re-emits the current canvas as create operations for a newly created room.
+    /// This keeps an existing local canvas when the server starts the room empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError`] if a current element cannot be represented as a
+    /// valid create operation.
+    pub fn reseed_for_new_room(&mut self) -> Result<usize, EditorError> {
+        let original = self.clone();
+        let elements = self.document().elements().cloned().collect::<Vec<_>>();
+        let mut count = 0;
+        for element in elements {
+            if let Err(error) = self.apply_command(EditorCommand::Create(element)) {
+                *self = original;
+                return Err(error);
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Removes and returns all queued local operations for transport.
     pub fn take_pending(&mut self) -> Vec<Operation> {
         std::mem::take(&mut self.pending)

@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::{
     Connector, WebSocketStream, connect_async_tls_with_config, tungstenite::Message,
 };
@@ -36,6 +36,7 @@ use crate::supervisor::{ReadyMessage, ReconnectBackoff, ReconnectState};
 
 /// Bounded channel capacity for UI/network handoff.
 pub const CHANNEL_CAPACITY: usize = 128;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Connection-level errors visible to the editor loop.
 #[derive(Debug, Error)]
@@ -188,14 +189,25 @@ pub async fn run_reconnecting(
     loop {
         let connector = config.connector()?;
         let connection = tokio::select! {
-            result = connect_async_tls_with_config(config.endpoint(), None, true, connector) => result,
+            result = timeout(CONNECT_TIMEOUT, connect_async_tls_with_config(config.endpoint(), None, true, connector)) => result,
             result = shutdown.changed() => {
                 let _ = result;
                 return Ok(());
             }
         };
         match connection {
-            Ok((socket, _)) => {
+            Err(_) => {
+                last_error = ConnectionError::Transport(tokio_tungstenite::tungstenite::Error::Io(
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "WebSocket connection timed out",
+                    ),
+                ));
+            }
+            Ok(Err(error)) => {
+                last_error = ConnectionError::Transport(error);
+            }
+            Ok(Ok((socket, _))) => {
                 let generation = connection_generation
                     .fetch_add(1, Ordering::AcqRel)
                     .wrapping_add(1);
@@ -225,9 +237,6 @@ pub async fn run_reconnecting(
                         return Err(error);
                     }
                 }
-            }
-            Err(error) => {
-                last_error = ConnectionError::Transport(error);
             }
         }
         match backoff.on_disconnect() {
@@ -287,23 +296,27 @@ where
                 match message? {
                     Message::Text(text) => {
                         let message = decode_server(text.as_bytes())?;
-                        inbound
-                            .send(ReceivedServerMessage {
-                                generation,
-                                message,
-                            })
-                            .await
-                            .map_err(|_| ConnectionError::InboundClosed)?;
+                        tokio::select! {
+                            result = inbound.send(ReceivedServerMessage { generation, message }) => {
+                                result.map_err(|_| ConnectionError::InboundClosed)?;
+                            }
+                            result = shutdown.changed() => {
+                                let _ = result;
+                                return Ok(());
+                            }
+                        }
                     }
                     Message::Binary(bytes) => {
                         let message = decode_server(&bytes)?;
-                        inbound
-                            .send(ReceivedServerMessage {
-                                generation,
-                                message,
-                            })
-                            .await
-                            .map_err(|_| ConnectionError::InboundClosed)?;
+                        tokio::select! {
+                            result = inbound.send(ReceivedServerMessage { generation, message }) => {
+                                result.map_err(|_| ConnectionError::InboundClosed)?;
+                            }
+                            result = shutdown.changed() => {
+                                let _ = result;
+                                return Ok(());
+                            }
+                        }
                     }
                     Message::Close(_) => return Err(ConnectionError::Disconnected),
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
@@ -832,6 +845,8 @@ impl CollaborationClient {
     ///
     /// Returns [`ConnectionError::Storage`] when the journal cannot be read or
     /// [`ConnectionError::QueueFull`] when the bounded transport queue is full.
+    /// Returns [`ConnectionError::Protocol`] when one operation cannot fit in a
+    /// bounded protocol frame.
     pub fn queue_pending(&mut self) -> Result<(), ConnectionError> {
         let Some(room_id) = self.room_id else {
             return Ok(());
@@ -844,8 +859,39 @@ impl CollaborationClient {
             .into_iter()
             .filter(|operation| !self.sent_operations.contains(&operation.id))
             .collect::<Vec<_>>();
-        for operations in unsent.chunks(MAX_OPERATIONS_PER_MESSAGE) {
+        let mut index = 0;
+        while index < unsent.len() {
             let request_id = self.next_request_id();
+            let mut lower = index + 1;
+            let mut upper = (index + MAX_OPERATIONS_PER_MESSAGE).min(unsent.len());
+            let mut end = None;
+            while lower <= upper {
+                let candidate_end = lower + (upper - lower) / 2;
+                let Some(candidate_operations) = unsent.get(index..candidate_end) else {
+                    return Err(ConnectionError::Closed);
+                };
+                let candidate = ClientMessage::SubmitOperations {
+                    room_id,
+                    request_id,
+                    operations: candidate_operations.to_vec(),
+                };
+                match encode_client(&candidate) {
+                    Ok(_) => {
+                        end = Some(candidate_end);
+                        lower = candidate_end + 1;
+                    }
+                    Err(ProtocolError::FrameTooLarge) => {
+                        upper = candidate_end.saturating_sub(1);
+                    }
+                    Err(error) => return Err(ConnectionError::Protocol(error)),
+                }
+            }
+            let Some(end) = end else {
+                return Err(ConnectionError::Protocol(ProtocolError::FrameTooLarge));
+            };
+            let Some(operations) = unsent.get(index..end) else {
+                return Err(ConnectionError::Closed);
+            };
             let message = ClientMessage::SubmitOperations {
                 room_id,
                 request_id,
@@ -854,6 +900,7 @@ impl CollaborationClient {
             self.send(message)?;
             self.sent_operations
                 .extend(operations.iter().map(|operation| operation.id));
+            index = end;
         }
         Ok(())
     }

@@ -389,20 +389,40 @@ fn auto_update_asset(release: &GitHubRelease, asset_kind: LinuxAssetKind) -> Opt
 #[cfg(not(target_os = "linux"))]
 fn auto_update_asset(release: &GitHubRelease) -> Option<&GitHubAsset> {
     #[cfg(target_os = "windows")]
-    let suffix = if release.prerelease {
-        "-windows-x86_64.zip"
+    let suffixes = if windows_install_directory_is_writable() {
+        ["-windows-x86_64.zip", "-windows-x86_64-setup.exe"]
     } else {
-        "-windows-x86_64-setup.exe"
+        ["-windows-x86_64-setup.exe", "-windows-x86_64.zip"]
     };
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    let suffix = "";
+    let suffixes = [""];
 
-    release.assets.iter().find(|asset| {
-        asset.name.ends_with(suffix)
-            && asset
-                .browser_download_url
-                .starts_with(RELEASE_DOWNLOAD_PREFIX)
+    suffixes.iter().find_map(|suffix| {
+        release.assets.iter().find(|asset| {
+            asset.name.ends_with(suffix)
+                && asset
+                    .browser_download_url
+                    .starts_with(RELEASE_DOWNLOAD_PREFIX)
+        })
     })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_install_directory_is_writable() -> bool {
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(directory) = executable.parent() else {
+        return false;
+    };
+    let probe = directory.join(format!(".Sketchi-update-selection-{}", std::process::id()));
+    let writable = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .is_ok();
+    let _ = fs::remove_file(probe);
+    writable
 }
 
 fn release_asset(asset: &GitHubAsset) -> Option<ReleaseAsset> {

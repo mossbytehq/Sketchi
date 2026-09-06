@@ -19,6 +19,7 @@ use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Key, Layout, Margin, Mesh, Modifiers,
     Painter, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
 };
+use image::GenericImageView;
 
 #[path = "settings_ui.rs"]
 mod settings_ui;
@@ -283,6 +284,7 @@ const COLOR_PICKER_BASE_SHADE_INDEX: usize = 2;
 /// Immediate-mode UI state for the desktop whiteboard workspace.
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct WorkspaceUi {
+    client_id: ClientId,
     active_tool: Tool,
     dark_mode: bool,
     system_dark_mode: Option<bool>,
@@ -1040,6 +1042,7 @@ impl Default for WorkspaceUi {
     #[allow(clippy::too_many_lines)]
     fn default() -> Self {
         Self {
+            client_id: ClientId::new(),
             active_tool: Tool::Select,
             dark_mode: false,
             system_dark_mode: None,
@@ -1153,6 +1156,7 @@ impl WorkspaceUi {
         }
         settings::Settings {
             version: 6,
+            client_id: self.client_id,
             appearance: match self.appearance {
                 AppearanceMode::System => settings::Appearance::System,
                 AppearanceMode::Light => settings::Appearance::Light,
@@ -1183,6 +1187,7 @@ impl WorkspaceUi {
 
     /// Applies persisted preferences with bounds and malformed-shortcut recovery.
     pub(crate) fn apply_settings(&mut self, persisted: &settings::Settings) {
+        self.client_id = persisted.client_id;
         self.update_channel = persisted.update_channel;
         self.update_cache = persisted.update_cache.clone();
         self.update_error = None;
@@ -9401,6 +9406,22 @@ fn paint_image(
     if needs_upload {
         image_textures.remove(&element.id);
         let (width, height, rgba) = if let Some(decoded) = decoded_images.remove(&element.id) {
+            let expected = u64::from(decoded.width)
+                .checked_mul(u64::from(decoded.height))
+                .and_then(|pixels| pixels.checked_mul(4))
+                .and_then(|bytes| usize::try_from(bytes).ok());
+            if expected != Some(decoded.rgba.len()) {
+                paint_image_placeholder(
+                    painter,
+                    rect,
+                    stroke,
+                    corner_radius,
+                    rotation,
+                    element.style.sloppiness,
+                    element.id.as_uuid().as_u128(),
+                );
+                return;
+            }
             (decoded.width, decoded.height, decoded.rgba)
         } else {
             let Ok(decoded) = image::load_from_memory(&image.bytes) else {
@@ -9415,8 +9436,9 @@ fn paint_image(
                 );
                 return;
             };
+            let (width, height) = decoded.dimensions();
             let rgba = decoded.to_rgba8().into_raw();
-            (image.width, image.height, rgba)
+            (width, height, rgba)
         };
         let width = usize::try_from(width).unwrap_or(usize::MAX);
         let height = usize::try_from(height).unwrap_or(usize::MAX);
