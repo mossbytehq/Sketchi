@@ -152,7 +152,7 @@ impl DesktopShell {
                 .as_deref()
                 .map(std::path::Path::new)
                 .filter(|path| path.is_file())
-                .map(|path| storage::load_document_from_path(path))
+                .map(storage::load_document_from_path)
                 .transpose();
             let document = match last_document {
                 Ok(Some(document)) => Some(document),

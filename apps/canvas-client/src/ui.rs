@@ -1273,32 +1273,7 @@ impl WorkspaceUi {
         self.new_object_style = saved_style.unwrap_or_default();
         self.draft_style = self.new_object_style;
 
-        let mut keybinds = Keybinds::default();
-        for action in KeybindAction::ALL {
-            let Some(saved) = persisted.keybinds.get(action.label()) else {
-                continue;
-            };
-            let Some(key) = Key::from_name(&saved.key) else {
-                continue;
-            };
-            let binding = KeyBinding {
-                key,
-                modifiers: Modifiers {
-                    alt: saved.alt,
-                    ctrl: saved.ctrl,
-                    shift: saved.shift,
-                    mac_cmd: saved.mac_cmd,
-                    command: saved.command,
-                },
-            };
-            let conflicts = KeybindAction::ALL
-                .into_iter()
-                .any(|other| other != action && keybinds.binding(other) == binding);
-            if !conflicts {
-                keybinds.set_binding(action, binding);
-            }
-        }
-        self.keybinds = keybinds;
+        self.keybinds = keybinds_from_settings(persisted);
         self.dark_mode = match self.appearance {
             AppearanceMode::System => self.system_dark_mode.unwrap_or(false),
             AppearanceMode::Light => false,
@@ -6894,6 +6869,35 @@ impl WorkspaceUi {
             .response
             .rect
     }
+}
+
+fn keybinds_from_settings(persisted: &settings::Settings) -> Keybinds {
+    let mut keybinds = Keybinds::default();
+    for action in KeybindAction::ALL {
+        let Some(saved) = persisted.keybinds.get(action.label()) else {
+            continue;
+        };
+        let Some(key) = Key::from_name(&saved.key) else {
+            continue;
+        };
+        let binding = KeyBinding {
+            key,
+            modifiers: Modifiers {
+                alt: saved.alt,
+                ctrl: saved.ctrl,
+                shift: saved.shift,
+                mac_cmd: saved.mac_cmd,
+                command: saved.command,
+            },
+        };
+        let conflicts = KeybindAction::ALL
+            .into_iter()
+            .any(|other| other != action && keybinds.binding(other) == binding);
+        if !conflicts {
+            keybinds.set_binding(action, binding);
+        }
+    }
+    keybinds
 }
 
 fn help_panel_frame(dark_mode: bool) -> egui::Frame {

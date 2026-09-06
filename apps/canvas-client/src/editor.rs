@@ -98,6 +98,10 @@ impl Editor {
     /// Creates an editor for a restored document with a fresh operation
     /// identity. This prevents materialized files from replaying sequence
     /// numbers that may already exist in a collaboration room.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError::Core`] if a restored element fails core validation.
     pub fn from_document_with_fresh_identity(document: &Document) -> Result<Self, EditorError> {
         Self::from_document(canvas_core::ClientId::new(), document)
     }
