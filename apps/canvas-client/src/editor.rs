@@ -98,9 +98,7 @@ impl Editor {
     /// Creates an editor for a restored document with a fresh operation
     /// identity. This prevents materialized files from replaying sequence
     /// numbers that may already exist in a collaboration room.
-    pub fn from_document_with_fresh_identity(
-        document: &Document,
-    ) -> Result<Self, EditorError> {
+    pub fn from_document_with_fresh_identity(document: &Document) -> Result<Self, EditorError> {
         Self::from_document(canvas_core::ClientId::new(), document)
     }
 
@@ -237,9 +235,7 @@ impl Editor {
     pub fn undo(&mut self) -> Result<OperationId, EditorError> {
         let entry = self.undo.pop().ok_or(EditorError::NothingToUndo)?;
         let (inverse, redo_entry) = match entry.inverse.clone() {
-            EditorCommand::Create(mut element)
-                if self.crdt.is_tombstoned(element.id) =>
-            {
+            EditorCommand::Create(mut element) if self.crdt.is_tombstoned(element.id) => {
                 // Deleted IDs are permanent CRDT tombstones. Recreate the
                 // object under a fresh identity and carry that identity into
                 // redo so the compensating edit remains effective.

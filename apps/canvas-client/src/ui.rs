@@ -9,8 +9,8 @@ use std::{
 
 use canvas_core::{
     ClientId, Color, Document, EdgeStyle, EditorCommand, Element, ElementId, ElementKind,
-    EmbeddedImage, FillStyle, Point, Size, Sloppiness, StrokeStyle, Style, StylePatch, TextAlign,
-    TextFontFamily, Transform, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS,
+    EmbeddedImage, FillStyle, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS, Point, Size,
+    Sloppiness, StrokeStyle, Style, StylePatch, TextAlign, TextFontFamily, Transform,
 };
 use canvas_protocol::{PresenceState, ToolKind};
 use canvas_renderer::{Camera, RenderPrimitive, Renderer, Scene};

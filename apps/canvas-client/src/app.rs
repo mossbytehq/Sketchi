@@ -157,7 +157,9 @@ impl DesktopShell {
             let document = match last_document {
                 Ok(Some(document)) => Some(document),
                 Ok(None) => storage::load_document(&settings_state.autosave_directory)
-                    .inspect_err(|error| tracing::warn!(error = %error, "Sketchi could not read autosave"))
+                    .inspect_err(
+                        |error| tracing::warn!(error = %error, "Sketchi could not read autosave"),
+                    )
                     .ok()
                     .flatten(),
                 Err(error) => {
