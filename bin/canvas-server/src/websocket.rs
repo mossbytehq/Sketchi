@@ -1035,12 +1035,31 @@ async fn send_sync_frames_locked(
         return;
     }
     let _ = sender.send(snapshot_message).await;
-    for chunk in operations.chunks(MAX_OPERATIONS_PER_MESSAGE) {
-        let message = ServerMessage::Operations {
-            room_id,
-            operations: chunk.to_vec(),
-        };
-        if encode_server(&message).is_err() {
+    let mut index = 0;
+    while index < operations.len() {
+        let mut lower = index + 1;
+        let mut upper = (index + MAX_OPERATIONS_PER_MESSAGE).min(operations.len());
+        let mut fitting_end = None;
+        // Finding the largest fitting prefix keeps synchronization bounded
+        // without repeatedly serializing every smaller suffix of a large
+        // image-heavy batch.
+        while lower <= upper {
+            let end = lower + (upper - lower) / 2;
+            let Some(candidate) = operations.get(index..end) else {
+                break;
+            };
+            let message = ServerMessage::Operations {
+                room_id,
+                operations: candidate.to_vec(),
+            };
+            if encode_server(&message).is_ok() {
+                fitting_end = Some(end);
+                lower = end.saturating_add(1);
+            } else {
+                upper = end.saturating_sub(1);
+            }
+        }
+        let Some(end) = fitting_end else {
             let _ = sender
                 .send(ServerMessage::Error {
                     request_id: None,
@@ -1049,10 +1068,18 @@ async fn send_sync_frames_locked(
                 })
                 .await;
             return;
-        }
+        };
+        let Some(chunk) = operations.get(index..end) else {
+            return;
+        };
+        let message = ServerMessage::Operations {
+            room_id,
+            operations: chunk.to_vec(),
+        };
         if sender.send(message).await.is_err() {
             return;
         }
+        index = end;
     }
     for state in presence {
         let _ = sender
@@ -1118,8 +1145,8 @@ mod tests {
 
     use super::*;
     use canvas_core::{
-        Element, ElementId, LamportTimestamp, Operation, OperationId, OperationKind, Point, Size,
-        Transform, VersionVector,
+        CrdtDocument, Element, ElementId, EmbeddedImage, LamportTimestamp, Operation, OperationId,
+        OperationKind, Point, Size, Transform, VersionVector,
     };
     use canvas_protocol::{PresenceState, ToolKind};
     use std::net::{IpAddr, Ipv4Addr};
@@ -1163,6 +1190,70 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn image_heavy_sync_splits_operation_batches_to_frame_limit() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let image_bytes = vec![0; 3_500_000];
+        let operations = (0..10)
+            .map(|index| {
+                Operation::new(
+                    OperationId::new(ClientId::from_u128(100), index + 1),
+                    LamportTimestamp::new(index + 1),
+                    VersionVector::default(),
+                    OperationKind::Create {
+                        element: Element::image(
+                            ElementId::from_u128(u128::from(index) + 1),
+                            Transform::new(Point::default(), Size::new(20.0, 20.0)),
+                            EmbeddedImage::new("image/png", 1, 1, image_bytes.clone()),
+                        ),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        send_sync_frames_locked(
+            &sender,
+            RoomId::from_u128(7),
+            CrdtDocument::new().snapshot(),
+            operations,
+            Vec::new(),
+            Vec::new(),
+            VersionVector::default(),
+        )
+        .await;
+
+        assert!(matches!(
+            next_message(&mut receiver).await,
+            ServerMessage::Snapshot { .. }
+        ));
+        drop(sender);
+        let mut operation_frames = 0;
+        let mut saw_sync_complete = false;
+        let mut unexpected = None;
+        while let Some(message) = receiver.recv().await {
+            match message {
+                ServerMessage::Operations { operations, .. } => {
+                    operation_frames += 1;
+                    let encoded = encode_server(&ServerMessage::Operations {
+                        room_id: RoomId::from_u128(7),
+                        operations,
+                    })
+                    .expect("operation frame should encode");
+                    assert!(encoded.len() <= canvas_protocol::MAX_FRAME_BYTES);
+                }
+                ServerMessage::SyncComplete { .. } => saw_sync_complete = true,
+                ServerMessage::Participants { .. } => {}
+                message => unexpected = Some(message),
+            }
+        }
+        assert!(operation_frames > 1);
+        assert!(saw_sync_complete);
+        assert!(
+            unexpected.is_none(),
+            "unexpected sync message: {unexpected:?}"
+        );
     }
 
     #[tokio::test]

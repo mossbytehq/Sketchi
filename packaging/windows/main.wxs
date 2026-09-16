@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Wix
     xmlns="http://wixtoolset.org/schemas/v4/wxs"
+    xmlns:firewall="http://wixtoolset.org/schemas/v4/wxs/firewall"
     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Fragment>
     <Icon Id="SketchiIcon" SourceFile="$(var.IconFile)" />
@@ -33,6 +34,12 @@
         <File Source="$(var.ClientBinary)" Name="Sketchi.exe" />
         <File Source="$(var.ServerBinary)" Name="Sketchi-server.exe" />
         <File Source="$(var.LicenseFile)" Name="LICENSE.md" />
+        <firewall:FirewallException
+            Id="SketchiServerFirewall"
+            Name="Sketchi collaboration server"
+            Program="[INSTALLFOLDER]Sketchi-server.exe"
+            Protocol="tcp"
+            Scope="any" />
       </Component>
       <Component Directory="ApplicationProgramsFolder">
         <Shortcut

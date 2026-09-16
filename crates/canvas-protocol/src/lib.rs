@@ -16,10 +16,8 @@ pub use message::{
 pub const PROTOCOL_VERSION: u16 = 3;
 /// Maximum encoded JSON frame accepted by either endpoint.
 ///
-/// This accommodates a maximum-size embedded image in both a durable
-/// operation and the current snapshot representation, which retains the
-/// operation log for id-reuse detection, while keeping every network message
-/// bounded.
+/// Operation batches are split before encoding so a maximum-size embedded
+/// image and snapshot remain within the established wire budget.
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum durable operations in one protocol message.
 pub const MAX_OPERATIONS_PER_MESSAGE: usize = 256;

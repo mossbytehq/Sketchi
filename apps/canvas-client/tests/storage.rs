@@ -217,9 +217,27 @@ fn durable_journal_creates_and_reopens_below_configured_directory() {
     std::fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn journal_retains_current_client_operations_and_drops_stale_identities() {
+    let journal = Journal::open_in_memory().unwrap();
+    let current = operation_with_client(ClientId::from_u128(1), 1);
+    let stale = operation_with_client(ClientId::from_u128(2), 1);
+    journal.append_all(&[current.clone(), stale]).unwrap();
+
+    journal
+        .retain_client_operations(ClientId::from_u128(1))
+        .unwrap();
+
+    assert_eq!(journal.load().unwrap(), vec![current]);
+}
+
 fn operation_with_sequence(sequence: u64) -> Operation {
+    operation_with_client(ClientId::from_u128(1), sequence)
+}
+
+fn operation_with_client(client_id: ClientId, sequence: u64) -> Operation {
     Operation::new(
-        OperationId::new(ClientId::from_u128(1), sequence),
+        OperationId::new(client_id, sequence),
         LamportTimestamp::new(sequence),
         VersionVector::default(),
         OperationKind::Create {

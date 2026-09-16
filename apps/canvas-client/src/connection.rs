@@ -486,7 +486,7 @@ pub fn bounded_channels() -> (ConnectionChannels, NetworkEndpoints) {
 pub enum CollaborationIntent {
     /// Create a new room and automatically join it.
     Create {
-        /// Readiness data for the local server hosting the room.
+        /// Readiness data for the server hosting the room.
         readiness: ReadyMessage,
         /// Display name shown to other participants.
         display_name: String,

@@ -216,10 +216,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
+          & $wix extension add -g "WixToolset.Firewall.wixext/$env:WIX_VERSION"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
           $installer = Join-Path $env:GITHUB_WORKSPACE "dist\staging\Sketchi-$env:SKETCHI_VERSION-windows-x86_64-setup.msi"
           & $wix build "$env:GITHUB_WORKSPACE\packaging\windows\main.wxs" `
             -arch x64 `
             -ext WixToolset.UI.wixext `
+            -ext WixToolset.Firewall.wixext `
             -d "Version=$env:SKETCHI_VERSION" `
             -d "ClientBinary=$($stage.FullName)\Sketchi.exe" `
             -d "ServerBinary=$($stage.FullName)\Sketchi-server.exe" `

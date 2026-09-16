@@ -336,6 +336,27 @@ impl Journal {
         Ok(())
     }
 
+    /// Removes durable operations belonging to other client identities.
+    ///
+    /// This keeps unsent work that can be replayed by the current editor after
+    /// a process restart while preventing a restored document's fresh client
+    /// identity from replaying rows from an earlier process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when `SQLite` cannot delete the rows.
+    pub fn retain_client_operations(
+        &self,
+        client_id: canvas_core::ClientId,
+    ) -> Result<(), StorageError> {
+        let prefix = format!("{client_id}:%");
+        self.connection.execute(
+            "DELETE FROM pending_operations WHERE operation_id NOT LIKE ?1",
+            params![prefix],
+        )?;
+        Ok(())
+    }
+
     /// Removes acknowledged operation IDs.
     ///
     /// # Errors

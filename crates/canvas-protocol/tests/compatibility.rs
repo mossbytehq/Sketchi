@@ -23,7 +23,7 @@ fn unsupported_versions_and_unknown_messages_are_rejected() {
 }
 
 #[test]
-fn schema_changes_require_protocol_version_three() {
+fn current_messages_keep_protocol_version_three() {
     let encoded = encode_client(&ClientMessage::Ping { nonce: 1 }).unwrap();
     assert!(
         String::from_utf8(encoded)

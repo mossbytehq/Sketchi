@@ -2,6 +2,11 @@
 # Reduces persistent incremental artifacts; rebuilds may be slower.
 incremental = false
 
+[target.x86_64-pc-windows-msvc]
+# Keep the Windows packages self-contained; the Rust MSVC standard library
+# otherwise imports VCRUNTIME140.dll, which is not present on clean systems.
+rustflags = ["-C", "target-feature=+crt-static"]
+
 [alias]
 xtask = "run --package xtask --"
 clean-cache = "clean"

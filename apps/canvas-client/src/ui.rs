@@ -31,7 +31,7 @@ use crate::{
         color_picker_trigger, color_swatch, dropdown_field_sized, numeric_field,
         numeric_field_with_decimals, range_slider, sized_text_field, themed_checkbox,
     },
-    connection::{CollaborationView, format_room_invite},
+    connection::{CollaborationView, format_room_invite, parse_room_invite},
     editor::Editor,
     images::{embedded_image_from_rgba, embedded_image_with_rgba},
     lucide_icons::{self, LucideIcon as Icon},
@@ -411,10 +411,14 @@ enum CollaborationPopup {
 pub(crate) enum CollaborationAction {
     /// No collaboration action was selected this frame.
     None,
-    /// Create a room on the local supervised server.
+    /// Create a room on the local or configured remote server.
     Create {
         /// Display name advertised to collaborators.
         display_name: String,
+        /// Optional remote server endpoint.
+        endpoint: String,
+        /// Certificate pin for an optional remote server endpoint.
+        certificate_sha256: String,
     },
     /// Cancel the currently hosted collaboration room.
     CancelRoom,
@@ -3292,8 +3296,10 @@ impl WorkspaceUi {
         if !self.save_document_before_replacing(editor) {
             return;
         }
-        let client_id = editor.client_id();
-        *editor = Editor::new(client_id);
+        // A new whiteboard is a new collaboration document. Use a fresh
+        // identity so the application tears down any existing room session
+        // before the new document starts emitting sequence number 1.
+        *editor = Editor::new(ClientId::new());
         self.selected.clear();
         self.selection_gesture = None;
         self.document_path = None;
@@ -3703,6 +3709,9 @@ impl WorkspaceUi {
         };
         let has_custom_endpoint = !self.collaboration_endpoint.trim().is_empty()
             || !self.collaboration_certificate_sha256.trim().is_empty();
+        let has_invite_endpoint = parse_room_invite(&self.collaboration_invite)
+            .ok()
+            .is_some_and(|invite| invite.endpoint.is_some() && invite.certificate_sha256.is_some());
         let room_active =
             popup == CollaborationPopup::Create && room_id.is_some() && creator_token.is_some();
         let joined_room = popup == CollaborationPopup::Join
@@ -3781,6 +3790,24 @@ impl WorkspaceUi {
                                 });
                                 if !display_name_valid && room_id.is_none() {
                                     collaboration_required_name_message(ui, self.dark_mode);
+                                }
+                                if !room_active {
+                                    egui::CollapsingHeader::new("Advanced")
+                                        .default_open(false)
+                                        .show(ui, |ui| {
+                                            collaboration_text_field(
+                                                ui,
+                                                &mut self.collaboration_endpoint,
+                                                "wss:// endpoint (optional)",
+                                                self.dark_mode,
+                                            );
+                                            collaboration_text_field(
+                                                ui,
+                                                &mut self.collaboration_certificate_sha256,
+                                                "Certificate SHA-256 pin (optional)",
+                                                self.dark_mode,
+                                            );
+                                        });
                                 }
                                 if let (Some(room_id), Some(token)) = (&room_id, &capability_token)
                                 {
@@ -3900,7 +3927,8 @@ impl WorkspaceUi {
                                     }
                                 } else if ui
                                     .add_enabled_ui(
-                                        collaboration.server_available && display_name_valid,
+                                        (collaboration.server_available || has_custom_endpoint)
+                                            && display_name_valid,
                                         |ui| collaboration_primary_button(ui, "Create room"),
                                     )
                                     .inner
@@ -3909,6 +3937,11 @@ impl WorkspaceUi {
                                     action = CollaborationAction::Create {
                                         display_name: self
                                             .collaboration_display_name
+                                            .trim()
+                                            .to_owned(),
+                                        endpoint: self.collaboration_endpoint.trim().to_owned(),
+                                        certificate_sha256: self
+                                            .collaboration_certificate_sha256
                                             .trim()
                                             .to_owned(),
                                     };
@@ -3964,7 +3997,9 @@ impl WorkspaceUi {
                                         });
                                     if ui
                                         .add_enabled_ui(
-                                            (collaboration.server_available || has_custom_endpoint)
+                                            (collaboration.server_available
+                                                || has_custom_endpoint
+                                                || has_invite_endpoint)
                                                 && display_name_valid,
                                             |ui| collaboration_primary_button(ui, "Join room"),
                                         )
@@ -11351,6 +11386,7 @@ mod tests {
         let directory_string = directory.to_string_lossy().into_owned();
         let element_id = ElementId::from_u128(95);
         let mut editor = Editor::new(ClientId::new());
+        let previous_client_id = editor.client_id();
         assert!(
             editor
                 .execute(EditorCommand::Create(Element::rectangle(
@@ -11371,6 +11407,7 @@ mod tests {
             Some(1)
         );
         assert_eq!(editor.document().len(), 0);
+        assert_ne!(editor.client_id(), previous_client_id);
         let _ = std::fs::remove_dir_all(directory);
     }
 

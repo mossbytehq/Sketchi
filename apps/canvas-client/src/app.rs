@@ -606,6 +606,18 @@ impl DesktopApplication {
                 return;
             }
         };
+        // A new room starts with a clean history. A join may still need
+        // durable edits from this client (for example after a reconnect), so
+        // retain those and discard only rows left by an older client identity.
+        let journal_result = if creating_room {
+            journal.clear()
+        } else {
+            journal.retain_client_operations(self.editor.client_id())
+        };
+        if let Err(error) = journal_result {
+            self.report_collaboration_error(format!("Could not reset sync journal: {error}"));
+            return;
+        }
         match CollaborationClient::start(self.editor.client_id(), journal, intent) {
             Ok(collaboration) => {
                 if creating_room && let Err(error) = self.editor.reseed_for_new_room() {
@@ -620,6 +632,30 @@ impl DesktopApplication {
             Err(error) => {
                 self.collaboration_created_room = false;
                 self.report_collaboration_error(error.to_string());
+            }
+        }
+    }
+
+    fn create_collaboration_readiness(
+        &mut self,
+        local_readiness: Option<ReadyMessage>,
+        endpoint: &str,
+        certificate_sha256: &str,
+    ) -> Option<ReadyMessage> {
+        if endpoint.trim().is_empty() && certificate_sha256.trim().is_empty() {
+            let Some(readiness) = local_readiness else {
+                self.report_collaboration_error(
+                    "The local collaboration server is unavailable; enter a remote endpoint and certificate pin.",
+                );
+                return None;
+            };
+            return Some(readiness);
+        }
+        match resolve_invite_readiness(None, endpoint, certificate_sha256) {
+            Ok(readiness) => Some(readiness),
+            Err(error) => {
+                self.report_collaboration_error(error.to_string());
+                None
             }
         }
     }
@@ -659,17 +695,20 @@ impl DesktopApplication {
                 }
                 None
             }
-            CollaborationAction::Create { display_name } => {
+            CollaborationAction::Create {
+                display_name,
+                endpoint,
+                certificate_sha256,
+            } => {
                 let Some(display_name) = normalized_display_name(&display_name) else {
                     self.report_collaboration_error("A display name is required to create a room.");
                     return None;
                 };
-                let Some(readiness) = local_readiness else {
-                    self.report_collaboration_error(
-                        "The local collaboration server is unavailable.",
-                    );
-                    return None;
-                };
+                let readiness = self.create_collaboration_readiness(
+                    local_readiness,
+                    &endpoint,
+                    &certificate_sha256,
+                )?;
                 Some(CollaborationIntent::Create {
                     readiness,
                     display_name,
