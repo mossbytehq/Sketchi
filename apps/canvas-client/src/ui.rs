@@ -293,6 +293,9 @@ pub(crate) struct WorkspaceUi {
     settings_page: SettingsPage,
     new_document_confirmation: bool,
     open_document_confirmation: bool,
+    /// A join held back until the user agrees that their current canvas
+    /// will be merged into the room and visible to everyone in it.
+    pending_join_share: Option<CollaborationAction>,
     pending_open_document: Option<(PathBuf, Editor)>,
     pending_file_dialog: Option<FileDialogRequest>,
     document_path: Option<PathBuf>,
@@ -1055,6 +1058,7 @@ impl Default for WorkspaceUi {
             settings_page: SettingsPage::General,
             new_document_confirmation: false,
             open_document_confirmation: false,
+            pending_join_share: None,
             pending_open_document: None,
             pending_file_dialog: None,
             document_path: None,
@@ -3114,7 +3118,10 @@ impl WorkspaceUi {
         editor: &mut Editor,
         tools: &mut ToolController,
     ) {
-        if self.new_document_confirmation || self.open_document_confirmation {
+        if self.new_document_confirmation
+            || self.open_document_confirmation
+            || self.pending_join_share.is_some()
+        {
             return;
         }
         if self.text_edit.is_some() {
@@ -3638,7 +3645,113 @@ impl WorkspaceUi {
         }
         self.show_new_document_confirmation(context, editor);
         self.show_open_document_confirmation(context, editor);
-        self.show_collaboration_controls(context, collaboration)
+        let action = self.show_collaboration_controls(context, collaboration);
+        let action = self.request_collaboration_action(action, editor.document().len());
+        match self.show_join_share_confirmation(context, editor.document().len()) {
+            CollaborationAction::None => action,
+            confirmed => confirmed,
+        }
+    }
+
+    /// Holds back a join that would merge a non-empty local canvas into the
+    /// room until the user confirms it; every other action passes through.
+    fn request_collaboration_action(
+        &mut self,
+        action: CollaborationAction,
+        local_object_count: usize,
+    ) -> CollaborationAction {
+        if matches!(action, CollaborationAction::Join { .. }) && local_object_count > 0 {
+            self.pending_join_share = Some(action);
+            return CollaborationAction::None;
+        }
+        action
+    }
+
+    /// Releases the held join when `share` is true, or drops it otherwise.
+    fn resolve_join_share(&mut self, share: bool) -> CollaborationAction {
+        match self.pending_join_share.take() {
+            Some(action) if share => action,
+            _ => CollaborationAction::None,
+        }
+    }
+
+    fn show_join_share_confirmation(
+        &mut self,
+        context: &egui::Context,
+        local_object_count: usize,
+    ) -> CollaborationAction {
+        if self.pending_join_share.is_none() {
+            return CollaborationAction::None;
+        }
+        if context.input(|input| input.key_pressed(Key::Escape)) {
+            return self.resolve_join_share(false);
+        }
+
+        let objects = if local_object_count == 1 {
+            String::from("1 object")
+        } else {
+            format!("{local_object_count} objects")
+        };
+        let mut decision = None;
+        egui::Area::new(Id::new("sketchi.join_share_confirmation"))
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .show(context, |ui| {
+                confirmation_frame(self.dark_mode).show(ui, |ui| {
+                    ui.set_width(360.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("Share your canvas with the room?")
+                                .size(18.0)
+                                .strong()
+                                .color(text_color(self.dark_mode)),
+                        );
+                    });
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Your current canvas ({objects}) will be added to the room \
+                             and everyone in it will be able to see and edit it."
+                        ))
+                        .color(muted_color(self.dark_mode)),
+                    );
+                    ui.add_space(16.0);
+                    let button_width = ((ui.available_width() - 10.0) / 2.0).max(1.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        if button(
+                            ui,
+                            "Cancel",
+                            Vec2::new(button_width, STANDARD_CONTROL_SIZE.y),
+                            if self.dark_mode {
+                                Color32::from_rgb(52, 54, 62)
+                            } else {
+                                Color32::from_rgb(245, 246, 249)
+                            },
+                        )
+                        .clicked()
+                        {
+                            decision = Some(false);
+                        }
+                        if button(
+                            ui,
+                            egui::RichText::new("Join and share").color(Color32::WHITE),
+                            Vec2::new(button_width, STANDARD_CONTROL_SIZE.y),
+                            ACCENT,
+                        )
+                        .clicked()
+                        {
+                            decision = Some(true);
+                        }
+                    });
+                });
+            });
+
+        decision.map_or(CollaborationAction::None, |share| {
+            self.resolve_join_share(share)
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4840,23 +4953,11 @@ impl WorkspaceUi {
                                     );
                                 });
                                 ui.add_space(12.0);
-                                let summary = if self.update_checking {
-                                    "Checking for updates…"
-                                } else if self.update_installing {
-                                    "Installing update…"
-                                } else if update_status.target.is_some() {
-                                    if update_status.channel == UpdateChannel::Edge {
-                                        "Edge update available"
-                                    } else {
-                                        "Update available"
-                                    }
-                                } else if update_status.ahead_of_stable {
-                                    "You are using a pre-release"
-                                } else if update_status.has_result {
-                                    "Up to date"
-                                } else {
-                                    "No update check yet"
-                                };
+                                let summary = update_summary(
+                                    &update_status,
+                                    self.update_checking,
+                                    self.update_installing,
+                                );
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 12.0;
                                     ui.vertical(|ui| {
@@ -7718,6 +7819,34 @@ fn collaboration_display_name_is_valid(name: &str) -> bool {
 
 fn collaboration_invite_field_width(available_width: f32) -> f32 {
     (available_width - COLLABORATION_CONTROL_GAP - COLLABORATION_COPY_BUTTON_WIDTH).max(0.0)
+}
+
+/// Chooses the one-line update summary shown in settings.
+fn update_summary(status: &update::UpdateStatus, checking: bool, installing: bool) -> &'static str {
+    if checking {
+        "Checking for updates…"
+    } else if installing {
+        "Installing update…"
+    } else if status.target.is_some() {
+        if status.channel == UpdateChannel::Edge {
+            "Edge update available"
+        } else {
+            "Update available"
+        }
+    } else if status.ahead_of_stable {
+        "You are using a pre-release"
+    } else if status.has_result
+        && status.channel == UpdateChannel::Stable
+        && status.latest_stable.is_none()
+    {
+        // Saying "Up to date" here would hide that Stable has nothing to
+        // offer yet, even when newer Edge releases exist.
+        "No stable release yet"
+    } else if status.has_result {
+        "Up to date"
+    } else {
+        "No update check yet"
+    }
 }
 
 fn collaboration_invite_preview(room_id: &str, capability_token: &str) -> String {
@@ -10640,10 +10769,10 @@ mod tests {
 
     use super::{
         ACCENT, COLLABORATION_CONTROL_GAP, COLLABORATION_COPY_BUTTON_WIDTH,
-        COMPACT_STROKE_PRESET_COUNT, CONTROL_CORNER_RADIUS, ColorPickerTarget, CustomFontSizeState,
-        DARK_BORDER, DARK_PALETTE, ElementAction, INTERMEDIATE_DARK_PALETTE, KeyBinding,
-        KeybindAction, Keybinds, LEGACY_DARK_PALETTE, LEGACY_STROKE_COLORS, LIGHT_BORDER,
-        LIGHT_CANVAS, LIGHT_MUTED, LayerAction, MOSSBYTE_AGENCY_BUTTON_WIDTH,
+        COMPACT_STROKE_PRESET_COUNT, CONTROL_CORNER_RADIUS, CollaborationAction, ColorPickerTarget,
+        CustomFontSizeState, DARK_BORDER, DARK_PALETTE, ElementAction, INTERMEDIATE_DARK_PALETTE,
+        KeyBinding, KeybindAction, Keybinds, LEGACY_DARK_PALETTE, LEGACY_STROKE_COLORS,
+        LIGHT_BORDER, LIGHT_CANVAS, LIGHT_MUTED, LayerAction, MOSSBYTE_AGENCY_BUTTON_WIDTH,
         MOSSBYTE_AGENCY_ROW_GAP, MOSSBYTE_AGENCY_URL, PREVIOUS_DARK_PALETTE,
         PREVIOUS_ORDERED_DARK_PALETTE, PREVIOUS_STROKE_COLORS, PreparedImage,
         SETTINGS_CARD_BORDER_DARK, SETTINGS_CARD_DARK, SETTINGS_CONTROL_DARK,
@@ -11429,6 +11558,101 @@ mod tests {
 
         assert!(workspace.new_document_confirmation);
         assert_eq!(editor.document().len(), 1);
+    }
+
+    #[test]
+    fn stable_channel_without_a_stable_release_does_not_claim_up_to_date() {
+        use crate::update::{UpdateCache, UpdateChannel, status};
+
+        // Only pre-releases exist, none newer than this build.
+        let edge_only = UpdateCache {
+            checked_at_epoch: Some(1),
+            latest_edge: Some(String::from("0.0.1")),
+            ..UpdateCache::default()
+        };
+        assert_eq!(
+            super::update_summary(&status(&edge_only, UpdateChannel::Stable), false, false),
+            "No stable release yet"
+        );
+        assert_eq!(
+            super::update_summary(&status(&edge_only, UpdateChannel::Edge), false, false),
+            "Up to date"
+        );
+
+        let with_stable = UpdateCache {
+            latest_stable: Some(String::from("0.0.1")),
+            ..edge_only
+        };
+        assert_eq!(
+            super::update_summary(&status(&with_stable, UpdateChannel::Stable), false, false),
+            "Up to date"
+        );
+        assert_eq!(
+            super::update_summary(
+                &status(&UpdateCache::default(), UpdateChannel::Stable),
+                false,
+                false
+            ),
+            "No update check yet"
+        );
+    }
+
+    fn join_action() -> CollaborationAction {
+        CollaborationAction::Join {
+            invite_token: String::from("invite"),
+            display_name: String::from("Joiner"),
+            endpoint: String::new(),
+            certificate_sha256: String::new(),
+        }
+    }
+
+    #[test]
+    fn joining_with_local_work_waits_for_share_confirmation() {
+        let mut workspace = WorkspaceUi::default();
+
+        assert_eq!(
+            workspace.request_collaboration_action(join_action(), 2),
+            CollaborationAction::None
+        );
+        assert_eq!(workspace.pending_join_share, Some(join_action()));
+        assert_eq!(workspace.resolve_join_share(true), join_action());
+        assert_eq!(workspace.pending_join_share, None);
+    }
+
+    #[test]
+    fn cancelling_share_confirmation_drops_the_join() {
+        let mut workspace = WorkspaceUi::default();
+        let _ = workspace.request_collaboration_action(join_action(), 1);
+
+        assert_eq!(
+            workspace.resolve_join_share(false),
+            CollaborationAction::None
+        );
+        assert_eq!(workspace.pending_join_share, None);
+        assert_eq!(
+            workspace.resolve_join_share(true),
+            CollaborationAction::None
+        );
+    }
+
+    #[test]
+    fn joining_with_an_empty_canvas_or_creating_needs_no_share_confirmation() {
+        let mut workspace = WorkspaceUi::default();
+        let create = CollaborationAction::Create {
+            display_name: String::from("Host"),
+            endpoint: String::new(),
+            certificate_sha256: String::new(),
+        };
+
+        assert_eq!(
+            workspace.request_collaboration_action(join_action(), 0),
+            join_action()
+        );
+        assert_eq!(
+            workspace.request_collaboration_action(create.clone(), 5),
+            create
+        );
+        assert_eq!(workspace.pending_join_share, None);
     }
 
     #[allow(clippy::expect_used, clippy::unwrap_used)]

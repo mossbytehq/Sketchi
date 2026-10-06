@@ -355,18 +355,23 @@ pub(crate) fn take_update_result() -> Option<String> {
     let path = update_result_path().ok()?;
     let result = fs::read_to_string(&path).ok()?;
     clear_update_result(&path);
-    let result = result.trim();
-    Some(match result {
+    Some(describe_update_result(&result))
+}
+
+/// Turns the result written by an update handoff script into a message.
+fn describe_update_result(result: &str) -> String {
+    match result.trim() {
         "success" => String::from("Update completed successfully."),
-        "pending" => String::from("The previous update did not complete. Please try again."),
-        failure if failure.starts_with("failure:") => {
-            format!(
-                "Update failed before restart: {}",
-                failure.trim_start_matches("failure:")
-            )
+        "restart-required" => {
+            String::from("Update installed. Restart Windows to finish applying it.")
         }
+        "pending" => String::from("The previous update did not complete. Please try again."),
+        failure if failure.starts_with("failure:") => format!(
+            "The update could not be installed: {}",
+            failure.trim_start_matches("failure:").trim()
+        ),
         _ => String::from("The previous update finished with an unknown result."),
-    })
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -670,75 +675,55 @@ fn command_succeeds(program: &str, args: &[&str]) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Runs the Windows installer after the client exits and records the outcome.
+///
+/// Sketchi is reopened whatever happens: by the time this runs the client has
+/// closed for the update, so a failed or declined install must not leave the
+/// user without the app.
 #[cfg(target_os = "windows")]
-fn install_windows_update(
-    url: &str,
-    name: &str,
-    expected_digest: Option<&str>,
-) -> Result<(), UpdateError> {
-    let executable = std::env::current_exe()?;
-    let destination =
-        std::env::temp_dir().join(format!("Sketchi-update-{}-{name}", std::process::id()));
-    download_asset(url, &destination)?;
-    verify_digest(&destination, expected_digest)?;
-    if name.ends_with("-setup.exe") {
-        return install_windows_setup(&executable, &destination);
-    }
-
-    install_windows_archive(&executable, &destination)
-}
-
-#[cfg(target_os = "windows")]
-fn install_windows_setup(executable: &Path, destination: &Path) -> Result<(), UpdateError> {
-    let result_path = update_result_path()?;
-    let script_path =
-        std::env::temp_dir().join(format!("Sketchi-update-{}-setup.ps1", std::process::id()));
-    fs::write(
-        &script_path,
-        r#"param([string]$Installer, [string]$Exe, [int]$ProcessId, [string]$Result)
+const WINDOWS_SETUP_SCRIPT: &str = r#"param([string]$Installer, [string]$Exe, [int]$ProcessId, [string]$Result)
 $ErrorActionPreference = "Stop"
 try {
     Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue
     $install = Start-Process -FilePath $Installer -Verb RunAs -Wait -PassThru
-    if ($install.ExitCode -ne 0) {
-        throw "installer exited with code $($install.ExitCode)"
+    switch ($install.ExitCode) {
+        0 { [System.IO.File]::WriteAllText($Result, "success") }
+        # ERROR_SUCCESS_REBOOT_REQUIRED and ERROR_SUCCESS_REBOOT_INITIATED:
+        # the update is installed and only needs Windows to restart.
+        { $_ -in 3010, 1641 } { [System.IO.File]::WriteAllText($Result, "restart-required") }
+        1602 { throw "the installation was cancelled" }
+        default { throw "installer exited with code $($install.ExitCode)" }
     }
-    [System.IO.File]::WriteAllText($Result, "success")
-    # The installer may have been elevated by UAC. Launch through Explorer so
-    # the desktop client returns to the user's normal integrity level.
-    Start-Process -FilePath "explorer.exe" -ArgumentList ('"{0}"' -f $Exe)
 } catch {
     [System.IO.File]::WriteAllText($Result, ("failure: " + $_.Exception.Message))
 } finally {
     Remove-Item -LiteralPath $Installer -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-}"#,
-    )?;
-    fs::write(&result_path, "pending\n")?;
-    let mut command = windows_powershell_command(&script_path);
-    command
-        .arg(destination)
-        .arg(executable)
-        .arg(std::process::id().to_string())
-        .arg(&result_path);
-    spawn_windows_update_command(command, &result_path)
-}
+    # The installer may have been elevated by UAC. Launch through Explorer so
+    # the desktop client returns to the user's normal integrity level.
+    Start-Process -FilePath "explorer.exe" -ArgumentList ('"{0}"' -f $Exe) -ErrorAction SilentlyContinue
+}"#;
 
+/// Replaces a portable installation from a release archive after the client
+/// exits, elevating when the installation directory is not writable.
+///
+/// Sketchi is reopened on success, on failure, and when the user declines
+/// the elevation prompt, because the client has already closed by then.
 #[cfg(target_os = "windows")]
-fn install_windows_archive(executable: &Path, destination: &Path) -> Result<(), UpdateError> {
-    executable.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "current executable has no parent")
-    })?;
-
-    let script_path =
-        std::env::temp_dir().join(format!("Sketchi-update-{}-install.ps1", std::process::id()));
-    let result_path = update_result_path()?;
-    fs::write(
-        &script_path,
-        r#"param([string]$Zip, [string]$Exe, [int]$ProcessId, [string]$Result, [switch]$Elevated)
+const WINDOWS_ARCHIVE_SCRIPT: &str = r#"param([string]$Zip, [string]$Exe, [int]$ProcessId, [string]$Result, [switch]$Elevated)
 $ErrorActionPreference = "Stop"
 $parent = Split-Path -Parent $Exe
 $stage = Join-Path $env:TEMP ("Sketchi-update-" + $ProcessId)
+
+function Start-Sketchi {
+    if ($Elevated) {
+        # Launch through Explorer so the client returns to the user's normal
+        # integrity level instead of inheriting this elevated session.
+        Start-Process -FilePath "explorer.exe" -ArgumentList ('"{0}"' -f $Exe) -ErrorAction SilentlyContinue
+    } else {
+        Start-Process -FilePath $Exe -ErrorAction SilentlyContinue
+    }
+}
 
 if (-not $Elevated) {
     $probe = Join-Path $parent (".Sketchi-update-probe-" + $ProcessId)
@@ -768,10 +753,13 @@ if (-not $Elevated) {
         try {
             Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $arguments | Out-Null
         } catch {
-            # The elevated child never started, so it cannot clean up these handoff files.
+            # The elevated child never started, so it cannot clean up these
+            # handoff files or reopen the client that is closing for the update.
             Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
             [System.IO.File]::WriteAllText($Result, ("failure: " + $_.Exception.Message))
+            Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue
+            Start-Sketchi
         }
         exit 0
     }
@@ -783,19 +771,83 @@ try {
     Expand-Archive -LiteralPath $Zip -DestinationPath $stage -Force
     Copy-Item -Path (Join-Path $stage '*') -Destination $parent -Recurse -Force
     [System.IO.File]::WriteAllText($Result, "success")
-    if ($Elevated) {
-        Start-Process -FilePath "explorer.exe" -ArgumentList ('"{0}"' -f $Exe)
-    } else {
-        Start-Process -FilePath $Exe
-    }
 } catch {
     [System.IO.File]::WriteAllText($Result, ("failure: " + $_.Exception.Message))
 } finally {
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $Zip -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-}"#,
-    )?;
+    Start-Sketchi
+}"#;
+
+#[cfg(target_os = "windows")]
+fn install_windows_update(
+    url: &str,
+    name: &str,
+    expected_digest: Option<&str>,
+) -> Result<(), UpdateError> {
+    let executable = std::env::current_exe()?;
+    let destination =
+        std::env::temp_dir().join(format!("Sketchi-update-{}-{name}", std::process::id()));
+    stage_update(
+        &destination,
+        |path| download_asset(url, path),
+        |path| {
+            verify_digest(path, expected_digest)?;
+            if name.ends_with("-setup.exe") {
+                install_windows_setup(&executable, path)
+            } else {
+                install_windows_archive(&executable, path)
+            }
+        },
+    )
+}
+
+/// Downloads an update to `destination` and hands it to `finish`.
+///
+/// Any file left by an earlier attempt is removed first, and the download is
+/// removed again if a later step fails, so retrying in the same session does
+/// not trip over a stale file.
+#[cfg(any(target_os = "windows", test))]
+fn stage_update(
+    destination: &Path,
+    download: impl FnOnce(&Path) -> Result<(), UpdateError>,
+    finish: impl FnOnce(&Path) -> Result<(), UpdateError>,
+) -> Result<(), UpdateError> {
+    let _ = fs::remove_file(destination);
+    let result = download(destination).and_then(|()| finish(destination));
+    if result.is_err() {
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_setup(executable: &Path, destination: &Path) -> Result<(), UpdateError> {
+    let result_path = update_result_path()?;
+    let script_path =
+        std::env::temp_dir().join(format!("Sketchi-update-{}-setup.ps1", std::process::id()));
+    fs::write(&script_path, WINDOWS_SETUP_SCRIPT)?;
+    fs::write(&result_path, "pending\n")?;
+    let mut command = windows_powershell_command(&script_path);
+    command
+        .arg(destination)
+        .arg(executable)
+        .arg(std::process::id().to_string())
+        .arg(&result_path);
+    spawn_windows_update_command(command, &result_path)
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_archive(executable: &Path, destination: &Path) -> Result<(), UpdateError> {
+    executable.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "current executable has no parent")
+    })?;
+
+    let script_path =
+        std::env::temp_dir().join(format!("Sketchi-update-{}-install.ps1", std::process::id()));
+    let result_path = update_result_path()?;
+    fs::write(&script_path, WINDOWS_ARCHIVE_SCRIPT)?;
     fs::write(&result_path, "pending\n")?;
     let mut command = windows_powershell_command(&script_path);
     command
@@ -939,6 +991,126 @@ mod tests {
             Some(newer_edge)
         );
         assert!(edge.target_url.is_some());
+    }
+
+    #[test]
+    fn handoff_results_describe_restart_and_failure() {
+        assert_eq!(
+            super::describe_update_result("restart-required\n"),
+            "Update installed. Restart Windows to finish applying it."
+        );
+        assert_eq!(
+            super::describe_update_result("failure: the installation was cancelled"),
+            "The update could not be installed: the installation was cancelled"
+        );
+        assert_eq!(
+            super::describe_update_result("success"),
+            "Update completed successfully."
+        );
+    }
+
+    fn scratch_directory(label: &str) -> Option<std::path::PathBuf> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "sketchi-update-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).ok()?;
+        Some(directory)
+    }
+
+    #[test]
+    fn failed_handoff_removes_the_download_so_a_retry_can_stage_again() {
+        let Some(directory) = scratch_directory("retry") else {
+            return;
+        };
+        let destination = directory.join("Sketchi-0.4.5-windows-x86_64.zip");
+        let download = |path: &std::path::Path| -> Result<(), super::UpdateError> {
+            // Mirrors `download_asset`, which refuses to overwrite a file.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?;
+            Ok(())
+        };
+
+        let failed = super::stage_update(&destination, download, |_| {
+            Err(super::UpdateError::UnsupportedAsset)
+        });
+        assert!(failed.is_err());
+        assert!(
+            !destination.exists(),
+            "failed attempt must not leave a file"
+        );
+
+        // A file left behind by a crashed earlier process is cleared too.
+        assert!(std::fs::write(&destination, b"stale").is_ok());
+        let mut finished = false;
+        let retried = super::stage_update(&destination, download, |path| {
+            finished = path.exists();
+            Ok(())
+        });
+        assert!(retried.is_ok());
+        assert!(finished);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn archive_script_reopens_sketchi_when_the_update_fails() {
+        let Some(directory) = scratch_directory("archive") else {
+            return;
+        };
+        let install = directory.join("install dir");
+        assert!(std::fs::create_dir_all(&install).is_ok());
+        // A stand-in client that records being launched.
+        let executable = install.join("Sketchi.cmd");
+        let marker = install.join("relaunched.txt");
+        assert!(
+            std::fs::write(
+                &executable,
+                "@echo off\r\necho relaunched> \"%~dp0relaunched.txt\"\r\n"
+            )
+            .is_ok()
+        );
+        let archive = directory.join("Sketchi-update.zip");
+        assert!(std::fs::write(&archive, b"not a zip archive").is_ok());
+        let result = directory.join("update-result");
+        assert!(std::fs::write(&result, "pending\n").is_ok());
+        let script = directory.join("install.ps1");
+        assert!(std::fs::write(&script, super::WINDOWS_ARCHIVE_SCRIPT).is_ok());
+        // An already-exited process stands in for the closing client.
+        let exited = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit"])
+            .spawn()
+            .and_then(|mut child| child.wait().map(|_| child.id()));
+        let Ok(process_id) = exited else {
+            return;
+        };
+
+        let status = super::windows_powershell_command(&script)
+            .arg(&archive)
+            .arg(&executable)
+            .arg(process_id.to_string())
+            .arg(&result)
+            .status();
+        assert!(status.is_ok_and(|status| status.success()));
+
+        let recorded = std::fs::read_to_string(&result).unwrap_or_default();
+        assert!(
+            recorded.starts_with("failure:"),
+            "unexpected result {recorded:?}"
+        );
+        assert!(!archive.exists() && !script.exists());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(marker.exists(), "Sketchi must be reopened after a failure");
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

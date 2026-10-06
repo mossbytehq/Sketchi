@@ -41,6 +41,11 @@ use crate::{
 
 const CREATE_REQUEST_CACHE_CAPACITY: usize = 1024;
 const CREATE_REQUEST_RETENTION: Duration = Duration::from_mins(10);
+/// Interval between WebSocket pings sent to every session.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// Silence after which a session is treated as dead and removed. Clients
+/// answer pings automatically, so only a half-open connection goes silent.
+pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Errors returned by the HTTP/WebSocket server.
 #[derive(Debug, Error)]
@@ -98,6 +103,8 @@ pub struct ServerState {
     sessions: Arc<AsyncMutex<BTreeMap<SessionId, SessionPeer>>>,
     create_requests: Arc<AsyncMutex<BTreeMap<ClientId, CreateRequestRecord>>>,
     server_version: String,
+    heartbeat_interval: Duration,
+    idle_timeout: Duration,
 }
 
 impl ServerState {
@@ -109,7 +116,17 @@ impl ServerState {
             sessions: Arc::new(AsyncMutex::new(BTreeMap::new())),
             create_requests: Arc::new(AsyncMutex::new(BTreeMap::new())),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            idle_timeout: SESSION_IDLE_TIMEOUT,
         }
+    }
+
+    /// Overrides the session heartbeat interval and idle timeout.
+    #[must_use]
+    pub const fn with_heartbeat(mut self, interval: Duration, idle_timeout: Duration) -> Self {
+        self.heartbeat_interval = interval;
+        self.idle_timeout = idle_timeout;
+        self
     }
 }
 
@@ -231,25 +248,40 @@ async fn session(socket: WebSocket, state: ServerState) {
         },
     );
 
+    let heartbeat_interval = state.heartbeat_interval;
     let writer = tokio::spawn(async move {
-        while let Some(message) = outbound.recv().await {
-            let Ok(payload) = encode_server(&message) else {
-                continue;
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + heartbeat_interval,
+            heartbeat_interval,
+        );
+        loop {
+            let frame = tokio::select! {
+                message = outbound.recv() => {
+                    let Some(message) = message else {
+                        break;
+                    };
+                    let Ok(payload) = encode_server(&message) else {
+                        continue;
+                    };
+                    let Ok(text) = String::from_utf8(payload) else {
+                        continue;
+                    };
+                    Message::Text(text.into())
+                }
+                _ = heartbeat.tick() => Message::Ping(axum::body::Bytes::new()),
             };
-            let Ok(text) = String::from_utf8(payload) else {
-                continue;
-            };
-            if socket_sender
-                .send(Message::Text(text.into()))
-                .await
-                .is_err()
-            {
+            if socket_sender.send(frame).await.is_err() {
                 break;
             }
         }
     });
 
-    while let Some(Ok(message)) = socket_receiver.next().await {
+    // Any inbound frame, including the automatic pong to our heartbeat,
+    // proves the peer is alive. Silence means a half-open connection whose
+    // identity and room seat must be released so the client can reconnect.
+    while let Ok(Some(Ok(message))) =
+        tokio::time::timeout(state.idle_timeout, socket_receiver.next()).await
+    {
         let bytes = match message {
             Message::Text(text) => text.as_bytes().to_vec(),
             Message::Binary(bytes) => bytes.to_vec(),
@@ -349,7 +381,10 @@ async fn handle_message(
                     "client identity is already connected",
                 )
                 .await;
-                return Ok(());
+                // Close instead of leaving an unusable session open: the
+                // client's reconnect loop then retries until the older
+                // session is released by its idle timeout.
+                return Err(());
             }
             let client_name = client_name
                 .filter(|name| !name.trim().is_empty())
@@ -422,6 +457,14 @@ async fn handle_message(
                 .unwrap_or_else(|| String::from("Sketchi"));
             let switching_rooms = previous_room.is_some() && previous_room != Some(room_id);
             let token = crate::auth::CapabilityToken::from_secret(capability_token);
+            // Hold this session's outbound lock from before the snapshot is
+            // taken until its frames are queued, and route the session to the
+            // room before releasing the room lock. An operation applied after
+            // the snapshot is then broadcast here but waits on this lock and
+            // arrives after the snapshot instead of being skipped; one that is
+            // both in the snapshot and broadcast is a harmless CRDT duplicate.
+            // A rejected join never reroutes the session, so it keeps
+            // receiving its current room's broadcasts.
             let result = {
                 let _join_guard = outbound.lock().await;
                 let result = {
@@ -429,23 +472,36 @@ async fn handle_message(
                     let result = manager
                         .join_named(room_id, &token, client_id, client_name.clone())
                         .and_then(|()| manager.sync(room_id, &known_version));
-                    match (result, previous_room) {
+                    let result = match (result, previous_room) {
                         (Ok(sync), Some(previous_room)) if previous_room != room_id => {
                             manager.leave(previous_room, client_id).map(|()| sync)
                         }
                         (result, _) => result,
+                    };
+                    if result.is_ok() {
+                        update_peer(state, session_id, |peer| peer.room_id = Some(room_id)).await;
                     }
+                    result
                 };
-                if result.is_ok() {
-                    update_peer(state, session_id, |peer| peer.room_id = None).await;
+                match result {
+                    Ok(sync) => {
+                        send_sync_frames_locked(
+                            sender,
+                            room_id,
+                            sync.snapshot,
+                            sync.operations,
+                            sync.presence,
+                            sync.participants,
+                            sync.version,
+                        )
+                        .await;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
                 }
-                result
             };
             match result {
-                Ok(sync) => {
-                    let version = sync.version;
-                    let presence = sync.presence;
-                    let participants = sync.participants;
+                Ok(()) => {
                     if switching_rooms && let Some(previous_room) = previous_room {
                         broadcast_room(
                             state,
@@ -458,20 +514,6 @@ async fn handle_message(
                         )
                         .await;
                     }
-                    {
-                        let _sync_guard = outbound.lock().await;
-                        send_sync_frames_locked(
-                            sender,
-                            room_id,
-                            sync.snapshot,
-                            sync.operations,
-                            presence,
-                            participants,
-                            version,
-                        )
-                        .await;
-                    }
-                    update_peer(state, session_id, |peer| peer.room_id = Some(room_id)).await;
                     if previous_room != Some(room_id)
                         || previous_name.as_deref() != Some(client_name.as_str())
                     {
@@ -1708,6 +1750,213 @@ mod tests {
             next_message(&mut receiver).await,
             ServerMessage::SyncComplete { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn rejected_room_switch_keeps_receiving_the_current_room() {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::store::RoomStore::open_in_memory().expect("in-memory store"),
+        ));
+        let state = ServerState::new(RoomManager::new(store));
+        let (current, other) = {
+            let mut manager = state.manager.lock().await;
+            (
+                manager.create_room().expect("current room"),
+                manager.create_room().expect("other room"),
+            )
+        };
+        let client_id = ClientId::from_u128(31);
+        state
+            .manager
+            .lock()
+            .await
+            .join(current.room_id, &current.token, client_id)
+            .expect("join current room");
+        let session_id = SessionId::new();
+        let mut receiver =
+            add_peer(&state, session_id, Some(client_id), Some(current.room_id)).await;
+        let sender = state
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("peer was inserted")
+            .sender
+            .clone();
+
+        // Park the switch while it validates, then broadcast in the current
+        // room before the bad invite is rejected.
+        let manager_guard = state.manager.lock().await;
+        let join_state = state.clone();
+        let join = tokio::spawn(async move {
+            handle_message(
+                session_id,
+                ClientMessage::JoinRoom {
+                    room_id: other.room_id,
+                    capability_token: String::from("wrong-token"),
+                    known_version: VersionVector::default(),
+                },
+                &join_state,
+                &sender,
+            )
+            .await
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let broadcast_state = state.clone();
+        let broadcast = tokio::spawn(async move {
+            broadcast_room(
+                &broadcast_state,
+                current.room_id,
+                SessionId::new(),
+                ServerMessage::Operations {
+                    room_id: current.room_id,
+                    operations: Vec::new(),
+                },
+            )
+            .await;
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        drop(manager_guard);
+        assert!(join.await.expect("join task").is_ok());
+        broadcast.await.expect("broadcast task");
+
+        let mut received_current_room = false;
+        while let Ok(message) = receiver.try_recv() {
+            if matches!(message, ServerMessage::Operations { room_id, .. } if room_id == current.room_id)
+            {
+                received_current_room = true;
+            }
+        }
+        assert!(
+            received_current_room,
+            "the current room's broadcast was skipped during a rejected switch"
+        );
+        assert_eq!(peer_room(&state, session_id).await, Some(current.room_id));
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn operation_submitted_while_joiner_syncs_reaches_the_joiner() {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::store::RoomStore::open_in_memory().expect("in-memory store"),
+        ));
+        let state = ServerState::new(RoomManager::new(store));
+        let room = {
+            let mut manager = state.manager.lock().await;
+            manager.create_room().expect("room")
+        };
+        let drawer_client = ClientId::from_u128(11);
+        {
+            let mut manager = state.manager.lock().await;
+            manager
+                .join(room.room_id, &room.token, drawer_client)
+                .expect("drawer join");
+        }
+        let drawer_session = SessionId::new();
+        let mut drawer_receiver = add_peer(
+            &state,
+            drawer_session,
+            Some(drawer_client),
+            Some(room.room_id),
+        )
+        .await;
+        let drawer_sender = state
+            .sessions
+            .lock()
+            .await
+            .get(&drawer_session)
+            .expect("drawer peer was inserted")
+            .sender
+            .clone();
+
+        // A one-slot channel parks the join after it queues the snapshot,
+        // inside the window where the joiner has a snapshot but no live feed.
+        let joiner_session = SessionId::new();
+        let (joiner_sender, mut joiner_receiver) = mpsc::channel(1);
+        state.sessions.lock().await.insert(
+            joiner_session,
+            SessionPeer {
+                client_id: Some(ClientId::from_u128(12)),
+                client_name: None,
+                room_id: None,
+                sender: joiner_sender.clone(),
+                outbound: Arc::new(AsyncMutex::new(())),
+            },
+        );
+        let join_state = state.clone();
+        let join_sender = joiner_sender.clone();
+        let join = tokio::spawn(async move {
+            handle_message(
+                joiner_session,
+                ClientMessage::JoinRoom {
+                    room_id: room.room_id,
+                    capability_token: room.token.secret().to_owned(),
+                    known_version: VersionVector::default(),
+                },
+                &join_state,
+                &join_sender,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while joiner_sender.capacity() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("join should queue its snapshot");
+
+        let operation = Operation::new(
+            OperationId::new(drawer_client, 1),
+            LamportTimestamp::new(1),
+            VersionVector::default(),
+            OperationKind::Create {
+                element: Element::rectangle(
+                    ElementId::from_u128(77),
+                    Transform::new(Point::default(), Size::new(10.0, 10.0)),
+                ),
+            },
+        );
+        let operation_id = operation.id;
+        let submit_state = state.clone();
+        let submit = tokio::spawn(async move {
+            handle_message(
+                drawer_session,
+                ClientMessage::SubmitOperations {
+                    room_id: room.room_id,
+                    request_id: 1,
+                    operations: vec![operation],
+                },
+                &submit_state,
+                &drawer_sender,
+            )
+            .await
+        });
+        assert!(matches!(
+            next_message(&mut drawer_receiver).await,
+            ServerMessage::Ack { .. }
+        ));
+
+        let received = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(message) = joiner_receiver.recv().await {
+                if let ServerMessage::Operations { operations, .. } = message
+                    && operations
+                        .iter()
+                        .any(|operation| operation.id == operation_id)
+                {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(received, Ok(true), "joiner missed a concurrent operation");
+        assert!(join.await.expect("join task").is_ok());
+        assert!(submit.await.expect("submit task").is_ok());
     }
 
     #[tokio::test]

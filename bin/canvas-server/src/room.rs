@@ -401,11 +401,36 @@ impl RoomManager {
         let expires_at_epoch = u64::try_from(credentials.created_at_epoch)
             .unwrap_or_default()
             .saturating_add(ROOM_TOKEN_LIFETIME.as_secs());
-        if now_epoch >= expires_at_epoch {
+        // Expiry stops a leaked invite from admitting new people. The creator
+        // and anyone already admitted keep the ability to reconnect.
+        if now_epoch >= expires_at_epoch
+            && credentials.creator_id != Some(client_id)
+            && !self
+                .store
+                .lock()
+                .map_err(|_| RoomError::StoreLock)?
+                .is_member(room_id, client_id)?
+        {
             return Err(RoomError::TokenExpired);
         }
         let room = self.room_mut(room_id)?;
-        room.join(client_id, name.into())
+        let newly_joined = !room.is_member(client_id);
+        room.join(client_id, name.into())?;
+        // A client already in the room was recorded when first admitted, and
+        // its rejoin changes nothing; only a new admission is recorded, and
+        // only that admission is undone if recording fails.
+        if newly_joined {
+            let recorded = self
+                .store
+                .lock()
+                .map_err(|_| RoomError::StoreLock)
+                .and_then(|mut store| Ok(store.record_member(room_id, client_id)?));
+            if let Err(error) = recorded {
+                self.room_mut(room_id)?.leave(client_id);
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// Leaves a room.
@@ -564,6 +589,157 @@ mod tests {
             manager
                 .submit(created.room_id, creator, std::slice::from_ref(&operation))
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn admitted_members_and_the_creator_can_rejoin_after_capability_expiry() {
+        let store = Arc::new(Mutex::new(RoomStore::open_in_memory().expect("store")));
+        let creator = ClientId::from_u128(1);
+        let member = ClientId::from_u128(2);
+        let stranger = ClientId::from_u128(3);
+        let created = RoomManager::new(Arc::clone(&store))
+            .create_room_for(creator)
+            .expect("room");
+        let before_expiry = created.expires_at_epoch.saturating_sub(1);
+        let after_expiry = created.expires_at_epoch.saturating_add(60);
+        {
+            let mut manager = RoomManager::new(Arc::clone(&store));
+            manager
+                .join_named_at(
+                    created.room_id,
+                    &created.token,
+                    member,
+                    "Member",
+                    before_expiry,
+                )
+                .expect("member joins before expiry");
+            manager
+                .leave(created.room_id, member)
+                .expect("member disconnects");
+        }
+
+        // A fresh manager models a server restart: admission must be durable.
+        let mut manager = RoomManager::new(Arc::clone(&store));
+        manager
+            .join_named_at(
+                created.room_id,
+                &created.token,
+                member,
+                "Member",
+                after_expiry,
+            )
+            .expect("admitted member rejoins after expiry");
+        manager
+            .join_named_at(
+                created.room_id,
+                &created.token,
+                creator,
+                "Creator",
+                after_expiry,
+            )
+            .expect("creator rejoins after expiry");
+        assert!(matches!(
+            manager.join_named_at(
+                created.room_id,
+                &created.token,
+                stranger,
+                "Stranger",
+                after_expiry,
+            ),
+            Err(RoomError::TokenExpired)
+        ));
+        assert!(matches!(
+            manager.join_named_at(
+                created.room_id,
+                &CapabilityToken::from_secret("wrong-token"),
+                member,
+                "Member",
+                after_expiry,
+            ),
+            Err(RoomError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn failed_membership_write_only_undoes_a_new_admission() {
+        let store = Arc::new(Mutex::new(RoomStore::open_in_memory().expect("store")));
+        let mut manager = RoomManager::new(Arc::clone(&store));
+        let created = manager
+            .create_room_for(ClientId::from_u128(1))
+            .expect("room");
+        let member = ClientId::from_u128(2);
+        let newcomer = ClientId::from_u128(3);
+        manager
+            .join_named(created.room_id, &created.token, member, "Member")
+            .expect("member joins");
+        store
+            .lock()
+            .expect("store lock")
+            .break_member_records()
+            .expect("break membership writes");
+        let is_member = |manager: &RoomManager, client_id| {
+            manager
+                .rooms
+                .get(&created.room_id)
+                .is_some_and(|room| room.is_member(client_id))
+        };
+
+        // Rejoining (for example after a rename) must not evict the member.
+        assert!(
+            manager
+                .join_named(created.room_id, &created.token, member, "Renamed")
+                .is_ok()
+        );
+        assert!(is_member(&manager, member));
+
+        // A brand-new admission that cannot be recorded is rolled back.
+        assert!(
+            manager
+                .join_named(created.room_id, &created.token, newcomer, "Newcomer")
+                .is_err()
+        );
+        assert!(!is_member(&manager, newcomer));
+        assert!(is_member(&manager, member));
+    }
+
+    #[test]
+    fn rejected_join_does_not_grant_rejoin_after_expiry() {
+        let store = Arc::new(Mutex::new(RoomStore::open_in_memory().expect("store")));
+        let mut manager = RoomManager::new(Arc::clone(&store));
+        let created = manager
+            .create_room_for(ClientId::from_u128(1))
+            .expect("room");
+        let before_expiry = created.expires_at_epoch.saturating_sub(1);
+        for index in 0..MAX_PARTICIPANTS {
+            let client = ClientId::from_u128(10 + u128::try_from(index).expect("index fits"));
+            manager
+                .join_named_at(
+                    created.room_id,
+                    &created.token,
+                    client,
+                    "Member",
+                    before_expiry,
+                )
+                .expect("room has space");
+        }
+        let overflow = ClientId::from_u128(99);
+        assert!(matches!(
+            manager.join_named_at(
+                created.room_id,
+                &created.token,
+                overflow,
+                "Overflow",
+                before_expiry,
+            ),
+            Err(RoomError::RoomFull)
+        ));
+        assert!(
+            !store
+                .lock()
+                .expect("store lock")
+                .is_member(created.room_id, overflow)
+                .expect("membership lookup")
         );
     }
 

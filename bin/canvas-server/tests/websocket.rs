@@ -9,14 +9,17 @@
     missing_docs
 )]
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{body::Body, http::Request};
 use canvas_core::{
     ClientId, Element, ElementId, LamportTimestamp, Operation, OperationId, OperationKind, Point,
     Size, Transform, VersionVector,
 };
-use canvas_protocol::{ClientMessage, ServerMessage, decode_server, encode_client};
+use canvas_protocol::{ClientMessage, ErrorCode, ServerMessage, decode_server, encode_client};
 use canvas_server::{
     room::RoomManager,
     store::RoomStore,
@@ -165,6 +168,116 @@ async fn two_websocket_clients_receive_acknowledged_operations() {
         ServerMessage::Operations { .. }
     ));
 
+    server.abort();
+}
+
+type ClientSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn hello(
+    address: std::net::SocketAddr,
+    client_id: ClientId,
+) -> (ClientSocket, ServerMessage) {
+    let (mut socket, _) = connect_async(format!("ws://{address}/ws")).await.unwrap();
+    send_client(
+        &mut socket,
+        ClientMessage::Hello {
+            client_id,
+            client_name: None,
+        },
+    )
+    .await;
+    let reply = receive_server(&mut socket).await;
+    (socket, reply)
+}
+
+#[tokio::test]
+async fn silent_session_is_released_so_its_identity_can_reconnect() {
+    let store = Arc::new(Mutex::new(RoomStore::open_in_memory().unwrap()));
+    let state = ServerState::new(RoomManager::new(store))
+        .with_heartbeat(Duration::from_millis(50), Duration::from_millis(300));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(state)).await;
+    });
+    let client_id = ClientId::from_u128(21);
+
+    // The first connection goes half-open: it stays open but never reads,
+    // so it never answers the server's heartbeat pings.
+    let (half_open, reply) = hello(address, client_id).await;
+    assert!(matches!(reply, ServerMessage::Welcome { .. }));
+
+    // While the stale session is still alive, the same identity is refused
+    // and the socket is closed so the client's reconnect loop retries.
+    let (mut refused, reply) = hello(address, client_id).await;
+    assert!(matches!(
+        reply,
+        ServerMessage::Error {
+            code: ErrorCode::Unauthorized,
+            ..
+        }
+    ));
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match refused.next().await {
+                None | Some(Err(_) | Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "refused handshake should close the socket");
+
+    let welcomed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (_socket, reply) = hello(address, client_id).await;
+            if matches!(reply, ServerMessage::Welcome { .. }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        welcomed.is_ok(),
+        "identity should be released after the idle timeout"
+    );
+    drop(half_open);
+    server.abort();
+}
+
+#[tokio::test]
+async fn responsive_session_outlives_the_idle_timeout() {
+    let store = Arc::new(Mutex::new(RoomStore::open_in_memory().unwrap()));
+    let state = ServerState::new(RoomManager::new(store))
+        .with_heartbeat(Duration::from_millis(50), Duration::from_millis(200));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router(state)).await;
+    });
+    let (mut socket, reply) = hello(address, ClientId::from_u128(22)).await;
+    assert!(matches!(reply, ServerMessage::Welcome { .. }));
+
+    // Reading lets tungstenite answer the server's pings, which is all an
+    // otherwise idle client does. Several idle timeouts pass meanwhile.
+    let mut pings = 0;
+    let _ = tokio::time::timeout(Duration::from_millis(800), async {
+        while let Some(Ok(message)) = socket.next().await {
+            if matches!(message, Message::Ping(_)) {
+                pings += 1;
+            }
+        }
+    })
+    .await;
+    assert!(pings > 0, "server should send heartbeat pings");
+
+    send_client(&mut socket, ClientMessage::Ping { nonce: 7 }).await;
+    assert!(matches!(
+        receive_server(&mut socket).await,
+        ServerMessage::Pong { nonce: 7 }
+    ));
     server.abort();
 }
 

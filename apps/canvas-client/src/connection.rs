@@ -37,6 +37,26 @@ use crate::supervisor::{ReadyMessage, ReconnectBackoff, ReconnectState};
 /// Bounded channel capacity for UI/network handoff.
 pub const CHANNEL_CAPACITY: usize = 128;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a connection must stay up before the reconnect budget resets.
+const STABLE_CONNECTION: Duration = Duration::from_secs(10);
+
+/// Client-side liveness policy for one WebSocket connection.
+#[derive(Clone, Copy, Debug)]
+struct Heartbeat {
+    /// Interval between pings sent to the server.
+    interval: Duration,
+    /// Silence after which the connection is treated as half-open.
+    idle_timeout: Duration,
+}
+
+impl Default for Heartbeat {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(20),
+        }
+    }
+}
 
 /// Connection-level errors visible to the editor loop.
 #[derive(Debug, Error)]
@@ -211,17 +231,25 @@ pub async fn run_reconnecting(
                 let generation = connection_generation
                     .fetch_add(1, Ordering::AcqRel)
                     .wrapping_add(1);
-                backoff.on_connected();
-                match run_socket(
+                let connected_at = tokio::time::Instant::now();
+                let result = run_socket(
                     socket,
                     &mut outbound,
                     &inbound,
                     &handshake,
                     generation,
                     &mut shutdown,
+                    Heartbeat::default(),
                 )
-                .await
-                {
+                .await;
+                // A connection the server closes during the handshake (for
+                // example while an older session with this identity is still
+                // timing out) must keep backing off instead of retrying at
+                // the initial delay forever.
+                if connected_at.elapsed() >= STABLE_CONNECTION {
+                    backoff.on_connected();
+                }
+                match result {
                     Ok(()) => return Ok(()),
                     Err(error)
                         if matches!(
@@ -265,11 +293,20 @@ async fn run_socket<S>(
     handshake: &Mutex<Vec<ClientMessage>>,
     generation: u64,
     shutdown: &mut watch::Receiver<bool>,
+    heartbeat: Heartbeat,
 ) -> Result<(), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut writer, mut reader) = socket.split();
+    let mut ping = tokio::time::interval_at(
+        tokio::time::Instant::now() + heartbeat.interval,
+        heartbeat.interval,
+    );
+    // Servers answer pings automatically, so silence past this deadline
+    // means the connection is half-open and should be re-established.
+    let idle = sleep(heartbeat.idle_timeout);
+    tokio::pin!(idle);
     let handshake_messages = handshake
         .lock()
         .map(|messages| messages.clone())
@@ -289,38 +326,47 @@ where
                 let payload = encode_client(&message)?;
                 writer.send(Message::Text(String::from_utf8(payload)?.into())).await?;
             }
+            _ = ping.tick() => {
+                writer.send(Message::Ping(Vec::new().into())).await?;
+            }
+            () = &mut idle => {
+                return Err(ConnectionError::Disconnected);
+            }
             message = reader.next() => {
                 let Some(message) = message else {
                     return Err(ConnectionError::Disconnected);
                 };
-                match message? {
-                    Message::Text(text) => {
-                        let message = decode_server(text.as_bytes())?;
-                        tokio::select! {
-                            result = inbound.send(ReceivedServerMessage { generation, message }) => {
-                                result.map_err(|_| ConnectionError::InboundClosed)?;
-                            }
-                            result = shutdown.changed() => {
-                                let _ = result;
-                                return Ok(());
-                            }
-                        }
-                    }
-                    Message::Binary(bytes) => {
-                        let message = decode_server(&bytes)?;
-                        tokio::select! {
-                            result = inbound.send(ReceivedServerMessage { generation, message }) => {
-                                result.map_err(|_| ConnectionError::InboundClosed)?;
-                            }
-                            result = shutdown.changed() => {
-                                let _ = result;
-                                return Ok(());
-                            }
-                        }
-                    }
+                idle.as_mut().reset(tokio::time::Instant::now() + heartbeat.idle_timeout);
+                let message = match message? {
+                    Message::Text(text) => decode_server(text.as_bytes())?,
+                    Message::Binary(bytes) => decode_server(&bytes)?,
                     Message::Close(_) => return Err(ConnectionError::Disconnected),
-                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+                };
+                // The inbound queue fills when the UI thread stalls (for
+                // example behind a modal file dialog). Keep pinging while
+                // waiting so the server does not mistake the stall for a dead
+                // connection.
+                let mut delivery =
+                    std::pin::pin!(inbound.send(ReceivedServerMessage { generation, message }));
+                loop {
+                    tokio::select! {
+                        result = &mut delivery => {
+                            result.map_err(|_| ConnectionError::InboundClosed)?;
+                            break;
+                        }
+                        _ = ping.tick() => {
+                            writer.send(Message::Ping(Vec::new().into())).await?;
+                        }
+                        result = shutdown.changed() => {
+                            let _ = result;
+                            return Ok(());
+                        }
+                    }
                 }
+                // Socket reads were paused by our own backpressure, so the
+                // silence since the last frame is not evidence of a dead peer.
+                idle.as_mut().reset(tokio::time::Instant::now() + heartbeat.idle_timeout);
             }
             result = shutdown.changed() => {
                 let _ = result;
@@ -960,7 +1006,9 @@ impl CollaborationClient {
     /// Returns [`ConnectionError::QueueFull`] or [`ConnectionError::Closed`]
     /// when the automatic join message cannot be queued.
     pub fn observe(&mut self, received: &ReceivedServerMessage) -> Result<bool, ConnectionError> {
-        if received.generation != self.connection_generation.load(Ordering::Acquire) {
+        if received.generation != self.connection_generation.load(Ordering::Acquire)
+            || self.wait_if_handshake_refused(received)
+        {
             return Ok(false);
         }
         match &received.message {
@@ -1058,6 +1106,24 @@ impl CollaborationClient {
             _ => {}
         }
         Ok(true)
+    }
+
+    /// Detects a server refusing this connection's handshake, typically
+    /// because an older session with the same identity has not timed out
+    /// yet. The server closes the socket and the reconnect loop retries, so
+    /// this records a waiting status instead of surfacing an error.
+    fn wait_if_handshake_refused(&mut self, received: &ReceivedServerMessage) -> bool {
+        let refused = matches!(
+            received.message,
+            ServerMessage::Error {
+                code: canvas_protocol::ErrorCode::Unauthorized,
+                ..
+            }
+        ) && self.welcome_generation != Some(received.generation);
+        if refused {
+            self.status = String::from("Waiting for the previous connection to close…");
+        }
+        refused
     }
 
     fn reset_room_state(&mut self, status: &str) {
@@ -1579,6 +1645,184 @@ mod tests {
                 creator_token,
             }) if room_id == RoomId::from_u128(1) && creator_token == "creator-token"
         ));
+    }
+
+    async fn websocket_pair() -> Option<(
+        WebSocketStream<tokio::net::TcpStream>,
+        WebSocketStream<tokio::net::TcpStream>,
+    )> {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+        let address = listener.local_addr().ok()?;
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+        let client = WebSocketStream::from_raw_socket(client.ok()?, Role::Client, None).await;
+        let server = WebSocketStream::from_raw_socket(accepted.ok()?.0, Role::Server, None).await;
+        Some((client, server))
+    }
+
+    const TEST_HEARTBEAT: Heartbeat = Heartbeat {
+        interval: Duration::from_millis(30),
+        idle_timeout: Duration::from_millis(150),
+    };
+
+    #[tokio::test]
+    async fn socket_is_dropped_when_the_server_goes_silent() {
+        let Some((client, _silent_server)) = websocket_pair().await else {
+            return;
+        };
+        let (_outbound_sender, mut outbound) = mpsc::channel(1);
+        let (inbound, _inbound_receiver) = mpsc::channel(1);
+        let (_shutdown_sender, mut shutdown) = watch::channel(false);
+        let handshake = Mutex::new(Vec::new());
+
+        // The server half never reads, so it never answers pings: the
+        // connection is half-open and the client must notice on its own.
+        let result = timeout(
+            Duration::from_secs(2),
+            run_socket(
+                client,
+                &mut outbound,
+                &inbound,
+                &handshake,
+                1,
+                &mut shutdown,
+                TEST_HEARTBEAT,
+            ),
+        )
+        .await;
+        assert!(matches!(result, Ok(Err(ConnectionError::Disconnected))));
+    }
+
+    #[tokio::test]
+    async fn socket_stays_up_while_the_server_answers_pings() {
+        let Some((client, mut server)) = websocket_pair().await else {
+            return;
+        };
+        // Reading is enough for tungstenite to answer the client's pings.
+        let responder = tokio::spawn(async move { while server.next().await.is_some() {} });
+        let (_outbound_sender, mut outbound) = mpsc::channel(1);
+        let (inbound, _inbound_receiver) = mpsc::channel(1);
+        let (_shutdown_sender, mut shutdown) = watch::channel(false);
+        let handshake = Mutex::new(Vec::new());
+
+        let result = timeout(
+            TEST_HEARTBEAT.idle_timeout * 5,
+            run_socket(
+                client,
+                &mut outbound,
+                &inbound,
+                &handshake,
+                1,
+                &mut shutdown,
+                TEST_HEARTBEAT,
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "a responsive server must not be dropped");
+        responder.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_ui_keeps_pinging_and_resumes_without_disconnecting() {
+        let Some((client, mut server)) = websocket_pair().await else {
+            return;
+        };
+        for nonce in 0..3 {
+            let Ok(payload) = canvas_protocol::encode_server(&ServerMessage::Pong { nonce }) else {
+                return;
+            };
+            let Ok(text) = String::from_utf8(payload) else {
+                return;
+            };
+            assert!(server.send(Message::Text(text.into())).await.is_ok());
+        }
+        let (_outbound_sender, mut outbound) = mpsc::channel(1);
+        // Nobody drains this one-slot queue at first: the UI thread is stalled.
+        let (inbound, mut stalled_ui) = mpsc::channel(1);
+        let (_shutdown_sender, mut shutdown) = watch::channel(false);
+        let handshake = Mutex::new(Vec::new());
+        let socket = run_socket(
+            client,
+            &mut outbound,
+            &inbound,
+            &handshake,
+            1,
+            &mut shutdown,
+            TEST_HEARTBEAT,
+        );
+        tokio::pin!(socket);
+
+        let mut pings = 0;
+        let survived_stall = tokio::select! {
+            _ = &mut socket => false,
+            _ = timeout(TEST_HEARTBEAT.idle_timeout * 3, async {
+                while let Some(Ok(frame)) = server.next().await {
+                    if matches!(frame, Message::Ping(_)) {
+                        pings += 1;
+                    }
+                }
+            }) => true,
+        };
+        assert!(survived_stall, "a stalled UI must not end the connection");
+        assert!(
+            pings > 0,
+            "the server must keep hearing from a stalled client"
+        );
+
+        // Once the UI catches up, the overdue idle deadline must not fire.
+        let resumed = tokio::select! {
+            _ = &mut socket => false,
+            () = async {
+                for _ in 0..3 {
+                    let _ = stalled_ui.recv().await;
+                }
+                let _ = timeout(TEST_HEARTBEAT.idle_timeout / 2, async {
+                    while server.next().await.is_some() {}
+                })
+                .await;
+            } => true,
+        };
+        assert!(resumed, "draining the queue must not trigger a disconnect");
+    }
+
+    #[test]
+    fn refused_handshake_waits_quietly_and_keeps_the_room() {
+        let room_id = RoomId::from_u128(9);
+        let Some((mut client, _endpoints)) = test_client(Some(room_id)) else {
+            return;
+        };
+        client.connection_generation.store(2, Ordering::Release);
+        let refused = ReceivedServerMessage {
+            generation: 2,
+            message: ServerMessage::Error {
+                request_id: None,
+                code: canvas_protocol::ErrorCode::Unauthorized,
+                message: String::from("client identity is already connected"),
+            },
+        };
+
+        assert!(matches!(client.observe(&refused), Ok(false)));
+        assert_eq!(client.room_id(), Some(room_id));
+        assert_eq!(
+            client.status,
+            "Waiting for the previous connection to close…"
+        );
+
+        assert!(
+            client
+                .observe(&ReceivedServerMessage {
+                    generation: 2,
+                    message: ServerMessage::Welcome {
+                        session_id: canvas_protocol::SessionId::new(),
+                        server_version: String::from("test"),
+                    },
+                })
+                .is_ok()
+        );
+        // After the handshake succeeds, the same code is a real error again.
+        assert!(matches!(client.observe(&refused), Ok(true)));
     }
 
     #[tokio::test]

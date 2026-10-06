@@ -61,7 +61,46 @@ impl RoomStore {
 
     fn from_connection(connection: Connection) -> Result<Self, StoreError> {
         connection.execute_batch(include_str!("../migrations/001_initial.sql"))?;
+        connection.execute_batch(include_str!("../migrations/002_room_members.sql"))?;
         Ok(Self { connection })
+    }
+
+    /// Records that a client has been admitted to a room, so it can rejoin
+    /// after the room capability stops admitting new participants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when `SQLite` cannot insert the membership.
+    pub fn record_member(
+        &mut self,
+        room_id: RoomId,
+        client_id: ClientId,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO room_members (room_id, client_id) VALUES (?1, ?2)",
+            params![room_id.to_string(), client_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Drops the membership table so tests can make membership writes fail.
+    #[cfg(test)]
+    pub(crate) fn break_member_records(&self) -> Result<(), StoreError> {
+        self.connection.execute_batch("DROP TABLE room_members")?;
+        Ok(())
+    }
+
+    /// Returns whether a client has previously been admitted to a room.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] when `SQLite` cannot query the membership.
+    pub fn is_member(&self, room_id: RoomId, client_id: ClientId) -> Result<bool, StoreError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM room_members WHERE room_id = ?1 AND client_id = ?2)",
+            params![room_id.to_string(), client_id.to_string()],
+            |row| row.get(0),
+        )?)
     }
 
     /// Creates a room with only the hashed capability token persisted.
@@ -212,6 +251,10 @@ impl RoomStore {
         )?;
         transaction.execute(
             "DELETE FROM room_creator_tokens WHERE room_id = ?1",
+            params![room_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM room_members WHERE room_id = ?1",
             params![room_id],
         )?;
         let deleted =
