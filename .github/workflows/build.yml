@@ -30,7 +30,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       sha: ${{ steps.version.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
@@ -65,7 +65,7 @@ jobs:
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.metadata.outputs.sha }}
       - uses: ./.github/actions/install-linux-deps
@@ -415,7 +415,7 @@ jobs:
         if: ${{ always() && runner.os == 'Windows' && inputs.sign_windows }}
         shell: pwsh
         run: Remove-Item -Force -ErrorAction SilentlyContinue "$env:RUNNER_TEMP\sketchi-signing.pfx"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: sketchi-staging-${{ matrix.target }}
           path: dist/staging
@@ -427,10 +427,10 @@ jobs:
     if: ${{ !contains(needs.metadata.outputs.version, '-') }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.metadata.outputs.sha }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: sketchi-staging-x86_64-unknown-linux-gnu
           path: dist/staging
@@ -476,7 +476,7 @@ jobs:
                 rm -f /workspace/dist/artifacts/*-debug-*.pkg.tar.*
               "
             '
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: sketchi-package-arch-${{ needs.metadata.outputs.version }}
           path: dist/artifacts
@@ -488,10 +488,10 @@ jobs:
     if: ${{ !contains(needs.metadata.outputs.version, '-') }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.metadata.outputs.sha }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: sketchi-staging-x86_64-unknown-linux-gnu
           path: dist/staging
@@ -523,7 +523,7 @@ jobs:
           dpkg-deb --info "dist/artifacts/sketchi_${SKETCHI_VERSION}_amd64.deb"
           dpkg-deb --contents "dist/artifacts/sketchi_${SKETCHI_VERSION}_amd64.deb" \
             | grep -F './usr/bin/sketchi'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: sketchi-package-deb-${{ needs.metadata.outputs.version }}
           path: dist/artifacts
@@ -535,10 +535,10 @@ jobs:
     if: ${{ !contains(needs.metadata.outputs.version, '-') }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.metadata.outputs.sha }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: sketchi-staging-x86_64-unknown-linux-gnu
           path: dist/staging
@@ -571,7 +571,7 @@ jobs:
           rpm -qpl "dist/artifacts/$(basename "${packages[0]}")" | grep -Fx /usr/bin/sketchi
           rpm -qpl "dist/artifacts/$(basename "${packages[0]}")" | grep -Fx /usr/bin/sketchi-server
           rpm -qpl "dist/artifacts/$(basename "${packages[0]}")" | grep -Fx /usr/share/applications/sketchi.desktop
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: sketchi-package-rpm-${{ needs.metadata.outputs.version }}
           path: dist/artifacts
