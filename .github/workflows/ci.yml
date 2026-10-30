@@ -30,6 +30,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          # Keep this key aligned with the artifact build workflow.
           shared-key: sketchi-${{ matrix.target }}
       - name: Format
         run: cargo fmt --all --check
