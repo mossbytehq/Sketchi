@@ -4,13 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
   schedule:
     - cron: "17 3 * * 1"
 
 permissions:
   contents: read
-  checks: write
-  issues: write
 
 jobs:
   audit:
@@ -18,6 +17,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1
-      - uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # Run cargo-audit directly: audit-check creates public issues on schedules.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit locked dependencies
+        shell: bash
+        run: cargo audit --deny unmaintained --deny unsound 2>&1 | tee rustsec-audit.txt
+      - name: Summarize RustSec audit
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f rustsec-audit.txt ]]; then
+            {
+              echo '### RustSec dependency audit'
+              echo '```text'
+              cat rustsec-audit.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
