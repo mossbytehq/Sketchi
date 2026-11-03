@@ -72,13 +72,13 @@ async fn two_websocket_clients_receive_acknowledged_operations() {
         ServerMessage::Welcome { .. }
     ));
     send_client(&mut first, ClientMessage::CreateRoom { request_id: 1 }).await;
-    let (room_id, token) = match receive_server(&mut first).await {
-        ServerMessage::RoomCreated {
-            room_id,
-            capability_token,
-            ..
-        } => (room_id, capability_token),
-        other => panic!("unexpected room response: {other:?}"),
+    let ServerMessage::RoomCreated {
+        room_id,
+        capability_token: token,
+        ..
+    } = receive_server(&mut first).await
+    else {
+        panic!("expected a room-created response");
     };
     send_client(
         &mut first,

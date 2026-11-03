@@ -4,8 +4,7 @@ Sketchi is a fast, native whiteboard for Windows and Linux. Sketch shapes,
 arrows, freehand drawings, text, and images on an infinite canvas, and invite
 up to three other people to draw with you in real time.
 
-> Sketchi is in active development. Every release is currently published as a
-> pre-release, so expect rough edges and frequent updates.
+Sketchi is in active development, so expect rough edges and frequent updates.
 
 ## Features
 
@@ -20,8 +19,8 @@ up to three other people to draw with you in real time.
   and redo (up to 64 steps).
 - **Live collaboration:** see other people's edits, cursors, and selections as
   they happen.
-- **Your files stay local:** documents are saved as plain JSON files, with
-  optional autosave.
+- **Local documents:** save drawings as plain JSON files, with optional
+  autosave. Joining a room shares your canvas with that room.
 - **Built-in updates:** Sketchi can check for, download, and install new
   versions for you.
 
@@ -37,15 +36,16 @@ contains a `SHA256SUMS` file if you want to verify your download.
 | Windows (MSI) | `Sketchi-<version>-windows-x86_64-setup.msi` | For managed or scripted installs. |
 | Windows (portable) | `Sketchi-<version>-windows-x86_64.zip` | Unzip anywhere and run `Sketchi.exe`. No installation needed. |
 | Debian / Ubuntu | `sketchi_<version>_amd64.deb` | `sudo apt install ./sketchi_<version>_amd64.deb` |
-| Fedora / openSUSE | `sketchi-<version>-1.x86_64.rpm` | `sudo dnf install ./sketchi-<version>-1.x86_64.rpm` |
+| Fedora | `sketchi-<version>-1.x86_64.rpm` | `sudo dnf install ./sketchi-<version>-1.x86_64.rpm` |
+| openSUSE | `sketchi-<version>-1.x86_64.rpm` | `sudo zypper install ./sketchi-<version>-1.x86_64.rpm` |
 | Arch Linux | `sketchi-<version>-1-x86_64.pkg.tar.zst` | `sudo pacman -U sketchi-<version>-1-x86_64.pkg.tar.zst` |
-| Any Linux (portable) | `Sketchi-<version>-linux-x86_64` | `chmod +x` the file, then run it. |
+| Linux (portable) | `Sketchi-<version>-linux-x86_64` | `chmod +x` the file, then run it. |
 
 Only 64-bit (x86_64) systems are supported.
 
-**Windows SmartScreen:** releases are not code-signed yet, so Windows may show
-"Windows protected your PC" the first time you run the installer. Choose
-**More info → Run anyway** to continue.
+**Windows SmartScreen:** unsigned downloads may show "Windows protected your
+PC". Confirm that the file came from this repository's Releases page before
+choosing **More info → Run anyway**.
 
 ## Drawing
 
@@ -114,29 +114,14 @@ to see the room's canvas.
   means the same home, office, or school network. To collaborate from
   different places, connect everyone to a shared virtual network such as
   [Tailscale](https://tailscale.com/) or [ZeroTier](https://www.zerotier.com/),
-  or run a standalone server (see below).
+  or [host a standalone server](DEVELOPMENT.md#hosting-a-standalone-server).
 - On Windows, allow Sketchi through the firewall if asked, or others will not
   be able to join your room.
 
-### Hosting a standalone server
-
-For collaborators in different locations, run the server on a machine everyone
-can reach, such as a VPS. It needs a TLS certificate and private key in PEM
-format:
-
-```sh
-sketchi-server --bind 0.0.0.0:3210 --certificate cert.pem --private-key key.pem
-```
-
-On Windows the server is `Sketchi-server.exe`, installed next to the app; you
-can also build it from source (see below). When creating or joining a room,
-open **Advanced** and enter the server's `wss://<host>:3210/ws` address and the
-SHA-256 fingerprint of its certificate.
-
 ## Updates
 
-Open **Settings → About** to check for new versions and install them with one
-click. Sketchi restarts itself to finish the update, and reopens even if the
+Open **Settings → About** to check for new versions and install an available
+update. Sketchi restarts itself to finish the update, and reopens even if the
 update fails.
 
 There are two update channels:
@@ -144,55 +129,32 @@ There are two update channels:
 - **Stable** receives full releases only.
 - **Edge** also receives pre-releases.
 
-While Sketchi is in development, every release is a pre-release, so choose
-**Edge** to receive updates.
+Choose **Edge** if you want to try pre-releases as well as stable releases.
 
-## Building from source
+## Privacy and sharing
 
-Sketchi is written in Rust. Install [rustup](https://rustup.rs/); the
-repository pins the exact toolchain it needs, so rustup installs it
-automatically on first build.
+No account is needed. Documents, settings, and recovery data are stored on
+your computer. When you join or host a room, canvas content, including
+embedded images, is shared through the collaboration server with the room's
+participants. Use invites only with people you trust.
 
-```sh
-git clone https://github.com/mossbytehq/Sketchi.git
-cd Sketchi
-cargo sketchi
-```
+Update checks contact GitHub, and installing an update downloads release
+files from GitHub. The host receives the network information normally sent
+with a request, including your public IP address.
 
-`cargo sketchi` builds and starts the desktop app. To run the collaboration
-server on its own:
+## Help and feedback
 
-```sh
-cargo run --package canvas-server --bin sketchi-server
-```
+If someone cannot join your room, check that they can reach the host, that
+the firewall allows Sketchi, and that the invite has not expired. Keep a
+saved copy of your drawing before trying a new release.
 
-Set `RUST_LOG=info` to see startup and runtime diagnostics.
+[Report a problem or request a feature](https://github.com/mossbytehq/Sketchi/issues).
+Include your operating system, Sketchi version, and steps to reproduce the
+problem. Remove room invites, capability tokens, private drawings, and other
+personal information from screenshots and logs before posting.
 
-### For contributors
-
-Run the full check before opening a pull request:
-
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --locked
-```
-
-The workspace is split into small crates:
-
-```text
-crates/canvas-core       document model and operation-based CRDT
-crates/canvas-protocol   versioned collaboration messages
-crates/canvas-renderer   camera and geometry/rendering support
-apps/canvas-client       Sketchi desktop app
-bin/canvas-server        collaboration server
-xtask                    packaging and release checks
-```
-
-Releases are built by the GitHub workflows in `.github/workflows`. To change the
-version, run `cargo xtask set-version --workspace <version>`. Add `--d` to make
-the existing GitHub release a draft, `--rc` to mark it as a pre-release, or
-`--r` to publish it as the latest stable release.
+For building, contributing, and releasing, see the
+[development guide](DEVELOPMENT.md).
 
 ## License
 

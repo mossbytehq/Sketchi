@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Branch or commit to build; defaults to the selected branch
+        description: Branch, tag, or commit on main history; run this workflow from main
         required: false
         default: ""
         type: string
@@ -23,7 +23,13 @@ permissions:
   contents: read
 
 jobs:
+  trusted-revision:
+    uses: ./.github/workflows/trusted-revision.yml
+    with:
+      ref: ${{ inputs.ref }}
+
   metadata:
+    needs: trusted-revision
     name: Read workspace version
     runs-on: ubuntu-24.04
     outputs:
@@ -32,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ needs.trusted-revision.outputs.sha }}
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.97.1
       - id: version

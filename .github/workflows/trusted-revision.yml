@@ -1,0 +1,52 @@
+name: Validate trusted build revision
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        type: string
+        default: ""
+    outputs:
+      sha:
+        description: Immutable commit on the main branch history
+        value: ${{ jobs.validate.outputs.sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.revision.outputs.sha }}
+    steps:
+      # Do not check out or execute the requested revision before this check.
+      - name: Require a revision from trusted main history
+        id: revision
+        uses: actions/github-script@v8
+        env:
+          REQUESTED_REF: ${{ inputs.ref }}
+        with:
+          script: |
+            if (context.ref !== 'refs/heads/main') {
+              throw new Error('Build and release workflows must run from main.');
+            }
+            const requested = process.env.REQUESTED_REF || context.ref;
+            const { data: branch } = await github.rest.repos.getBranch({
+              ...context.repo,
+              branch: 'main',
+            });
+            const { data: commit } = await github.rest.repos.getCommit({
+              ...context.repo,
+              ref: requested,
+            });
+            const { data: comparison } = await github.rest.repos.compareCommitsWithBasehead({
+              ...context.repo,
+              basehead: `${commit.sha}...${branch.commit.sha}`,
+            });
+            // With main as the head, "ahead" means the requested commit is its ancestor.
+            if (!['ahead', 'identical'].includes(comparison.status)) {
+              throw new Error('Requested revision must be main or an ancestor of main.');
+            }
+            core.setOutput('sha', commit.sha);

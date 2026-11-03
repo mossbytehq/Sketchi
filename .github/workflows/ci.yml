@@ -34,9 +34,15 @@ jobs:
           shared-key: sketchi-${{ matrix.target }}
       - name: Format
         run: cargo fmt --all --check
+      - name: Trusted revision regression tests
+        if: runner.os == 'Linux'
+        run: node --test .github/tests/trusted-revision.test.cjs
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --all-targets --locked
+      - name: Vendored Linux input regression tests
+        if: runner.os == 'Linux'
+        run: cargo test --manifest-path vendor/winit/Cargo.toml --lib --locked
       - name: Release build
         run: cargo build --workspace --release --locked --target ${{ matrix.target }}

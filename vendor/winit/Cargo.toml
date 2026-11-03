@@ -9,6 +9,10 @@
 # will likely look very different (and much more reasonable).
 # See Cargo.toml.orig for the original contents.
 
+# A standalone workspace lets CI test this patched dependency's unit tests.
+[workspace]
+resolver = "2"
+
 [package]
 edition = "2021"
 rust-version = "1.70.0"

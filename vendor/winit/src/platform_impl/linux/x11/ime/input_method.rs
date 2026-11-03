@@ -42,7 +42,7 @@ impl InputMethod {
     fn new(xconn: &Arc<XConnection>, im: ffi::XIM, name: String) -> Option<Self> {
         let mut styles: *mut XIMStyles = std::ptr::null_mut();
 
-        // Query the styles supported by the XIM.
+        // SAFETY: `im` is an open input method and `styles` is a writable output pointer.
         unsafe {
             if !(xconn.xlib.XGetIMValues)(
                 im,
@@ -56,35 +56,56 @@ impl InputMethod {
             }
         }
 
-        let mut preedit_style = None;
-        let mut none_style = None;
-
-        unsafe {
-            std::slice::from_raw_parts((*styles).supported_styles, (*styles).count_styles as _)
-                .iter()
-                .for_each(|style| match *style {
-                    XIM_PREEDIT_STYLE => {
-                        preedit_style = Some(Style::Preedit(*style));
-                    },
-                    XIM_NOTHING_STYLE if preedit_style.is_none() => {
-                        preedit_style = Some(Style::Nothing(*style))
-                    },
-                    XIM_NONE_STYLE => none_style = Some(Style::None(*style)),
-                    _ => (),
-                });
-
-            (xconn.xlib.XFree)(styles.cast());
-        };
-
-        if preedit_style.is_none() && none_style.is_none() {
-            return None;
+        // SAFETY: XGetIMValues owns the returned allocation until XFree below. The
+        // selector checks both output pointers and the count before reading the array.
+        let selected = unsafe { select_styles(styles) };
+        if !styles.is_null() {
+            // SAFETY: The non-null allocation was returned by XGetIMValues and is freed once.
+            unsafe { (xconn.xlib.XFree)(styles.cast()) };
         }
-
-        let preedit_style = preedit_style.unwrap_or_else(|| none_style.unwrap());
-        let none_style = none_style.unwrap_or(preedit_style);
+        let (preedit_style, none_style) = selected?;
 
         Some(InputMethod { im, _name: name, preedit_style, none_style })
     }
+}
+
+/// Select supported styles without retaining references to Xlib's allocation.
+///
+/// # Safety
+/// Non-null pointers must refer to an initialized XIMStyles and, for a nonzero
+/// count and non-null array, that many initialized XIMStyle values, valid for this call.
+unsafe fn select_styles(styles: *const XIMStyles) -> Option<(Style, Style)> {
+    if styles.is_null() {
+        return None;
+    }
+    // SAFETY: The caller guarantees validity of a non-null styles pointer.
+    let styles = unsafe { &*styles };
+    if styles.count_styles == 0 || styles.supported_styles.is_null() {
+        return None;
+    }
+    let mut preedit_style = None;
+    let mut none_style = None;
+    // SAFETY: Both pointers and the nonzero count were checked above; the caller
+    // guarantees the array is initialized and remains valid throughout selection.
+    unsafe {
+        std::slice::from_raw_parts(styles.supported_styles, styles.count_styles as _)
+            .iter()
+            .for_each(|style| match *style {
+                XIM_PREEDIT_STYLE => {
+                    preedit_style = Some(Style::Preedit(*style));
+                },
+                XIM_NOTHING_STYLE if preedit_style.is_none() => {
+                    preedit_style = Some(Style::Nothing(*style))
+                },
+                XIM_NONE_STYLE => none_style = Some(Style::None(*style)),
+                _ => (),
+            });
+    };
+
+    let preedit_style = preedit_style.or(none_style)?;
+    let none_style = none_style.unwrap_or(preedit_style);
+
+    Some((preedit_style, none_style))
 }
 
 const XIM_PREEDIT_STYLE: XIMStyle = (ffi::XIMPreeditCallbacks | ffi::XIMStatusNothing) as XIMStyle;
@@ -118,6 +139,71 @@ struct XIMStyles {
 }
 
 pub(crate) type XIMStyle = c_ulong;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_or_empty_style_output_is_rejected() {
+        // SAFETY: Null output is explicitly supported by the selector.
+        assert_eq!(unsafe { select_styles(ptr::null()) }, None);
+        for count_styles in [0, 1] {
+            let styles = XIMStyles {
+                count_styles,
+                supported_styles: ptr::null(),
+            };
+            // SAFETY: The descriptor is live; a null array is explicitly supported.
+            assert_eq!(unsafe { select_styles(&styles) }, None);
+        }
+        let array = [XIM_NONE_STYLE];
+        let styles = XIMStyles {
+            count_styles: 0,
+            supported_styles: array.as_ptr(),
+        };
+        // SAFETY: The descriptor and array are live; the zero count must prevent a read.
+        assert_eq!(unsafe { select_styles(&styles) }, None);
+    }
+
+    #[test]
+    fn style_preference_and_fallback_are_preserved() {
+        for (array, expected) in [
+            (
+                vec![XIM_NONE_STYLE],
+                Some((Style::None(XIM_NONE_STYLE), Style::None(XIM_NONE_STYLE))),
+            ),
+            (
+                vec![XIM_NOTHING_STYLE],
+                Some((
+                    Style::Nothing(XIM_NOTHING_STYLE),
+                    Style::Nothing(XIM_NOTHING_STYLE),
+                )),
+            ),
+            (
+                vec![XIM_NOTHING_STYLE, XIM_NONE_STYLE, XIM_PREEDIT_STYLE],
+                Some((
+                    Style::Preedit(XIM_PREEDIT_STYLE),
+                    Style::None(XIM_NONE_STYLE),
+                )),
+            ),
+            (
+                vec![XIM_PREEDIT_STYLE, XIM_NOTHING_STYLE],
+                Some((
+                    Style::Preedit(XIM_PREEDIT_STYLE),
+                    Style::Preedit(XIM_PREEDIT_STYLE),
+                )),
+            ),
+            (vec![0], None),
+        ] {
+            let styles = XIMStyles {
+                count_styles: array.len() as c_ushort,
+                supported_styles: array.as_ptr(),
+            };
+            // SAFETY: The descriptor and its initialized array remain live for selection.
+            assert_eq!(unsafe { select_styles(&styles) }, expected);
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum InputMethodResult {

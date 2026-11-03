@@ -976,6 +976,8 @@ impl XkbKeymap {
         layout: xkb_layout_index_t,
         keycode: xkb_keycode_t,
     ) -> xkb_keysym_t {
+        // SAFETY: The owned keymap is live for the call. The returned array is
+        // borrowed from it and is read only when the count and pointer are valid.
         unsafe {
             let mut keysyms = ptr::null();
             let count = (XKBH.xkb_keymap_key_get_syms_by_level)(
@@ -987,7 +989,7 @@ impl XkbKeymap {
                 &mut keysyms,
             );
 
-            if count == 1 {
+            if count == 1 && !keysyms.is_null() {
                 *keysyms
             } else {
                 0
