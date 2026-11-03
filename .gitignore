@@ -1,5 +1,6 @@
 # Rust build output.
 /target/
+/vendor/winit/target/
 
 # Local Rust tooling and profiling output.
 /.agents/

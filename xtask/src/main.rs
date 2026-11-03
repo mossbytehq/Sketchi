@@ -37,7 +37,7 @@ enum CommandKind {
     Check,
     /// Check workspace/tag versions and optional built binaries.
     VersionCheck(VersionCheckArgs),
-    /// Set the workspace version and optionally update an existing GitHub release state.
+    /// Set manifest and lockfile versions and optionally update an existing GitHub release state.
     SetVersion(SetVersionArgs),
     /// Stage a client package containing the server sidecar.
     Package(StageArgs),
@@ -301,7 +301,7 @@ fn run_set_version(root: &Path, args: &SetVersionArgs) -> Result<()> {
     if let Some(state) = release_state {
         update_github_release_state(&args.version, state)?;
     }
-    write_workspace_version(root, &args.version)?;
+    set_workspace_version(root, &args.version)?;
     println!("workspace version set to {}", args.version);
     if let Some(state) = release_state {
         println!("GitHub release v{} set to {}", args.version, state.label());
@@ -364,6 +364,36 @@ fn write_workspace_version(root: &Path, version: &str) -> Result<()> {
         updated.push('\n');
     }
     fs::write(&path, updated).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn set_workspace_version(root: &Path, version: &str) -> Result<()> {
+    let manifest = root.join("Cargo.toml");
+    let lockfile = root.join("Cargo.lock");
+    let original_manifest = fs::read(&manifest).context("back up workspace manifest")?;
+    let original_lockfile = fs::read(&lockfile).context("back up workspace lockfile")?;
+
+    let result = write_workspace_version(root, version).and_then(|()| {
+        let output = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+            .args(["update", "--workspace", "--offline"])
+            .current_dir(root)
+            .output()
+            .context("run Cargo to synchronize workspace lockfile versions")?;
+        if !output.status.success() {
+            bail!(
+                "could not synchronize workspace lockfile: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    });
+    if let Err(error) = result {
+        fs::write(&manifest, original_manifest)
+            .context("restore workspace manifest after failed version update")?;
+        fs::write(&lockfile, original_lockfile)
+            .context("restore workspace lockfile after failed version update")?;
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -1076,6 +1106,99 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.join("Cargo.toml")).expect("read updated manifest"),
             "[workspace.package]\nversion = \"0.2.0\"\nedition = \"2024\"\n\n[workspace]\nmembers = []\n"
+        );
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    fn version_test_workspace() -> PathBuf {
+        let root = test_directory("version-lockfile");
+        write_file(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"first\", \"second\"]\nexclude = [\"fixed\"]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        );
+        for name in ["first", "second"] {
+            write_file(
+                &root.join(name).join("Cargo.toml"),
+                &format!(
+                    "[package]\nname = \"{name}\"\nversion.workspace = true\nedition.workspace = true\n\n[dependencies]\nfixed = {{ path = \"../fixed\" }}\n"
+                ),
+            );
+            write_file(&root.join(name).join("src/lib.rs"), "");
+        }
+        write_file(
+            &root.join("fixed/Cargo.toml"),
+            "[package]\nname = \"fixed\"\nversion = \"0.7.3\"\nedition = \"2024\"\n",
+        );
+        write_file(&root.join("fixed/src/lib.rs"), "");
+        let output = Command::new(env!("CARGO"))
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(&root)
+            .output()
+            .expect("generate fixture lockfile");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        root
+    }
+
+    fn version_test_args(version: &str) -> SetVersionArgs {
+        SetVersionArgs {
+            workspace: true,
+            version: version.to_owned(),
+            draft: false,
+            release_candidate: false,
+            latest: false,
+        }
+    }
+
+    #[test]
+    fn set_version_keeps_repeated_bumps_usable_with_locked_cargo() {
+        let root = version_test_workspace();
+        let original_lockfile = fs::read_to_string(root.join("Cargo.lock")).expect("read lockfile");
+        for version in ["0.2.0", "0.3.0", "0.3.0"] {
+            run_set_version(&root, &version_test_args(version)).expect("set workspace version");
+            assert_eq!(
+                fs::read_to_string(root.join("Cargo.lock")).expect("read updated lockfile"),
+                original_lockfile
+                    .replace("version = \"0.1.0\"", &format!("version = \"{version}\""))
+            );
+            let output = Command::new(env!("CARGO"))
+                .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+                .current_dir(&root)
+                .output()
+                .expect("check locked workspace metadata");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn failed_version_sync_restores_manifest_and_lockfile() {
+        let root = version_test_workspace();
+        let manifest = fs::read(root.join("Cargo.toml")).expect("read manifest");
+        let lockfile = fs::read(root.join("Cargo.lock")).expect("read lockfile");
+        fs::remove_file(root.join("fixed/Cargo.toml")).expect("break fixture dependency");
+
+        let error = run_set_version(&root, &version_test_args("0.2.0"))
+            .expect_err("a failed lockfile sync must fail set-version");
+        assert!(
+            error
+                .to_string()
+                .contains("could not synchronize workspace lockfile")
+        );
+        assert_eq!(
+            fs::read(root.join("Cargo.toml")).expect("read manifest"),
+            manifest
+        );
+        assert_eq!(
+            fs::read(root.join("Cargo.lock")).expect("read lockfile"),
+            lockfile
         );
         fs::remove_dir_all(root).expect("remove test directory");
     }

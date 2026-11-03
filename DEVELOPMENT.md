@@ -104,14 +104,13 @@ From the repository root, replace `<version>` with a stable version such as
 
 ```sh
 cargo xtask set-version --workspace <version>
-cargo update --workspace
 cargo xtask version-check
 ```
 
-Commit both `Cargo.toml` and `Cargo.lock`. The version command changes the
-manifest; the lockfile refresh updates the workspace package entries so
-`--locked` checks continue to pass. If all dependencies are already cached,
-the refresh can use `cargo update --workspace --offline`.
+Commit both `Cargo.toml` and `Cargo.lock`. The version command updates the
+manifest and synchronizes workspace package entries in the lockfile offline,
+preserving locked dependency versions. If synchronization fails, it restores
+both files and reports the error.
 
 The optional `set-version` flags also edit an **existing** GitHub release
 and require an authenticated GitHub CLI:
